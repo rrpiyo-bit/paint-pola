@@ -1538,9 +1538,7 @@ class MainWindow(QMainWindow):
             merged = QImage(mw, mh, QImage.Format.Format_ARGB32_Premultiplied)
             merged.fill(Qt.GlobalColor.transparent)
             mp = QPainter(merged)
-            for child in reversed(grp.children):
-                if child.visible:
-                    self.layer_stack._draw_layer_to(mp, child, min_x, min_y)
+            self.layer_stack._draw_layers_to(mp, grp.children, min_x, min_y)
             mp.end()
             new_layer = Layer(grp.name, mw, mh)
             new_layer.image = merged.convertToFormat(QImage.Format.Format_ARGB32)

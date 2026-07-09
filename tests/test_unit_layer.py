@@ -323,6 +323,37 @@ class TestLayerStack:
         ls = LayerStack(W, H)
         assert ls.merge_all_visible() is False
 
+    # ── フォルダ結合(_draw_layers_to)のクリッピング反映 ─────────────────────────
+    # グループを結合すると clipping フラグが無視され、クリッピングされているはずの
+    # レイヤーが全面に描画されてしまうバグの回帰確認（実際のユーザーファイルで
+    # 「色が消えて黒線だけになる」症状として再現した）。
+
+    def test_group_merge_respects_clipping(self):
+        from PyQt6.QtGui import QPainter
+        ls = LayerStack(W, H)
+        grp = ls.add_group("G")
+        # 下: 中央に小さい不透明な四角（線画相当）
+        base = Layer("base", W, H)
+        base.image.fill(Qt.GlobalColor.transparent)
+        p = QPainter(base.image)
+        p.fillRect(40, 40, 20, 20, QColor(0, 0, 0, 255))
+        p.end()
+        # 上: 全面を塗る色レイヤー、clipping=True（下のレイヤーの形状でマスクされるべき）
+        color = Layer("color", W, H)
+        color.image.fill(QColor(0, 255, 0, 255))
+        color.clipping = True
+        # children はトップが先頭（[0]=color が [1]=base の上にクリップされる）
+        grp.children.extend([color, base])
+
+        ls.active_path = [0]
+        assert ls.merge_all_visible() is True
+        merged = ls.layers[0].image
+        # クリッピングされていれば、四角の外側は透明のまま（緑で塗り潰されない）
+        assert px(merged, 5, 5).alpha() == 0
+        # 四角の内側は緑色（色レイヤーがクリップされて反映されている）
+        c = px(merged, 50, 50)
+        assert c.green() > 200 and c.red() < 50
+
     # ── composite ─────────────────────────────────────────────────────────────
 
     def test_composite_transparent_background(self):

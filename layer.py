@@ -512,8 +512,7 @@ class LayerStack:
         merged = QImage(mw, mh, QImage.Format.Format_ARGB32_Premultiplied)
         merged.fill(Qt.GlobalColor.transparent)
         p = QPainter(merged)
-        for lyr in reversed(visible):
-            self._draw_layer_to(p, lyr, min_x, min_y)
+        self._draw_layers_to(p, visible, min_x, min_y)
         p.end()
 
         new_layer = Layer("統合レイヤー", mw, mh)
@@ -587,15 +586,54 @@ class LayerStack:
     def _draw_layer_to(self, p: QPainter, lyr, off_x: int, off_y: int):
         """統合用: lyrをオフセット補正して描画する。"""
         if lyr.is_group:
-            for child in reversed(lyr.children):
-                if child.visible:
-                    self._draw_layer_to(p, child, off_x, off_y)
+            self._draw_layers_to(p, lyr.children, off_x, off_y)
         else:
             ox = getattr(lyr, 'offset_x', 0)
             oy = getattr(lyr, 'offset_y', 0)
             img = lyr.image_with_effects() if hasattr(lyr, 'image_with_effects') else lyr.image
             p.setOpacity(lyr.opacity / 255)
             p.drawImage(ox - off_x, oy - off_y, img)
+
+    def _draw_layers_to(self, p: QPainter, layers, off_x: int, off_y: int):
+        """統合用: 同階層のレイヤー群をクリッピング・ブレンドモードを反映して描画する
+        （composite() と同じロジックだが、キャンバス全面ではなく off_x/off_y 補正した
+        任意サイズのバッファに描く点だけが異なる）。"""
+        for i in range(len(layers) - 1, -1, -1):
+            child = layers[i]
+            if not child.visible:
+                continue
+            if child.is_group:
+                p.setOpacity(child.opacity / 255)
+                self._draw_layers_to(p, child.children, off_x, off_y)
+                continue
+            ox = getattr(child, 'offset_x', 0) - off_x
+            oy = getattr(child, 'offset_y', 0) - off_y
+            if (child.clipping  # type: ignore
+                    and i < len(layers) - 1
+                    and not layers[i + 1].is_group):
+                below = layers[i + 1]
+                box = getattr(below, 'offset_x', 0) - off_x
+                boy = getattr(below, 'offset_y', 0) - off_y
+                bw, bh = p.device().width(), p.device().height()
+                mask_img = QImage(bw, bh, QImage.Format.Format_ARGB32)
+                mask_img.fill(Qt.GlobalColor.transparent)
+                mp = QPainter(mask_img)
+                mp.setOpacity(child.opacity / 255)
+                mp.drawImage(ox, oy, child.image_with_effects())  # type: ignore
+                mp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+                mp.drawImage(box, boy, below.image_with_effects())  # type: ignore
+                mp.end()
+                p.setOpacity(1.0)
+                p.drawImage(0, 0, mask_img)
+            else:
+                blend = BLEND_KEY_TO_MODE.get(getattr(child, 'blend_mode', 'normal'))
+                if blend:
+                    p.setCompositionMode(blend)
+                else:
+                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                p.setOpacity(child.opacity / 255)
+                p.drawImage(ox, oy, child.image_with_effects())  # type: ignore
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
     def composite(self, skip: object = None) -> QImage:
         """全レイヤーを合成する。skip を指定すると、そのトップレベルレイヤー
