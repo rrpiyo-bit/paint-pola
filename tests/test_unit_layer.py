@@ -75,6 +75,31 @@ class TestLayer:
         layer.border_size = 0
         assert layer.image_with_border() is layer.image
 
+    def test_image_with_border_no_gap_at_antialiased_edge(self):
+        """線と同じ色の縁をつけても、アンチエイリアシングの縁ピクセルが
+        中間色のまま残らない（線と縁の境目に薄い隙間が見えるバグの回帰確認）。"""
+        from PyQt6.QtGui import QPainter, QPen
+        layer = Layer("test", W, H)
+        layer.image.fill(Qt.GlobalColor.transparent)
+        p = QPainter(layer.image)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QPen(QColor(0, 0, 0, 255), 4))
+        p.drawLine(10, 50, 90, 50)
+        p.end()
+
+        layer.border_enabled = True
+        layer.border_size = 3
+        layer.border_color = QColor(0, 0, 0, 255)  # 線と同じ黒縁
+
+        result = layer.image_with_border()
+        # 縁取り膨張範囲内は alpha=255 の黒で連続しているはず（隙間となる
+        # 半透明・別色ピクセルが残っていないこと）
+        for y in range(45, 56):
+            for x in range(10, 90):
+                c = px(result, x, y)
+                if c.alpha() > 0:
+                    assert c.alpha() == 255 and c.red() == 0 and c.green() == 0 and c.blue() == 0
+
 
 # ── GroupLayer ───────────────────────────────────────────────────────────────
 

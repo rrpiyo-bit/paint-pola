@@ -77,10 +77,14 @@ class Layer:
         ksize = self.border_size * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         dilated = cv2.dilate(alpha, kernel)
-        border_only = (dilated > 0) & (alpha == 0)
+        # alpha==0 の完全透明部分だけでなく dilated 領域全体を縁色で塗る。
+        # 線画のアンチエイリアシングで生じる半透明の縁ピクセル（alpha 1~254）の下にも
+        # 縁色を敷いておかないと、元画像を上から通常合成した際に背景色とブレンドされた
+        # 薄い色がそのまま残り、線と縁の境目に隙間のような段差が見えてしまうため。
+        border_area = dilated > 0
         result = arr.copy()
         bc = self.border_color
-        result[border_only] = [bc.blue(), bc.green(), bc.red(), bc.alpha()]
+        result[border_area] = [bc.blue(), bc.green(), bc.red(), bc.alpha()]
         border_img = QImage(result.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
         out = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         out.fill(Qt.GlobalColor.transparent)
