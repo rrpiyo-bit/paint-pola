@@ -1,6 +1,5 @@
 from __future__ import annotations
 import math
-from collections import deque
 import numpy as np
 import cv2
 
@@ -9,7 +8,7 @@ from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QFont, QPixmap,
                           QTransform, QBrush, QPainterPath)
 from PyQt6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal, QTimer
 
-from layer import LayerStack, Layer
+from layer import LayerStack, Layer, BLEND_KEY_TO_MODE
 from tools import Tool
 from brush import BrushType, get_brush, StabilizedBrush, BlurBrush, BRUSH_LABELS
 
@@ -26,6 +25,7 @@ _TOOL_KEY_MAP: dict[Qt.Key, Tool] = {
     Qt.Key.Key_B: Tool.BLUR,
     Qt.Key.Key_S: Tool.SELECT_RECT,
     Qt.Key.Key_Q: Tool.LASSO,
+    Qt.Key.Key_W: Tool.LASSO_FILL,
     Qt.Key.Key_V: Tool.MOVE,
     Qt.Key.Key_F: Tool.TRANSFORM,
 }
@@ -69,9 +69,17 @@ def _alpha(pixel: int) -> int:
     return (pixel >> 24) & 0xFF
 
 
+def _is_line_pixel(pixel: int, threshold: int = 10) -> bool:
+    """参照レイヤーのピクセルが「線」（塗りつぶしを堰き止める境界）かどうか判定する。
+    不透明なピクセルはすべて境界（白い線も含む）。"""
+    return _alpha(pixel) > threshold
+
+
 def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
                 ref_image: QImage | None = None):
-    """scanline 塗りつぶし。大キャンバスでもメモリ効率が良い。"""
+    """連結領域を numpy/cv2 のラベリングで検出し、一括書き込みする塗りつぶし。
+    QImage.pixel()/setPixel() を1ピクセルずつ呼ぶ旧scanline実装は、大キャンバスで
+    UIスレッドが長時間ブロックされフリーズ/クラッシュする原因になっていたため廃止。"""
     w, h = image.width(), image.height()
     if not (0 <= x < w and 0 <= y < h):
         return
@@ -79,64 +87,46 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
     judge = ref_image if ref_image is not None else image
     fill = fill_color.rgba()
 
+    nbytes = h * w * 4
+    judge_ptr = judge.bits(); judge_ptr.setsize(nbytes)
+    judge_arr = np.frombuffer(judge_ptr, dtype=np.uint8).reshape(h, w, 4)
+
     # 参照モード: judge の不透明ピクセルが境界、image の未塗りピクセルが対象
     # 通常モード: image の同色ピクセルが対象
     if ref_image is not None:
-        if _alpha(judge.pixel(x, y)) > 10:
+        if _is_line_pixel(judge.pixel(x, y)):
             return
-        def can_enter(cx: int, cy: int) -> bool:
-            return (0 <= cx < w and 0 <= cy < h
-                    and _alpha(judge.pixel(cx, cy)) <= 10
-                    and image.pixel(cx, cy) != fill)
+        candidate = (judge_arr[:, :, 3] <= 10).astype(np.uint8)
     else:
         target = judge.pixel(x, y)
         if target == fill:
             return
-        def can_enter(cx: int, cy: int) -> bool:
-            return (0 <= cx < w and 0 <= cy < h
-                    and image.pixel(cx, cy) == target)
+        img_ptr = image.bits(); img_ptr.setsize(nbytes)
+        img_arr_ro = np.frombuffer(img_ptr, dtype=np.uint8).reshape(h, w, 4)
+        target_color = QColor.fromRgba(target)
+        target_bgra = np.array([target_color.blue(), target_color.green(),
+                                 target_color.red(), target_color.alpha()], dtype=np.uint8)
+        candidate = np.all(img_arr_ro == target_bgra, axis=2).astype(np.uint8)
 
-    q: deque[tuple[int, int, int]] = deque()
+    num, labels = cv2.connectedComponents(candidate, connectivity=4)
+    seed_label = labels[y, x]
+    if seed_label == 0:
+        return
+    fill_mask = labels == seed_label
 
-    def scan_and_enqueue(x0: int, x1: int, cy: int):
-        i = x0
-        while i <= x1:
-            while i <= x1 and not can_enter(i, cy):
-                i += 1
-            if i > x1:
-                break
-            j = i
-            while j + 1 <= x1 and can_enter(j + 1, cy):
-                j += 1
-            q.append((i, j, cy))
-            i = j + 1
+    if ref_image is not None:
+        img_ptr = image.bits(); img_ptr.setsize(nbytes)
+        img_arr = np.frombuffer(img_ptr, dtype=np.uint8).reshape(h, w, 4)
+        # 参照モードでは「未塗り(候補)」かつ「既に fill 色ではない」ピクセルのみ書き換える
+        fill_color_bgra = np.array([fill_color.blue(), fill_color.green(),
+                                     fill_color.red(), fill_color.alpha()], dtype=np.uint8)
+        already_filled = np.all(img_arr == fill_color_bgra, axis=2)
+        fill_mask = fill_mask & ~already_filled
+    else:
+        img_arr = img_arr_ro
 
-    # seed row
-    lx = x
-    while lx > 0 and can_enter(lx - 1, y):
-        lx -= 1
-    rx = x
-    while rx < w - 1 and can_enter(rx + 1, y):
-        rx += 1
-    q.append((lx, rx, y))
-
-    while q:
-        x0, x1, cy = q.popleft()
-        i = x0
-        while i <= x1:
-            if not can_enter(i, cy):
-                i += 1
-                continue
-            j = i
-            while j + 1 <= x1 and can_enter(j + 1, cy):
-                j += 1
-            for xi in range(i, j + 1):
-                image.setPixel(xi, cy, fill)
-            for dy in (-1, 1):
-                ny = cy + dy
-                if 0 <= ny < h:
-                    scan_and_enqueue(max(0, i - 1), min(w - 1, j + 1), ny)
-            i = j + 1
+    img_arr[fill_mask] = (fill_color.blue(), fill_color.green(),
+                           fill_color.red(), fill_color.alpha())
 
 
 def _flood_fill_expanded(image: QImage, x: int, y: int,
@@ -183,6 +173,65 @@ def _flood_fill_expanded(image: QImage, x: int, y: int,
     p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
     p.drawImage(0, 0, result_img)
     p.end()
+
+
+def _fill_closed_regions_in_area(image: QImage, area_mask: np.ndarray,
+                                  fill_color: QColor, ref_image: QImage | None) -> int:
+    """area_mask（投げなわ選択範囲）内にある、線で閉じた領域だけを自動検出して塗りつぶす。
+    area_mask の外周に接している領域（＝閉じていない/範囲外に開いている）は対象外にする。
+    戻り値: 実際に塗りつぶした領域の数。"""
+    w, h = image.width(), image.height()
+    judge = ref_image if ref_image is not None else image
+
+    nbytes = h * w * 4
+    ptr = judge.bits(); ptr.setsize(nbytes)
+    judge_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+    line_mask = (judge_arr[:, :, 3] > 10).astype(np.uint8)  # 不透明=線(境界)
+
+    # 選択範囲内かつ線でない領域を対象候補としてラベリング
+    candidate = ((area_mask > 0) & (line_mask == 0)).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=4)
+
+    # 投げなわ選択範囲の外周ピクセルのうち、その「すぐ外側」が線でない（＝塗りが
+    # 投げなわの外へ漏れ出せる）場所だけを「閉じていない」境界とみなす。
+    # 外側が線（またはキャンバス外）なら、そこで塞がれているので閉じているとみなしてよい。
+    area_bool = area_mask > 0
+    padded_area = np.pad(area_bool, 1, mode='constant', constant_values=False)
+    padded_line = np.pad(line_mask > 0, 1, mode='constant', constant_values=True)
+
+    def _outside_open(shift_area, shift_line):
+        # shift_area: 隣接方向にずらした area_mask（True=そちら側も選択範囲内）
+        # shift_line: 同じ方向にずらした line_mask（True=そちら側は線）
+        return (~shift_area) & (~shift_line)
+
+    up_open    = _outside_open(padded_area[0:h,   1:w+1], padded_line[0:h,   1:w+1])
+    down_open  = _outside_open(padded_area[2:h+2, 1:w+1], padded_line[2:h+2, 1:w+1])
+    left_open  = _outside_open(padded_area[1:h+1, 0:w],   padded_line[1:h+1, 0:w])
+    right_open = _outside_open(padded_area[1:h+1, 2:w+2], padded_line[1:h+1, 2:w+2])
+
+    border = area_bool & (up_open | down_open | left_open | right_open)
+
+    open_labels = set(np.unique(labels[border]))
+    open_labels.discard(0)
+
+    closed_labels = [i for i in range(1, num) if i not in open_labels]
+    if not closed_labels:
+        return 0
+
+    # 閉じた領域はラベリングの時点で既にピクセル集合が確定しているため、
+    # 各領域ごとに scanline flood fill (QImage.pixel/setPixel の逐次呼び出し) を
+    # やり直す必要はない。numpy で一括書き込みすることで大キャンバス・多領域でも
+    # 高速に処理する（従来の実装は領域数×面積に比例して QImage の低速なピクセル
+    # アクセスを繰り返しており、投げなわ内に閉領域が多いと処理落ち・クラッシュしていた）。
+    fill_mask = np.isin(labels, closed_labels)
+
+    nbytes = h * w * 4
+    ptr = image.bits(); ptr.setsize(nbytes)
+    img_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+    img_arr[fill_mask] = (fill_color.blue(), fill_color.green(),
+                           fill_color.red(), fill_color.alpha())
+
+    return len(closed_labels)
 
 
 # ── ポリゴンマスク ─────────────────────────────────────────────────────────────
@@ -280,6 +329,13 @@ class Canvas(QWidget):
         self._drawing = False
         self._preview_start: QPoint | None = None
         self._preview_end: QPoint | None = None
+
+        # ストローク中の背景合成キャッシュ（ペン/消しゴム/ぼかし用）
+        # レイヤー数が多いと毎フレーム全レイヤー再合成が重くなるため、
+        # ストローク開始時に「描画中レイヤー以外」の合成結果を1回だけ作り、
+        # ドラッグ中はそれに描画中レイヤーだけを重ねて使い回す。
+        self._stroke_bg_cache: QImage | None = None
+        self._stroke_layer: object = None
 
         # selection
         self._selection_rect: QRect | None = None
@@ -444,6 +500,21 @@ class Canvas(QWidget):
     def _layer_id(self) -> int | None:
         layer = self.layer_stack.active
         return id(layer) if layer and not layer.is_group else None
+
+    def _begin_stroke_cache(self, layer) -> None:
+        """ストローク開始時に「描画中レイヤー以外」の合成結果をキャッシュする。
+        クリッピング等が絡み安全に省略できない場合はキャッシュしない
+        （その場合 paintEvent は毎回フル合成にフォールバックする）。"""
+        if self.layer_stack.can_fast_preview(layer):
+            self._stroke_layer = layer
+            self._stroke_bg_cache = self.layer_stack.composite(skip=layer)
+        else:
+            self._stroke_layer = None
+            self._stroke_bg_cache = None
+
+    def _end_stroke_cache(self) -> None:
+        self._stroke_layer = None
+        self._stroke_bg_cache = None
 
     def _save_history(self):
         lid = self._layer_id()
@@ -960,6 +1031,19 @@ class Canvas(QWidget):
         変形中は元の切り取り領域を消した状態でフローティング画像を合成して
         リアルタイムプレビューを正しく表示する。"""
         if not self._transform_image or not self._transform_rect:
+            if self._stroke_bg_cache is not None and self._stroke_layer is not None:
+                result = QImage(self._stroke_bg_cache)
+                p = QPainter(result)
+                layer = self._stroke_layer
+                blend = BLEND_KEY_TO_MODE.get(getattr(layer, 'blend_mode', 'normal'))
+                if blend:
+                    p.setCompositionMode(blend)
+                p.setOpacity(layer.opacity / 255)  # type: ignore
+                ox = getattr(layer, 'offset_x', 0)
+                oy = getattr(layer, 'offset_y', 0)
+                p.drawImage(ox, oy, layer.image_with_effects())  # type: ignore
+                p.end()
+                return result
             return self.layer_stack.composite()
 
         # 変形元レイヤーから切り取り領域を消去したプレビュー用合成を作る
@@ -1272,7 +1356,7 @@ class Canvas(QWidget):
             return
 
         if not layer or layer.is_group:
-            if layer and layer.is_group and self.tool in (Tool.PEN, Tool.ERASER, Tool.FILL, Tool.BLUR):
+            if layer and layer.is_group and self.tool in (Tool.PEN, Tool.ERASER, Tool.FILL, Tool.BLUR, Tool.LASSO_FILL):
                 self.status_message.emit("グループレイヤーには描画できません。子レイヤーを選択してください。")
             return
 
@@ -1284,6 +1368,7 @@ class Canvas(QWidget):
 
         if self.tool == Tool.PEN:
             self._save_history()
+            self._begin_stroke_cache(layer)
             self._stabilizer.reset()
             smooth_pt = self._stabilizer.push(lp).toPoint()
             self._last_pos = smooth_pt
@@ -1292,6 +1377,7 @@ class Canvas(QWidget):
 
         elif self.tool == Tool.ERASER:
             self._save_history()
+            self._begin_stroke_cache(layer)
             self._stabilizer.reset()
             self._last_pos = lp
             self._erase_point(layer.image, lp)  # type: ignore
@@ -1299,26 +1385,13 @@ class Canvas(QWidget):
 
         elif self.tool == Tool.FILL:
             self._save_history()
-            refs = [r for r in self.layer_stack.references if r is not layer]
-            if len(refs) == 0:
-                ref_img = None
-            elif len(refs) == 1:
-                ref_img = refs[0].image
-            else:
-                w, h = self.layer_stack.width, self.layer_stack.height
-                ref_img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
-                ref_img.fill(Qt.GlobalColor.transparent)
-                rp = QPainter(ref_img)
-                for r in reversed(refs):
-                    rp.setOpacity(r.opacity / 255)
-                    rp.drawImage(0, 0, r.image)
-                rp.end()
-                ref_img = ref_img.convertToFormat(QImage.Format.Format_ARGB32)
+            ref_img = self._build_fill_reference(layer)
             _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img, self.fill_expand)  # type: ignore
             self.update()
 
         elif self.tool == Tool.BLUR:
             self._save_history()
+            self._begin_stroke_cache(layer)
             self._last_pos = lp
             self._blur_brush.strength = self.blur_strength
             self._blur_brush.stamp(layer.image, lp, self.pen_color, self.blur_size)
@@ -1395,6 +1468,13 @@ class Canvas(QWidget):
                 self._lasso_mask = None
                 self._preview_start = cp
                 self._preview_end = cp
+
+        elif self.tool == Tool.LASSO_FILL:
+            # 常に新規に投げなわを描く専用ツール（選択の持ち上げ・変形は行わない）
+            self._selection_rect = None
+            self._lasso_mask = None
+            self._lasso_path_points = []
+            self._lasso_points = [cp]
 
         elif self.tool == Tool.LASSO:
             if self._transform_image:
@@ -1547,13 +1627,14 @@ class Canvas(QWidget):
             self._preview_end = cp
             self.update()
 
-        elif self.tool == Tool.LASSO:
+        elif self.tool in (Tool.LASSO, Tool.LASSO_FILL):
             self._lasso_points.append(cp)
             self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        self._end_stroke_cache()
         if self._panning:
             self._pan_start_widget = None
             self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -1611,6 +1692,16 @@ class Canvas(QWidget):
             self._sync_ant_timer()
             self.update()
 
+        elif self.tool == Tool.LASSO_FILL and self._lasso_points and len(self._lasso_points) <= 2:
+            # 2点以下でリリース → 範囲を作れないので何もしない
+            self._lasso_points = []
+            self.update()
+
+        elif self.tool == Tool.LASSO_FILL and len(self._lasso_points) > 2:
+            self._apply_lasso_fill(layer, self._lasso_points)
+            self._lasso_points = []
+            self.update()
+
         elif self.tool == Tool.LASSO and self._lasso_points and len(self._lasso_points) <= 2:
             # 2点以下でリリース → 選択できないのでクリア
             self._lasso_points = []
@@ -1641,6 +1732,46 @@ class Canvas(QWidget):
             self.update()
 
         self._last_pos = None
+
+    def _build_fill_reference(self, layer) -> QImage | None:
+        """塗りつぶしの境界判定に使う参照画像（自分以外の参照レイヤーの合成）を作る。"""
+        refs = [r for r in self.layer_stack.references if r is not layer]
+        if len(refs) == 0:
+            return None
+        if len(refs) == 1:
+            return refs[0].image
+        w, h = self.layer_stack.width, self.layer_stack.height
+        ref_img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        ref_img.fill(Qt.GlobalColor.transparent)
+        rp = QPainter(ref_img)
+        for r in reversed(refs):
+            rp.setOpacity(r.opacity / 255)
+            rp.drawImage(0, 0, r.image)
+        rp.end()
+        return ref_img.convertToFormat(QImage.Format.Format_ARGB32)
+
+    def _apply_lasso_fill(self, layer, lasso_points: list[QPoint]) -> None:
+        """投げなわで囲んだ範囲内にある、線で閉じた領域だけを自動で塗りつぶす。"""
+        if not layer or layer.is_group:
+            return
+        w, h = self.layer_stack.width, self.layer_stack.height
+        mask_img = _mask_from_polygon(lasso_points, w, h)
+        nbytes = h * w * 4
+        ptr = mask_img.bits(); ptr.setsize(nbytes)
+        mask_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+        area_mask = (mask_arr[:, :, 3] > 0).astype(np.uint8)
+        if not area_mask.any():
+            return
+
+        self._save_history()
+        ref_img = self._build_fill_reference(layer)
+        # 通常の塗りつぶしツール(Tool.FILL)と同じく、参照画像・レイヤー画像とも
+        # キャンバス座標系のまま扱う（レイヤーオフセットによる座標変換は行わない）
+        filled = _fill_closed_regions_in_area(layer.image, area_mask, self.pen_color, ref_img)  # type: ignore
+        if filled == 0 and self._history and self._history[-1][0] == "pixel":
+            # 何も塗られなかった場合は空の undo エントリを積まない
+            self._history.pop()
+        self.update()
 
     # ── drawing helpers ──────────────────────────────────────────────────────
 
@@ -2200,6 +2331,7 @@ class Canvas(QWidget):
 
     def reset_state(self):
         """新規/開くなどでキャンバスを差し替える前に一切の作業状態を破棄する。"""
+        self._end_stroke_cache()
         self._move_base_image = None
         self._move_base_pos = None
         self._move_group_bases = None

@@ -189,6 +189,16 @@ class Layer:
         result = np.dstack([bgr_out, alpha])
         return self._array_to_qimage(result, w, h)
 
+    def rasterize(self) -> None:
+        """レイヤー効果（縁取り・ドロップシャドウ等）を画像に焼き込み、効果設定を無効化する。
+        以後、統合しても効果が消えたり二重適用されたりしない。"""
+        self.image = self.image_with_effects().convertToFormat(QImage.Format.Format_ARGB32)
+        self.border_enabled = False
+        self.shadow_enabled = False
+        self.glow_enabled = False
+        self.blur_enabled = False
+        self.hsl_enabled = False
+
     @property
     def is_group(self) -> bool:
         return False
@@ -458,14 +468,20 @@ class LayerStack:
         merged.fill(Qt.GlobalColor.transparent)
         p = QPainter(merged)
         p.setOpacity(lower.opacity / 255)
-        p.drawImage(l_ox - min_x, l_oy - min_y, lower.image)
+        p.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
         p.setOpacity(upper.opacity / 255)
-        p.drawImage(u_ox - min_x, u_oy - min_y, upper.image)
+        p.drawImage(u_ox - min_x, u_oy - min_y, upper.image_with_effects())
         p.end()
         lower.image = merged.convertToFormat(QImage.Format.Format_ARGB32)
         lower.opacity = 255
         lower.offset_x = min_x
         lower.offset_y = min_y
+        # 統合後は効果を焼き込み済みなので、旧設定が残って二重適用されないようリセットする
+        lower.border_enabled = False
+        lower.shadow_enabled = False
+        lower.glow_enabled = False
+        lower.blur_enabled = False
+        lower.hsl_enabled = False
 
         container.pop(idx)
         if not container and parent_path:
@@ -523,6 +539,35 @@ class LayerStack:
                 max_y = max(max_y, oy + lyr.image.height())
         return min_x, min_y, max(max_x - min_x, 1), max(max_y - min_y, 1)
 
+    def _folder_bounds(self, layers) -> tuple[int, int, int, int]:
+        """フォルダ結合用: 渡されたレイヤー群だけのバウンディングボックスを返す
+        (min_x, min_y, w, h)。_visible_bounds と違いキャンバス全体を初期値に
+        含めない（そうしないと結合結果が常にキャンバス全面サイズになってしまう）。"""
+        vals = None
+        for lyr in layers:
+            if lyr.is_group:
+                if vals is None:
+                    ox = getattr(lyr.children[0], 'offset_x', 0) if lyr.children else 0
+                    oy = getattr(lyr.children[0], 'offset_y', 0) if lyr.children else 0
+                    vals = [ox, oy, ox, oy]
+                self._expand_bounds_group_accum(lyr, vals)
+            else:
+                ox = getattr(lyr, 'offset_x', 0)
+                oy = getattr(lyr, 'offset_y', 0)
+                mx = ox + lyr.image.width()
+                my = oy + lyr.image.height()
+                if vals is None:
+                    vals = [ox, oy, mx, my]
+                else:
+                    vals[0] = min(vals[0], ox)
+                    vals[1] = min(vals[1], oy)
+                    vals[2] = max(vals[2], mx)
+                    vals[3] = max(vals[3], my)
+        if vals is None:
+            return 0, 0, 1, 1
+        min_x, min_y, max_x, max_y = vals
+        return min_x, min_y, max(max_x - min_x, 1), max(max_y - min_y, 1)
+
     def _expand_bounds_group_accum(self, group, vals):
         for child in group.children:
             if child.is_group:
@@ -548,7 +593,10 @@ class LayerStack:
             p.setOpacity(lyr.opacity / 255)
             p.drawImage(ox - off_x, oy - off_y, img)
 
-    def composite(self) -> QImage:
+    def composite(self, skip: object = None) -> QImage:
+        """全レイヤーを合成する。skip を指定すると、そのトップレベルレイヤー
+        （通常レイヤーのみ・クリッピングと無関係なもの）の描画だけを省略する
+        （ストローク中の背景キャッシュ用）。"""
         result = QImage(self.width, self.height, QImage.Format.Format_ARGB32)
         result.fill(Qt.GlobalColor.transparent)
         if not self.layers:
@@ -558,6 +606,8 @@ class LayerStack:
         for i in range(len(self.layers) - 1, -1, -1):
             layer = self.layers[i]
             if not layer.visible:
+                continue
+            if layer is skip:
                 continue
 
             ox = getattr(layer, 'offset_x', 0)
@@ -595,3 +645,18 @@ class LayerStack:
 
         p.end()
         return result
+
+    def can_fast_preview(self, layer: object) -> bool:
+        """layer が単独で（クリッピングの授受なしに）差し替え描画できるトップレベル
+        の通常レイヤーかどうかを返す。True ならストローク中の背景キャッシュが使える。"""
+        if layer is None or layer.is_group:  # type: ignore
+            return False
+        try:
+            i = self.layers.index(layer)
+        except ValueError:
+            return False
+        if layer.clipping:  # type: ignore
+            return False
+        if i > 0 and self.layers[i - 1].clipping:
+            return False
+        return True

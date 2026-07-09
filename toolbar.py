@@ -18,6 +18,7 @@ TOOL_SHORTCUTS: dict[Tool, str] = {
     Tool.BLUR:       "B",
     Tool.SELECT_RECT:"S",
     Tool.LASSO:      "Q",
+    Tool.LASSO_FILL: "W",
     Tool.MOVE:       "V",
     Tool.TRANSFORM:  "F",
 }
@@ -37,6 +38,7 @@ _TOOL_ICONS: dict[Tool, str] = {
     Tool.BLUR: "💧",
     Tool.SELECT_RECT: "⬚",
     Tool.LASSO: "〇",
+    Tool.LASSO_FILL: "\U0001f7e2",
     Tool.MOVE: "✥",
     Tool.TRANSFORM: "⤢",
 }
@@ -53,6 +55,7 @@ _TOOL_LABELS: dict[Tool, str] = {
     Tool.BLUR: "ぼかし",
     Tool.SELECT_RECT: "矩形選択",
     Tool.LASSO: "投げなわ",
+    Tool.LASSO_FILL: "囲み内塗りつぶし",
     Tool.MOVE: "移動",
     Tool.TRANSFORM: "自由変形",
 }
@@ -149,6 +152,17 @@ def make_tool_cursors() -> dict[Tool, QCursor]:
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
 
+    def _lasso_fill(p: QPainter, s: int):
+        from PyQt6.QtGui import QPainterPath
+        path = QPainterPath()
+        path.moveTo(12, 4)
+        path.cubicTo(20, 4, 22, 12, 18, 16)
+        path.cubicTo(14, 20, 6, 20, 4, 14)
+        path.cubicTo(2, 8, 6, 4, 12, 4)
+        p.setPen(QPen(QColor(0, 0, 0), 1.5, Qt.PenStyle.DashLine))
+        p.setBrush(QBrush(QColor(100, 160, 255, 120)))
+        p.drawPath(path)
+
     def _blur(p: QPainter, s: int):
         p.setPen(QPen(QColor(100, 140, 220), 2))
         p.setBrush(QBrush(QColor(100, 140, 220, 60)))
@@ -174,6 +188,7 @@ def make_tool_cursors() -> dict[Tool, QCursor]:
     cursors[Tool.TEXT] = _make_cursor_pixmap(_text, hot=(12, 12))
     cursors[Tool.SELECT_RECT] = _make_cursor_pixmap(_select, hot=(12, 12))
     cursors[Tool.LASSO] = _make_cursor_pixmap(_lasso, hot=(12, 12))
+    cursors[Tool.LASSO_FILL] = _make_cursor_pixmap(_lasso_fill, hot=(12, 12))
     cursors[Tool.BLUR] = _make_cursor_pixmap(_blur, hot=(12, 12))
     cursors[Tool.MOVE] = QCursor(Qt.CursorShape.SizeAllCursor)
     cursors[Tool.TRANSFORM] = _make_cursor_pixmap(_transform, hot=(12, 12))
@@ -314,6 +329,11 @@ class Toolbar(QWidget):
     def set_color(self, color: QColor):
         self._swatch.set_color(color)
         self.color_changed.emit(color)
+
+    def set_color_preview(self, color: QColor):
+        """スウォッチの見た目だけ更新し、履歴には追加しない
+        （HSVスライダーのドラッグ中など、確定前の中間値向け）。"""
+        self._swatch.set_color(color)
 
     def push_color(self, color: QColor):
         """色を使用履歴に追加する（同色は先頭へ移動）。"""

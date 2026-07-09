@@ -83,6 +83,7 @@ class ToolOptionsPanel(QWidget):
             Tool.ELLIPSE: "楕円",
             Tool.SELECT_RECT: "矩形選択",
             Tool.LASSO: "投げなわ",
+            Tool.LASSO_FILL: "囲み内塗りつぶし",
             Tool.BLUR: "ぼかし",
             Tool.MOVE: "移動",
             Tool.TRANSFORM: "自由変形",

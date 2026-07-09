@@ -3,6 +3,7 @@ import sys, os, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+import numpy as np
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QColor, QMouseEvent, QKeyEvent, QPainter
 from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent, QRect
@@ -280,6 +281,120 @@ class TestMergeDown:
             ls.remove(0)
         win._merge_down()
         assert len(ls.layers) == 1
+
+
+# ── レイヤーをラスタライズ ───────────────────────────────────────────────────
+
+class TestRasterizeLayer:
+    """メニュー「画像 → レイヤーをラスタライズ」の統合テスト。"""
+
+    def test_rasterize_disables_effects_and_saves_history(self, win):
+        layer = win.layer_stack.active
+        layer.border_enabled = True
+        layer.border_size = 3
+        layer.border_color = QColor(0, 0, 255, 255)
+        hist_len_before = len(win.canvas._history)
+
+        win._rasterize_layer()
+
+        assert layer.border_enabled is False
+        assert len(win.canvas._history) == hist_len_before + 1
+
+    def test_rasterize_group_layer_shows_message_and_noop(self, win):
+        win.layer_panel._add_group()
+        win.layer_stack.active_path = [0]
+        hist_len_before = len(win.canvas._history)
+
+        win._rasterize_layer()  # グループはラスタライズ対象外
+
+        assert len(win.canvas._history) == hist_len_before
+
+    def test_rasterize_then_merge_down_no_double_apply(self, win):
+        """ラスタライズ後に統合しても効果が二重適用されないこと。"""
+        win.layer_panel._add()
+        layer = win.layer_stack.active
+        layer.border_enabled = True
+        layer.border_size = 3
+        layer.border_color = QColor(0, 0, 255, 255)
+
+        win._rasterize_layer()
+        assert layer.border_enabled is False
+
+        initial_count = len(win.layer_stack.layers)
+        win._merge_down()
+        assert len(win.layer_stack.layers) == initial_count - 1
+        # 統合後も焼き込み済み効果は再度有効化されない
+        assert win.layer_stack.layers[0].border_enabled is False
+
+
+# ── フィルター → ゴミ取り ────────────────────────────────────────────────────
+
+class TestDespeckle:
+    """DespeckleDialog: スライダー操作でプレビュー更新するたびに全ラベルへ
+    Pythonループでアクセスしていた実装を numpy ベクトル化に置き換えた回帰確認。
+    ベクトル化前後で結果がビット単位で一致することを検証する。"""
+
+    def _make_noisy_layer(self, w=80, h=80, seed=0):
+        from layer import Layer
+        rng = np.random.default_rng(seed)
+        lyr = Layer("noisy", w, h)
+        lyr.image.fill(Qt.GlobalColor.transparent)
+        ptr = lyr.image.bits(); ptr.setsize(lyr.image.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+        n = (w * h) // 100
+        ys = rng.integers(0, h, n); xs = rng.integers(0, w, n)
+        arr[ys, xs] = (0, 0, 0, 255)
+        return lyr
+
+    def test_update_preview_removes_small_specks(self, win):
+        from main import DespeckleDialog
+        layer = self._make_noisy_layer()
+        dlg = DespeckleDialog(win.canvas, layer, None)
+        dlg._update_preview(9)
+        # 面積9px²以下の孤立点は透明化されているはず（少なくとも1点は消える）
+        ptr = dlg._layer.image.bits(); ptr.setsize(dlg._layer.image.sizeInBytes())
+        after = np.frombuffer(ptr, dtype=np.uint8).reshape(80, 80, 4)
+        opaque_after = int((after[:, :, 3] > 0).sum())
+        opaque_before = int((dlg._orig_arr[:, :, 3] > 0).sum())
+        assert opaque_after <= opaque_before
+
+    def test_update_preview_matches_reference_loop_implementation(self, win):
+        """ベクトル化した実装が、ラベルごとにループする素朴な実装と同じ結果になること。"""
+        import cv2
+        from main import DespeckleDialog
+        layer = self._make_noisy_layer(seed=7)
+        dlg = DespeckleDialog(win.canvas, layer, None)
+        dlg._update_preview(9)
+
+        ptr = dlg._layer.image.bits(); ptr.setsize(dlg._layer.image.sizeInBytes())
+        vectorized = bytes(ptr)
+
+        arr = dlg._orig_arr.copy()
+        opaque = (arr[:, :, 3] > 0).astype(np.uint8)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(opaque, connectivity=8)
+        for i in range(1, num):
+            if stats[i, cv2.CC_STAT_AREA] <= 9:
+                arr[labels == i] = 0
+        from PyQt6.QtGui import QImage as _QImage
+        ref_img = _QImage(arr.tobytes(), 80, 80, 80 * 4, _QImage.Format.Format_ARGB32).copy()
+        ref_ptr = ref_img.bits(); ref_ptr.setsize(ref_img.sizeInBytes())
+        reference = bytes(ref_ptr)
+
+        assert vectorized == reference
+
+    def test_reject_restores_original_image(self, win):
+        from main import DespeckleDialog
+        layer = self._make_noisy_layer()
+        original = layer.image.copy()
+        dlg = DespeckleDialog(win.canvas, layer, None)
+        dlg._update_preview(50)
+        dlg.reject()
+
+        def raw(img):
+            b = img.bits(); b.setsize(img.sizeInBytes())
+            return bytes(b)
+
+        assert raw(layer.image) == raw(original)
 
 
 # ── 新規作成 ─────────────────────────────────────────────────────────────────

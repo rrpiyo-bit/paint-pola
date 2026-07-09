@@ -305,8 +305,11 @@ class MiniSwatch(QFrame):
 
 
 class HsvSlider(QWidget):
-    """H / S / V それぞれのスライダー。色が変わると color_changed を emit。"""
+    """H / S / V それぞれのスライダー。色が変わると color_changed を emit。
+    ドラッグ操作が確定した（指を離した）時には color_committed も emit する
+    （履歴への追加はこちらだけを使い、ドラッグ中の中間値で履歴を汚さないようにする）。"""
     color_changed = pyqtSignal(QColor)
+    color_committed = pyqtSignal(QColor)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -331,6 +334,10 @@ class HsvSlider(QWidget):
         self._s.valueChanged.connect(self._emit)
         self._v.valueChanged.connect(self._emit)
         self._a.valueChanged.connect(self._emit)
+        self._h.sliderReleased.connect(self._emit_committed)
+        self._s.sliderReleased.connect(self._emit_committed)
+        self._v.sliderReleased.connect(self._emit_committed)
+        self._a.sliderReleased.connect(self._emit_committed)
 
         # 初期値: 黒・不透明
         self._h.setValue(0)
@@ -344,12 +351,19 @@ class HsvSlider(QWidget):
         sl.setFixedHeight(18)
         return sl
 
+    def _current(self) -> QColor:
+        return QColor.fromHsv(self._h.value(), self._s.value(),
+                               self._v.value(), self._a.value())
+
     def _emit(self):
         if self._block:
             return
-        c = QColor.fromHsv(self._h.value(), self._s.value(),
-                            self._v.value(), self._a.value())
-        self.color_changed.emit(c)
+        self.color_changed.emit(self._current())
+
+    def _emit_committed(self):
+        if self._block:
+            return
+        self.color_committed.emit(self._current())
 
     def set_color(self, color: QColor):
         self._block = True
@@ -364,6 +378,7 @@ class HsvSlider(QWidget):
 class ColorPanel(QWidget):
     """カラーパネル全体。タイトルバーで全体を折りたたみ可能。"""
     color_changed = pyqtSignal(QColor)
+    color_committed = pyqtSignal(QColor)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -403,6 +418,7 @@ class ColorPanel(QWidget):
         self._sec_hsv = CollapsibleSection("HSV スライダー")
         self._hsv = HsvSlider()
         self._hsv.color_changed.connect(self._on_hsv_change)
+        self._hsv.color_committed.connect(self._on_hsv_committed)
         self._sec_hsv.add_widget(self._hsv)
         body_layout.addWidget(self._sec_hsv)
 
@@ -464,6 +480,9 @@ class ColorPanel(QWidget):
         self._current = color
         self._preview.set_color(color)
         self.color_changed.emit(color)
+
+    def _on_hsv_committed(self, color: QColor):
+        self.color_committed.emit(color)
 
     def _on_swatch_click(self, color: QColor):
         self.set_color(color)

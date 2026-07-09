@@ -119,6 +119,80 @@ class LineExtractionDialog(QDialog):
         return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
 
 
+class DespeckleDialog(QDialog):
+    """フィルター → ゴミ取り: 面積が指定px²以下の孤立した不透明の塊を透明化する。
+    キャンバス上でリアルタイムにプレビューし、OKで確定・キャンセルで元に戻す。"""
+
+    def __init__(self, canvas, layer, area_mask: np.ndarray | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ゴミ取り")
+        self.setMinimumWidth(360)
+        self._canvas = canvas
+        self._layer = layer
+        self._orig_image = layer.image.copy()
+        self._area_mask = area_mask  # 選択範囲マスク（None ならレイヤー全体が対象）
+
+        img = self._orig_image
+        w, h = img.width(), img.height()
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        self._orig_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
+
+        root = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        self._size = QSlider(Qt.Orientation.Horizontal)
+        self._size.setRange(1, 500)
+        self._size.setValue(9)
+        self._size_label = QLabel("9 px²")
+        self._size_label.setFixedWidth(60)
+        row.addWidget(self._size)
+        row.addWidget(self._size_label)
+        form = QFormLayout()
+        form.addRow("除去する面積のしきい値", row)
+        root.addLayout(form)
+
+        hint = QLabel("指定した面積（px²）以下の、孤立した塗り残し・ゴミ点を透明化して消します。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        root.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._size.valueChanged.connect(self._update_preview)
+        self._update_preview(self._size.value())
+
+    def _update_preview(self, value: int):
+        self._size_label.setText(f"{value} px²")
+        arr = self._orig_arr.copy()
+        alpha = arr[:, :, 3]
+        opaque = (alpha > 0).astype(np.uint8)
+        if self._area_mask is not None:
+            opaque = opaque & self._area_mask
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(opaque, connectivity=8)
+        # ラベルごとに arr[labels==i]=0 をループすると、ラベル数×画像サイズの計算量になり
+        # スライダードラッグ中（valueChanged が高頻度発火）に固まる原因になっていたため、
+        # しきい値以下のラベルIDだけを一括で調べる numpy ベクトル化に置き換える。
+        areas = stats[:, cv2.CC_STAT_AREA]
+        small_label_mask = areas <= value
+        small_label_mask[0] = False  # 背景(ラベル0)は対象外
+        remove_mask = small_label_mask[labels]
+        arr[remove_mask] = 0
+        h, w = arr.shape[:2]
+        result = QImage(arr.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+        self._layer.image = result
+        self._canvas.update()
+
+    def reject(self):
+        self._layer.image = self._orig_image
+        self._canvas.update()
+        super().reject()
+
+
 class NewCanvasDialog(QDialog):
     PRESETS = [
         ("正方形 2500px",  2500, 2500),
@@ -658,9 +732,13 @@ class MainWindow(QMainWindow):
         self.canvas.color_picked.connect(self._on_color_change)
         self.canvas.color_picked.connect(self.color_panel.set_color)
         # カラーパネルからの色変更
-        # set_color → color_changed → push_color のルートが既にあるため直接接続は不要
+        # HSV スライダーはドラッグ中に大量の中間値を emit するため、
+        # ライブプレビュー（ペン色・スウォッチ反映）は color_changed で、
+        # 履歴への登録はドラッグ確定時の color_committed でのみ行う
+        # （そうしないと履歴が中間値で埋め尽くされてしまう）
         self.color_panel.color_changed.connect(self._on_color_change)
-        self.color_panel.color_changed.connect(self.toolbar.set_color)
+        self.color_panel.color_changed.connect(self.toolbar.set_color_preview)
+        self.color_panel.color_committed.connect(self.toolbar.set_color)
         # ツールキーボードショートカット
         self.canvas.tool_shortcut_pressed.connect(self.toolbar.select_tool)
         self.toolbar.undo_requested.connect(self.canvas.undo)
@@ -810,6 +888,9 @@ class MainWindow(QMainWindow):
         right_splitter.setStretchFactor(1, 0)
         right_splitter.setStretchFactor(2, 1)
 
+        # ナビゲーター・カラーパネルを小さめに固定し、残りをレイヤーパネルに割り当てる
+        right_splitter.setSizes([160, 260, 9999])
+
         root.addWidget(right_splitter)
 
     def _build_menus(self):
@@ -844,12 +925,14 @@ class MainWindow(QMainWindow):
         self._add_action(image_menu, "下に統合", self._merge_down, "Ctrl+M")
         self._add_action(image_menu, "表示レイヤーを統合", self._merge_all_visible, "Ctrl+Shift+M")
         self._add_action(image_menu, "フォルダを結合", self._merge_folder)
+        self._add_action(image_menu, "レイヤーをラスタライズ", self._rasterize_layer)
         image_menu.addSeparator()
         self._add_action(image_menu, "線画抽出...", self._extract_line)
         self._add_action(image_menu, "レイヤーを変形（拡大縮小・回転）...", self._transform_layer_dialog)
 
         filter_menu = mb.addMenu("フィルター")
         self._add_action(filter_menu, "ぼかし (ガウス)...", self._filter_blur)
+        self._add_action(filter_menu, "ゴミ取り...", self._filter_despeckle)
 
         view_menu = mb.addMenu("表示")
         zoom_menu = view_menu.addMenu("ズーム")
@@ -1434,18 +1517,21 @@ class MainWindow(QMainWindow):
 
     def _merge_selected(self):
         """選択されたレイヤーのみを結合（レイヤーパネルから呼ばれる）。"""
-        # 現在のアクティブレイヤーがグループの場合、そのグループを統合
-        active = self.layer_stack.active_top
-        if active and active.is_group and active.children:  # type: ignore
+        # 現在選択中のレイヤー（ネストしたフォルダの場合も、実際に選択されている
+        # そのフォルダ自身を対象にする。active_top は常にトップレベルの祖先を返す
+        # ため、ネストしたフォルダを選択した場合に外側ごと統合されてしまうバグがあった）
+        active = self.layer_stack.active
+        path = self.layer_stack.active_path
+        if active and active.is_group and active.children and path:  # type: ignore
             self.canvas.reset_state()
             self.canvas.save_structure_history()
             grp = active
-            idx = self.layer_stack.active_index
-            # グループ内のレイヤーの全範囲を計算して統合
+            container, parent_path = self.layer_stack.parent_of(path)
+            idx = path[-1]
+            # グループ内のレイヤーの全範囲を計算して統合（このフォルダの子のみを対象とする）
             visible_children = [c for c in grp.children if c.visible]
             if visible_children:
-                bounds = self.layer_stack._visible_bounds(visible_children)
-                min_x, min_y, mw, mh = bounds
+                min_x, min_y, mw, mh = self.layer_stack._folder_bounds(visible_children)
             else:
                 min_x, min_y = 0, 0
                 mw, mh = self.layer_stack.width, self.layer_stack.height
@@ -1462,8 +1548,8 @@ class MainWindow(QMainWindow):
             new_layer.offset_y = min_y
             new_layer.opacity = grp.opacity
             new_layer.visible = grp.visible
-            self.layer_stack.layers[idx] = new_layer
-            self.layer_stack.active_path = [idx]
+            container[idx] = new_layer
+            self.layer_stack.active_path = parent_path + [idx]
             self.layer_panel.refresh()
             self.canvas.update()
             self.navigator.refresh()
@@ -1472,6 +1558,19 @@ class MainWindow(QMainWindow):
 
     def _merge_folder(self):
         self._merge_selected()
+
+    def _rasterize_layer(self):
+        """レイヤーをラスタライズ: 縁取り・ドロップシャドウ等の効果を画像に焼き込み、
+        効果設定を無効化する。以後の統合で効果が消えたり二重適用されたりしなくなる。"""
+        layer = self.canvas.layer_stack.active
+        if not layer or layer.is_group:
+            self.statusBar().showMessage("通常レイヤーを選択してください", 3000)
+            return
+        self.canvas._save_history()
+        layer.rasterize()
+        self.layer_panel.refresh()
+        self.canvas.update()
+        self.navigator.refresh()
 
     def _filter_blur(self):
         """フィルター → ぼかし (ガウス): レイヤー全体または選択範囲にガウスぼかしをかける。"""
@@ -1526,6 +1625,41 @@ class MainWindow(QMainWindow):
         p.drawImage(0, 0, result)
         p.end()
         self.canvas.update()
+
+    def _filter_despeckle(self):
+        """フィルター → ゴミ取り: 選択レイヤー上の孤立した小さな塊（面積 px² 以下）を透明化する。"""
+        layer = self.canvas.layer_stack.active
+        if not layer or layer.is_group:
+            QMessageBox.warning(self, "ゴミ取り", "通常レイヤーを選択してください。")
+            return
+
+        area_mask = None
+        sel = self.canvas._selection_rect
+        mask = self.canvas._lasso_mask
+        w, h = layer.image.width(), layer.image.height()
+        if mask is not None:
+            m_bits = mask.bits()
+            m_bits.setsize(mask.sizeInBytes())
+            m_arr = np.frombuffer(m_bits, dtype=np.uint8).reshape(mask.height(), mask.width(), 4)
+            area_mask = (m_arr[:, :, 3] > 0).astype(np.uint8)
+        elif sel:
+            area_mask = np.zeros((h, w), dtype=np.uint8)
+            x0 = max(0, sel.left())
+            y0 = max(0, sel.top())
+            x1 = min(w, sel.right() + 1)
+            y1 = min(h, sel.bottom() + 1)
+            area_mask[y0:y1, x0:x1] = 1
+
+        self.canvas._save_history()
+        dlg = DespeckleDialog(self.canvas, layer, area_mask, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # キャンセル時は _save_history() で積んだ undo エントリを巻き戻す
+            if self.canvas._history and self.canvas._history[-1][0] == "pixel":
+                self.canvas._history.pop()
+            return
+        self.layer_panel.refresh()
+        self.canvas.update()
+        self.navigator.refresh()
 
     def _history_pop_last_structure(self):
         if self.canvas._history and self.canvas._history[-1][0] == "structure":

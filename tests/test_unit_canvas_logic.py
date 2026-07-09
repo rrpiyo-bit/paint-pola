@@ -9,9 +9,12 @@ from PyQt6.QtCore import Qt, QPoint
 
 app = QApplication.instance() or QApplication(sys.argv)
 
+import numpy as np
+
 import canvas as canvas_mod
 _flood_fill = canvas_mod._flood_fill
 _flood_fill_expanded = canvas_mod._flood_fill_expanded
+_fill_closed_regions_in_area = canvas_mod._fill_closed_regions_in_area
 
 W, H = 60, 60
 
@@ -159,3 +162,73 @@ class TestFloodFillExpanded:
         near_boundary_minus = px(img_minus, W // 2 + 2, H // 2).red()
         # 拡張 >= 縮小 であることを確認（縮小版は境界近くが白に戻る）
         assert near_boundary_plus >= near_boundary_minus
+
+
+# ── _fill_closed_regions_in_area（投げなわ選択内の閉領域塗りつぶし）──────────────
+
+class TestFillClosedRegionsInArea:
+    """クリスタ風「投げなわで囲んだ範囲内の閉じた線画領域だけを塗る」機能。
+    大キャンバス・多数の閉領域でも高速に処理できるよう、cv2.connectedComponents の
+    ラベルをそのまま numpy で一括書き込みする実装になっている（QImage.setPixel の
+    逐次呼び出しによるフリーズ/クラッシュを避けるため）。"""
+
+    def test_closed_region_is_filled(self):
+        img = make_transparent_image()
+        p = QPainter(img)
+        p.setPen(QPen(QColor(0, 0, 0, 255)))
+        p.drawRect(10, 10, 30, 30)  # 完全に閉じた四角
+        p.end()
+
+        # area_mask は画像端に達しないようにする（端に達すると外周は常に閉扱いになる
+        # 既存の境界判定仕様のため、テストの意図がぼやけるのを避ける）
+        area_mask = np.zeros((H, W), dtype=np.uint8)
+        area_mask[5:H - 5, 5:W - 5] = 1
+
+        filled = _fill_closed_regions_in_area(img, area_mask, QColor(0, 255, 0, 255), None)
+        assert filled == 1
+        assert px(img, 25, 25).green() == 255
+        # 境界線自体は塗り替えられない
+        assert px(img, 10, 25).green() != 255
+
+    def test_open_region_is_not_filled(self):
+        img = make_transparent_image()
+        p = QPainter(img)
+        p.setPen(QPen(QColor(0, 0, 0, 255)))
+        # 下辺のない、閉じていない四角
+        p.drawLine(10, 10, 40, 10)
+        p.drawLine(10, 10, 10, 40)
+        p.drawLine(40, 10, 40, 40)
+        p.end()
+
+        area_mask = np.zeros((H, W), dtype=np.uint8)
+        area_mask[5:H - 5, 5:W - 5] = 1
+
+        filled = _fill_closed_regions_in_area(img, area_mask, QColor(0, 255, 0, 255), None)
+        assert filled == 0
+
+    def test_empty_area_mask_fills_nothing(self):
+        img = make_transparent_image()
+        area_mask = np.zeros((H, W), dtype=np.uint8)
+        filled = _fill_closed_regions_in_area(img, area_mask, QColor(255, 0, 0, 255), None)
+        assert filled == 0
+
+    def test_multiple_closed_regions_all_filled(self):
+        """投げなわ内に複数の閉領域があれば全て塗られる（多数領域での一括処理を確認）。"""
+        img = make_transparent_image()
+        p = QPainter(img)
+        p.setPen(QPen(QColor(0, 0, 0, 255)))
+        p.drawRect(5, 5, 10, 10)
+        p.drawRect(20, 5, 10, 10)
+        p.drawRect(5, 20, 10, 10)
+        p.drawRect(20, 20, 10, 10)
+        p.end()
+
+        area_mask = np.zeros((H, W), dtype=np.uint8)
+        area_mask[0:H, 0:W - 5] = 1  # 4つの四角を含み画像端に達しない範囲
+
+        filled = _fill_closed_regions_in_area(img, area_mask, QColor(255, 0, 255, 255), None)
+        assert filled == 4
+        assert px(img, 10, 10).red() == 255
+        assert px(img, 25, 10).red() == 255
+        assert px(img, 10, 25).red() == 255
+        assert px(img, 25, 25).red() == 255
