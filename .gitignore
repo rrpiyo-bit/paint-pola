@@ -42,3 +42,6 @@ Thumbs.db
 
 # 生成物
 images/samples/
+
+# ユーザーの作品データ（検証用に置かれた個人の .pola ファイル等）
+images/*.pola

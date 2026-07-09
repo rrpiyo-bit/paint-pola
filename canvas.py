@@ -1754,19 +1754,28 @@ class Canvas(QWidget):
         """投げなわで囲んだ範囲内にある、線で閉じた領域だけを自動で塗りつぶす。"""
         if not layer or layer.is_group:
             return
-        w, h = self.layer_stack.width, self.layer_stack.height
-        mask_img = _mask_from_polygon(lasso_points, w, h)
-        nbytes = h * w * 4
+        # layer.image はキャンバスと同じ大きさとは限らない（貼り付け直後のレイヤー等は
+        # offset_x/offset_y 付きでキャンバスより大きいことがある）。投げなわ範囲は
+        # キャンバス座標系の点で来るため、layer.image のローカル座標系に変換してから
+        # そのサイズでマスクを作る（Tool.FILL が lp = cp - offset で変換しているのと同じ考え方）。
+        lox = getattr(layer, 'offset_x', 0)
+        loy = getattr(layer, 'offset_y', 0)
+        local_points = [QPoint(p.x() - lox, p.y() - loy) for p in lasso_points]
+        lw, lh = layer.image.width(), layer.image.height()
+        mask_img = _mask_from_polygon(local_points, lw, lh)
+        nbytes = lh * lw * 4
         ptr = mask_img.bits(); ptr.setsize(nbytes)
-        mask_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+        mask_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(lh, lw, 4)
         area_mask = (mask_arr[:, :, 3] > 0).astype(np.uint8)
         if not area_mask.any():
             return
 
         self._save_history()
         ref_img = self._build_fill_reference(layer)
-        # 通常の塗りつぶしツール(Tool.FILL)と同じく、参照画像・レイヤー画像とも
-        # キャンバス座標系のまま扱う（レイヤーオフセットによる座標変換は行わない）
+        if ref_img is not None and (ref_img.width() != lw or ref_img.height() != lh):
+            # 参照レイヤーはキャンバス座標系の合成画像なので、対象レイヤーのローカル
+            # 座標系に合わせて切り出す（サイズ不一致のままだと numpy 演算が失敗する）。
+            ref_img = ref_img.copy(lox, loy, lw, lh)
         filled = _fill_closed_regions_in_area(layer.image, area_mask, self.pen_color, ref_img)  # type: ignore
         if filled == 0 and self._history and self._history[-1][0] == "pixel":
             # 何も塗られなかった場合は空の undo エントリを積まない

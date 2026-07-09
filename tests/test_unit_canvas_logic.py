@@ -15,6 +15,9 @@ import canvas as canvas_mod
 _flood_fill = canvas_mod._flood_fill
 _flood_fill_expanded = canvas_mod._flood_fill_expanded
 _fill_closed_regions_in_area = canvas_mod._fill_closed_regions_in_area
+Canvas = canvas_mod.Canvas
+
+from layer import Layer, LayerStack
 
 W, H = 60, 60
 
@@ -232,3 +235,51 @@ class TestFillClosedRegionsInArea:
         assert px(img, 25, 10).red() == 255
         assert px(img, 10, 25).red() == 255
         assert px(img, 25, 25).red() == 255
+
+
+# ── Canvas._apply_lasso_fill（投げなわツールのマウス操作フロー）───────────────
+
+class TestApplyLassoFill:
+    """貼り付け直後のレイヤー等、layer.image がキャンバスより大きく offset_x/offset_y
+    を持つ場合にクラッシュしないこと（実際のユーザーファイルで再現した不具合の回帰確認）。
+    投げなわの点はキャンバス座標系で来るため、layer.image のローカル座標系に変換してから
+    処理する必要がある。変換を忘れると area_mask と layer.image の shape が食い違い、
+    numpy の broadcast エラーで落ちる。"""
+
+    def test_oversized_offset_layer_does_not_crash(self):
+        """キャンバスより大きく offset を持つレイヤーでもクラッシュしない。"""
+        stack = LayerStack(200, 200)
+        lyr = Layer("big", 400, 400)
+        lyr.image.fill(Qt.GlobalColor.transparent)
+        lyr.offset_x = -50
+        lyr.offset_y = -50
+        stack.layers = [lyr]
+        stack.active_path = [0]
+
+        c = Canvas(stack)
+        pts = [QPoint(40, 40), QPoint(110, 40), QPoint(110, 110), QPoint(40, 110)]
+        c._apply_lasso_fill(lyr, pts)  # 例外が出ないこと
+
+    def test_oversized_offset_layer_fills_correct_local_position(self):
+        """キャンバス座標で指定した投げなわが、レイヤーのローカル座標系の正しい位置に反映される。"""
+        stack = LayerStack(200, 200)
+        lyr = Layer("big", 400, 400)
+        lyr.image.fill(Qt.GlobalColor.transparent)
+        lyr.offset_x = -50
+        lyr.offset_y = -50
+        # レイヤーローカル座標 (100,100)-(150,150) に閉じた四角 → キャンバス座標では (50,50)-(100,100)
+        p = QPainter(lyr.image)
+        p.setPen(QPen(QColor(0, 0, 0, 255)))
+        p.drawRect(100, 100, 50, 50)
+        p.end()
+        stack.layers = [lyr]
+        stack.active_path = [0]
+
+        c = Canvas(stack)
+        c.pen_color = QColor(255, 0, 0, 255)
+        # キャンバス座標 (40,40)-(110,110) で四角を囲む
+        pts = [QPoint(40, 40), QPoint(110, 40), QPoint(110, 110), QPoint(40, 110)]
+        c._apply_lasso_fill(lyr, pts)
+
+        assert px(lyr.image, 125, 125).red() == 255   # 四角の内側（ローカル座標）
+        assert px(lyr.image, 10, 10).alpha() == 0      # 範囲外は変化なし
