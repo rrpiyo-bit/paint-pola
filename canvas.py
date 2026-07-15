@@ -342,6 +342,7 @@ class Canvas(QWidget):
         self._lasso_points: list[QPoint] = []
         self._lasso_mask: QImage | None = None
         self._lasso_path_points: list[QPoint] = []  # 確定後の投げ縄パス（表示用）
+        self._selection_outline_path: QPainterPath | None = None  # レイヤー形状選択の表示用輪郭（複数パス対応）
 
         # パスピックモード（アクション用: クリックでパスの点を打つ）
         self._path_pick_active: bool = False
@@ -730,6 +731,8 @@ class Canvas(QWidget):
             for pt in self._lasso_points[1:]:
                 lasso_path.lineTo(QPointF(pt))
             self._draw_marching_ants(p, path=lasso_path)
+        elif self._selection_outline_path is not None and self._selection_rect:
+            self._draw_marching_ants(p, path=self._selection_outline_path)
         elif self._lasso_path_points and self._selection_rect:
             lasso_path = QPainterPath()
             lasso_path.moveTo(QPointF(self._lasso_path_points[0]))
@@ -1178,6 +1181,11 @@ class Canvas(QWidget):
             p.drawRect(QRectF(pt.x() - 4, pt.y() - 4, 8, 8))
 
         if self._perspective_corners:
+            rot_wp = self._rotation_handle_widget()
+            if rot_wp:
+                p.setBrush(QBrush(QColor(255, 180, 0)))
+                p.setPen(QPen(SELECTION_COLOR, 1))
+                p.drawEllipse(QRectF(rot_wp.x() - 6, rot_wp.y() - 6, 12, 12))
             return
 
         # ピボットポイントを表示
@@ -1235,6 +1243,12 @@ class Canvas(QWidget):
                 else:
                     p.setBrush(QColor(255, 200, 100))
                     p.drawEllipse(QRectF(wpt.x() - 3, wpt.y() - 3, 6, 6))
+
+        rot_wp = self._rotation_handle_widget()
+        if rot_wp:
+            p.setBrush(QBrush(QColor(255, 180, 0)))
+            p.setPen(QPen(SELECTION_COLOR, 1))
+            p.drawEllipse(QRectF(rot_wp.x() - 6, rot_wp.y() - 6, 12, 12))
 
     def _draw_cursor_circle(self, p: QPainter):
         """ウィジェット座標系でブラシサイズを示す円を描く。"""
@@ -1415,11 +1429,7 @@ class Canvas(QWidget):
                 # 変形中 → ハンドルヒットテストして操作継続 or 確定して新規選択
                 handle = self._hit_transform_handle(wp)
                 if handle:
-                    self._transform_handle = handle
-                    self._transform_drag_start = wp
-                    self._transform_rect_start = QRectF(self._transform_rect)
-                    self._transform_angle_start = self._transform_angle
-                    self._drawing = True
+                    self._begin_transform_drag(handle, wp)
                 else:
                     self._commit_transform()
                     self._preview_start = cp
@@ -1431,24 +1441,14 @@ class Canvas(QWidget):
                         self._lift_selection(layer)  # type: ignore
                         # lift 直後はハンドルヒットテストして move/scale を開始
                         handle = self._hit_transform_handle(wp)
-                        if handle:
-                            self._transform_handle = handle
-                            self._transform_drag_start = wp
-                            self._transform_rect_start = QRectF(self._transform_rect)
-                            self._transform_angle_start = self._transform_angle
-                            self._drawing = True
-                        else:
-                            self._transform_handle = 'move'
-                            self._transform_drag_start = wp
-                            self._transform_rect_start = QRectF(self._transform_rect)
-                            self._transform_angle_start = self._transform_angle
-                            self._drawing = True
+                        self._begin_transform_drag(handle or 'move', wp)
                     else:
                         # 選択外クリック → 変形中なら確定してから新規選択
                         if self._transform_image:
                             self._commit_transform()
                         self._selection_rect = None
                         self._lasso_mask = None
+                        self._selection_outline_path = None
                         self._preview_start = cp
                         self._preview_end = cp
                 else:
@@ -1460,12 +1460,14 @@ class Canvas(QWidget):
                     else:
                         self._selection_rect = None
                         self._lasso_mask = None
+                        self._selection_outline_path = None
                         self._preview_start = cp
                         self._preview_end = cp
             else:
                 # 新規選択開始
                 self._selection_rect = None
                 self._lasso_mask = None
+                self._selection_outline_path = None
                 self._preview_start = cp
                 self._preview_end = cp
 
@@ -1473,6 +1475,7 @@ class Canvas(QWidget):
             # 常に新規に投げなわを描く専用ツール（選択の持ち上げ・変形は行わない）
             self._selection_rect = None
             self._lasso_mask = None
+            self._selection_outline_path = None
             self._lasso_path_points = []
             self._lasso_points = [cp]
 
@@ -1480,11 +1483,7 @@ class Canvas(QWidget):
             if self._transform_image:
                 handle = self._hit_transform_handle(wp)
                 if handle:
-                    self._transform_handle = handle
-                    self._transform_drag_start = wp
-                    self._transform_rect_start = QRectF(self._transform_rect)
-                    self._transform_angle_start = self._transform_angle
-                    self._drawing = True
+                    self._begin_transform_drag(handle, wp)
                 else:
                     self._commit_transform()
                     self._lasso_points = [cp]
@@ -1493,14 +1492,11 @@ class Canvas(QWidget):
                 if self.select_mode == "transform":
                     if self._selection_rect.contains(cp):
                         self._lift_selection(layer)  # type: ignore
-                        self._transform_handle = "move"
-                        self._transform_drag_start = wp
-                        self._transform_rect_start = QRectF(self._transform_rect)
-                        self._transform_angle_start = self._transform_angle
-                        self._drawing = True
+                        self._begin_transform_drag("move", wp)
                     else:
                         self._selection_rect = None
                         self._lasso_mask = None
+                        self._selection_outline_path = None
                         self._lasso_path_points = []
                         self._lasso_points = [cp]
                 else:
@@ -1511,11 +1507,13 @@ class Canvas(QWidget):
                     else:
                         self._selection_rect = None
                         self._lasso_mask = None
+                        self._selection_outline_path = None
                         self._lasso_path_points = []
                         self._lasso_points = [cp]
             else:
                 self._selection_rect = None
                 self._lasso_mask = None
+                self._selection_outline_path = None
                 self._lasso_path_points = []
                 self._lasso_points = [cp]
 
@@ -1525,20 +1523,27 @@ class Canvas(QWidget):
             self._drawing = False
             self._ask_text()
 
+    def _begin_transform_drag(self, handle: str, wp: QPointF):
+        """変形ハンドルのドラッグ開始状態を記録する。TRANSFORM ツールに限らず
+        SELECT_RECT/LASSO の変形モードからも呼ばれるため、ここに一本化する
+        （個別に書くと mesh_grid_start / perspective_corners_start の初期化が
+        漏れやすく、実際に漏れて自由変形の頂点ドラッグが効かないバグになっていた）。"""
+        self._transform_handle = handle
+        self._transform_drag_start = wp
+        self._transform_rect_start = QRectF(self._transform_rect)
+        self._transform_angle_start = self._transform_angle
+        if self._mesh_grid:
+            self._mesh_grid_start = [[QPointF(p) for p in row] for row in self._mesh_grid]
+        elif self._perspective_corners:
+            self._perspective_corners_start = [QPointF(pt) for pt in self._perspective_corners]
+        self._drawing = True
+
     def _handle_transform_press(self, wp: QPointF, cp: QPoint,
                                  layer):
         if self._transform_image and self._transform_rect:
             handle = self._hit_transform_handle(wp)
             if handle:
-                self._transform_handle = handle
-                self._transform_drag_start = wp
-                self._transform_rect_start = QRectF(self._transform_rect)
-                self._transform_angle_start = self._transform_angle
-                if self._mesh_grid:
-                    self._mesh_grid_start = [[QPointF(p) for p in row] for row in self._mesh_grid]
-                elif self._perspective_corners:
-                    self._perspective_corners_start = [QPointF(c) for c in self._perspective_corners]
-                self._drawing = True
+                self._begin_transform_drag(handle, wp)
             else:
                 self._commit_transform()
         else:
@@ -1572,10 +1577,7 @@ class Canvas(QWidget):
                 self._lift_selection(layer)  # type: ignore
                 self._lift_pending = False
                 self._lift_pending_wp = None
-                self._transform_handle = 'move'
-                self._transform_drag_start = wp
-                self._transform_rect_start = QRectF(self._transform_rect)
-                self._transform_angle_start = self._transform_angle
+                self._begin_transform_drag('move', wp)
 
         if self._drawing and self._transform_handle and self._transform_image:
             # TRANSFORM ツール以外でも変形ドラッグ（SELECT_RECT/LASSO での持ち上げ後）
@@ -1687,6 +1689,7 @@ class Canvas(QWidget):
             if sel.width() > 1 and sel.height() > 1:
                 self._selection_rect = sel
                 self._lasso_mask = None
+                self._selection_outline_path = None
             else:
                 self._selection_rect = None
             self._sync_ant_timer()
@@ -1707,6 +1710,7 @@ class Canvas(QWidget):
             self._lasso_points = []
             self._selection_rect = None
             self._lasso_mask = None
+            self._selection_outline_path = None
             self._sync_ant_timer()
             self.update()
 
@@ -1723,9 +1727,11 @@ class Canvas(QWidget):
             if sel.width() > 0 and sel.height() > 0:
                 self._selection_rect = sel
                 self._lasso_path_points = list(self._lasso_points)
+                self._selection_outline_path = None
             else:
                 self._selection_rect = None
                 self._lasso_mask = None
+                self._selection_outline_path = None
                 self._lasso_path_points = []
             self._lasso_points = []
             self._sync_ant_timer()
@@ -1907,7 +1913,10 @@ class Canvas(QWidget):
         if not layer or layer.is_group or not self._selection_rect:
             return
         src: QImage = layer.image  # type: ignore
-        region = src.copy(self._selection_rect)
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
+        shifted = QRect(self._selection_rect.translated(-ox, -oy))
+        region = src.copy(shifted)
         if self._lasso_mask:
             mask_crop = self._lasso_mask.copy(self._selection_rect)
             p = QPainter(region)
@@ -1917,17 +1926,26 @@ class Canvas(QWidget):
         self._clipboard_image = region
         self._clipboard_offset = self._selection_rect.topLeft()
 
+    def cut_selection(self):
+        """選択範囲をクリップボードにコピーしてから消去する。"""
+        if not self._selection_rect:
+            return
+        self.copy_selection()
+        self.delete_selection()
+
     def paste_selection(self):
         layer = self.layer_stack.active
         if not layer or layer.is_group or not self._clipboard_image:
             return
         self._save_history()
         img: QImage = layer.image  # type: ignore
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
         w, h = img.width(), img.height()
         overlay = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         overlay.fill(Qt.GlobalColor.transparent)
         op = QPainter(overlay)
-        op.drawImage(self._clipboard_offset, self._clipboard_image)
+        op.drawImage(self._clipboard_offset - QPoint(ox, oy), self._clipboard_image)
         op.end()
         p = QPainter(img)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
@@ -1935,6 +1953,7 @@ class Canvas(QWidget):
         p.end()
         self._selection_rect = None
         self._lasso_mask = None
+        self._selection_outline_path = None
         self.update()
 
     def delete_selection(self):
@@ -1942,21 +1961,56 @@ class Canvas(QWidget):
         if not layer or layer.is_group or not self._selection_rect:
             return
         self._save_history()
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
         painter = QPainter(layer.image)  # type: ignore
         if self._lasso_mask:
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
-            painter.drawImage(0, 0, self._lasso_mask)
+            painter.drawImage(-ox, -oy, self._lasso_mask)
         else:
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            painter.fillRect(self._selection_rect, Qt.GlobalColor.transparent)
+            painter.fillRect(self._selection_rect.translated(-ox, -oy), Qt.GlobalColor.transparent)
         painter.end()
         self._selection_rect = None
         self._lasso_mask = None
+        self._selection_outline_path = None
         self.update()
 
     def select_all(self):
         self._selection_rect = QRect(0, 0, self.layer_stack.width, self.layer_stack.height)
         self._lasso_mask = None
+        self._selection_outline_path = None
+        self._sync_ant_timer()
+        self.update()
+
+    def invert_selection(self):
+        """選択範囲を反転する。矩形選択・投げなわ選択どちらにも対応。"""
+        if not self._selection_rect:
+            return
+        w, h = self.layer_stack.width, self.layer_stack.height
+        canvas_rect = QRect(0, 0, w, h)
+
+        if self._lasso_mask is None:
+            # 矩形選択 → 選択範囲マスクを作ってから反転する
+            base_mask = QImage(w, h, QImage.Format.Format_ARGB32)
+            base_mask.fill(Qt.GlobalColor.transparent)
+            p = QPainter(base_mask)
+            p.fillRect(self._selection_rect, Qt.GlobalColor.white)
+            p.end()
+        else:
+            base_mask = self._lasso_mask
+
+        inverted = QImage(w, h, QImage.Format.Format_ARGB32)
+        inverted.fill(Qt.GlobalColor.white)
+        ip = QPainter(inverted)
+        ip.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
+        ip.drawImage(0, 0, base_mask)
+        ip.end()
+
+        self._lasso_mask = inverted
+        self._selection_rect = canvas_rect
+        self._selection_outline_path = None
+        self._lasso_path_points = []
         self._sync_ant_timer()
         self.update()
 
@@ -1967,8 +2021,78 @@ class Canvas(QWidget):
         self._lasso_mask = None
         self._lasso_path_points = []
         self._lasso_points = []
+        self._selection_outline_path = None
         self._sync_ant_timer()
         self.update()
+
+    def select_layer_alpha(self, layer=None, threshold: int = 10) -> bool:
+        """レイヤーの不透明部分（alpha > threshold）の形で選択範囲を作る。
+        （レイヤーパネルでサムネイルをCtrlクリックした時などに呼ばれる想定）
+        layer省略時はアクティブレイヤーを使う。グループレイヤーは対象外。"""
+        if layer is None:
+            layer = self.layer_stack.active
+        if not layer or layer.is_group:
+            return False
+
+        src: QImage = layer.image  # type: ignore
+        lw, lh = src.width(), src.height()
+        if lw == 0 or lh == 0:
+            return False
+        img = src.convertToFormat(QImage.Format.Format_ARGB32)
+        ptr = img.bits(); ptr.setsize(lh * lw * 4)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(lh, lw, 4)
+        alpha = arr[:, :, 3]
+        opaque = (alpha > threshold).astype(np.uint8)
+        if not opaque.any():
+            return False
+
+        # レイヤーのローカル座標系からキャンバス座標系へ offset_x/offset_y 分ずらして配置する
+        # （_apply_lasso_fill と同じ考え方）。
+        lox = getattr(layer, 'offset_x', 0)
+        loy = getattr(layer, 'offset_y', 0)
+        cw, ch = self.layer_stack.width, self.layer_stack.height
+
+        canvas_mask = np.zeros((ch, cw), dtype=np.uint8)
+        sx0, sy0 = max(0, -lox), max(0, -loy)
+        dx0, dy0 = max(0, lox), max(0, loy)
+        copy_w = min(lw - sx0, cw - dx0)
+        copy_h = min(lh - sy0, ch - dy0)
+        if copy_w <= 0 or copy_h <= 0:
+            return False
+        canvas_mask[dy0:dy0 + copy_h, dx0:dx0 + copy_w] = \
+            opaque[sy0:sy0 + copy_h, sx0:sx0 + copy_w]
+        if not canvas_mask.any():
+            return False
+
+        ys, xs = np.nonzero(canvas_mask)
+        sel = QRect(int(xs.min()), int(ys.min()),
+                    int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+
+        mask_img = QImage(cw, ch, QImage.Format.Format_ARGB32)
+        mask_img.fill(Qt.GlobalColor.transparent)
+        mptr = mask_img.bits(); mptr.setsize(ch * cw * 4)
+        mask_arr = np.frombuffer(mptr, dtype=np.uint8).reshape(ch, cw, 4)
+        mask_arr[canvas_mask > 0] = [255, 255, 255, 255]
+
+        contours, _ = cv2.findContours(canvas_mask * 255, cv2.RETR_LIST,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        outline = QPainterPath()
+        for cnt in contours:
+            if len(cnt) < 2:
+                continue
+            outline.moveTo(QPointF(float(cnt[0][0][0]), float(cnt[0][0][1])))
+            for pt in cnt[1:]:
+                outline.lineTo(QPointF(float(pt[0][0]), float(pt[0][1])))
+            outline.closeSubpath()
+
+        self._selection_rect = sel
+        self._lasso_mask = mask_img
+        self._lasso_path_points = []
+        self._lasso_points = []
+        self._selection_outline_path = outline
+        self._sync_ant_timer()
+        self.update()
+        return True
 
     # ── transform ────────────────────────────────────────────────────────────
 
@@ -2012,6 +2136,7 @@ class Canvas(QWidget):
         self._transform_erase_mask = self._lasso_mask
         self._selection_rect = None
         self._lasso_mask = None
+        self._selection_outline_path = None
         self.update()
 
     def _hit_transform_handle(self, wp: QPointF) -> str | None:
@@ -2027,6 +2152,9 @@ class Canvas(QWidget):
                     if (wpt - wp).manhattanLength() < HANDLE_HIT_RADIUS:
                         self._mesh_drag_idx = (r_idx, c_idx)
                         return 'mesh_point'
+            rot_w = self._rotation_handle_widget()
+            if rot_w and (rot_w - wp).manhattanLength() < HANDLE_HIT_RADIUS:
+                return 'rotate'
             # 格子内クリック → move
             w2c = self._w2c()
             cp = w2c.map(wp)
@@ -2042,6 +2170,9 @@ class Canvas(QWidget):
                 if (wpt - wp).manhattanLength() < HANDLE_HIT_RADIUS:
                     self._perspective_drag_idx = i
                     return name
+            rot_w = self._rotation_handle_widget()
+            if rot_w and (rot_w - wp).manhattanLength() < HANDLE_HIT_RADIUS:
+                return 'rotate'
             w2c = self._w2c()
             cp = w2c.map(wp)
             if self._point_in_quad(cp, self._perspective_corners):
@@ -2104,7 +2235,7 @@ class Canvas(QWidget):
         h = self._transform_handle
         w2c = self._w2c()
 
-        if self._mesh_grid and self._mesh_grid_start:
+        if self._mesh_grid and self._mesh_grid_start and h not in ('rotate', 'pivot'):
             start_c = w2c.map(self._transform_drag_start)
             cur_c = w2c.map(wp)
             dx = cur_c.x() - start_c.x()
@@ -2123,7 +2254,7 @@ class Canvas(QWidget):
             self.update()
             return
 
-        if self._perspective_corners and self._perspective_corners_start:
+        if self._perspective_corners and self._perspective_corners_start and h not in ('rotate', 'pivot'):
             start_c = w2c.map(self._transform_drag_start)
             cur_c = w2c.map(wp)
             dx = cur_c.x() - start_c.x()
@@ -2164,6 +2295,22 @@ class Canvas(QWidget):
                 wp.y() - center_w.y(),
                 wp.x() - center_w.x()))
             self._transform_angle = self._transform_angle_start + (cur_ang - start_ang)
+            delta_ang = self._transform_angle - self._transform_angle_start
+            # メッシュ/自由変形（4隅）は矩形+角度ではなく絶対座標点で状態を持つため、
+            # 回転ハンドルの操作はドラッグ開始時点のスナップショットをピボット中心に
+            # 回転させて反映する（標準モードの _transform_matrix() 相当をここで手動適用）。
+            if self._mesh_grid and self._mesh_grid_start:
+                rot = QTransform()
+                rot.translate(center_c.x(), center_c.y())
+                rot.rotate(delta_ang)
+                rot.translate(-center_c.x(), -center_c.y())
+                self._mesh_grid = [[rot.map(p) for p in row] for row in self._mesh_grid_start]
+            elif self._perspective_corners and self._perspective_corners_start:
+                rot = QTransform()
+                rot.translate(center_c.x(), center_c.y())
+                rot.rotate(delta_ang)
+                rot.translate(-center_c.x(), -center_c.y())
+                self._perspective_corners = [rot.map(p) for p in self._perspective_corners_start]
             self.update()
             return
 
@@ -2177,6 +2324,17 @@ class Canvas(QWidget):
         if h == 'move':
             r.translate(dx, dy)
         elif h in ('tl', 'tr', 'bl', 'br'):
+            # _transform_rect は回転前のローカル矩形。角ハンドルは _transform_matrix()
+            # で回転させた見た目の位置に表示されるため、ドラッグ量（画面＝キャンバス
+            # 座標系のベクトル）もその逆回転をかけてローカル座標系に戻してから
+            # 辺に適用する必要がある。これをしないと、回転がかかった状態で角を
+            # ドラッグしたときにマウスの動きと伸縮方向が一致しない
+            # （例: 90度回転時に上下左右が入れ替わる）。
+            if self._transform_angle != 0.0:
+                rot_only = QTransform()
+                rot_only.rotate(-self._transform_angle)
+                delta = rot_only.map(QPointF(dx, dy)) - rot_only.map(QPointF(0, 0))
+                dx, dy = delta.x(), delta.y()
             orig_w = self._transform_rect_start.width()
             orig_h = self._transform_rect_start.height()
             # ratio は変形開始時のアスペクト比。orig_w/orig_h のどちらかが 0 の場合は
@@ -2209,12 +2367,55 @@ class Canvas(QWidget):
             self._transform_rect = r
         self.update()
 
+    def _ensure_layer_bounds(self, layer, canvas_rect: QRect):
+        """canvas_rect（キャンバス座標系）が layer.image に収まるよう、必要なら
+        image を拡張し offset_x/offset_y を調整する。拡大縮小でキャンバス外に
+        絵がはみ出すと、layer.image のサイズで描画がクリップされてしまうため。"""
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
+        img: QImage = layer.image  # type: ignore
+        cur = QRect(ox, oy, img.width(), img.height())
+        needed = cur.united(canvas_rect)
+        if needed == cur:
+            return
+        new_img = QImage(needed.width(), needed.height(), QImage.Format.Format_ARGB32)
+        new_img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(new_img)
+        p.drawImage(ox - needed.x(), oy - needed.y(), img)
+        p.end()
+        layer.image = new_img  # type: ignore
+        layer.offset_x = needed.x()  # type: ignore
+        layer.offset_y = needed.y()  # type: ignore
+
     def _commit_transform(self):
         layer = self._transform_layer or self.layer_stack.active
         if not layer or layer.is_group or not self._transform_image or not self._transform_rect:
             return
 
         self._save_history()
+
+        # 変形結果を先に確定させてから、キャンバス座標での実際の描画範囲に
+        # layer.image が収まるようにする（拡大縮小・回転でキャンバス外にはみ出す
+        # と layer.image のサイズでクリップされてしまうため）。
+        mesh_result = self._warp_mesh_image() if self._mesh_grid else None
+        perspective_result = self._warp_perspective_image() if (
+            not self._mesh_grid and self._perspective_corners) else None
+
+        if mesh_result:
+            warped_img, wx, wy = mesh_result
+            target_rect = QRect(wx, wy, warped_img.width(), warped_img.height())
+        elif perspective_result:
+            warped_img, wx, wy = perspective_result
+            target_rect = QRect(wx, wy, warped_img.width(), warped_img.height())
+        else:
+            pv = self._pivot_point()
+            m = QTransform()
+            m.translate(pv.x(), pv.y())
+            m.rotate(self._transform_angle)
+            m.translate(-pv.x(), -pv.y())
+            target_rect = m.mapRect(self._transform_rect).toAlignedRect()
+
+        self._ensure_layer_bounds(layer, target_rect)
 
         img: QImage = layer.image  # type: ignore
         ox = getattr(layer, 'offset_x', 0)
@@ -2228,20 +2429,16 @@ class Canvas(QWidget):
             ep.fillRect(self._transform_erase_rect.translated(-ox, -oy), Qt.GlobalColor.transparent)
         ep.end()
 
-        if self._mesh_grid:
-            result = self._warp_mesh_image()
-            if result:
-                warped_img, wx, wy = result
-                painter = QPainter(img)
-                painter.drawImage(wx - ox, wy - oy, warped_img)
-                painter.end()
-        elif self._perspective_corners:
-            result = self._warp_perspective_image()
-            if result:
-                warped_img, wx, wy = result
-                painter = QPainter(img)
-                painter.drawImage(wx - ox, wy - oy, warped_img)
-                painter.end()
+        if mesh_result:
+            warped_img, wx, wy = mesh_result
+            painter = QPainter(img)
+            painter.drawImage(wx - ox, wy - oy, warped_img)
+            painter.end()
+        elif perspective_result:
+            warped_img, wx, wy = perspective_result
+            painter = QPainter(img)
+            painter.drawImage(wx - ox, wy - oy, warped_img)
+            painter.end()
         else:
             r = self._transform_rect
             pv = self._pivot_point()
@@ -2268,7 +2465,24 @@ class Canvas(QWidget):
         self._mesh_grid = None
         self._mesh_grid_start = None
         self._mesh_drag_idx = (-1, -1)
+        # 変形モードは確定のたびに標準へ戻す。ツールオプションパネルの
+        # 「変形モード」コンボは毎回 index 0（標準）で再生成されるため、
+        # ここでフラグを残すと表示（標準）と実際の内部状態（前回選んだ
+        # パース/メッシュ）がずれ、2回目以降の変形でハンドルが出ない・
+        # 掴めないバグになる。
+        self._perspective_mode = False
+        self._mesh_mode = False
         self.update()
+
+    @property
+    def transform_mode(self) -> str:
+        """現在の変形モードを "standard" / "perspective" / "mesh" で返す。
+        ツールオプションパネルの表示をキャンバスの実状態と一致させるために使う。"""
+        if self._mesh_mode:
+            return "mesh"
+        if self._perspective_mode:
+            return "perspective"
+        return "standard"
 
     def set_transform_mode(self, mode: str):
         """"standard" / "perspective" / "mesh" を切り替える。"""
@@ -2301,6 +2515,7 @@ class Canvas(QWidget):
         self.save_structure_history()
         self._selection_rect = None
         self._lasso_mask = None
+        self._selection_outline_path = None
         self._lift_selection(layer)  # type: ignore
         return True
 
@@ -2317,6 +2532,20 @@ class Canvas(QWidget):
         cy = orig.center().y()
         self._transform_rect = QRectF(cx - new_w / 2, cy - new_h / 2, new_w, new_h)
         self._transform_angle = angle_deg
+        self.update()
+
+    def flip_transform_horizontal(self):
+        """フローティング変形中の画像を左右反転する。"""
+        if not self._transform_image:
+            return
+        self._transform_image = self._transform_image.mirrored(True, False)
+        self.update()
+
+    def flip_transform_vertical(self):
+        """フローティング変形中の画像を上下反転する。"""
+        if not self._transform_image:
+            return
+        self._transform_image = self._transform_image.mirrored(False, True)
         self.update()
 
     def cancel_transform(self):
@@ -2336,6 +2565,8 @@ class Canvas(QWidget):
         self._mesh_grid = None
         self._mesh_grid_start = None
         self._mesh_drag_idx = (-1, -1)
+        self._perspective_mode = False
+        self._mesh_mode = False
         self.update()
 
     def reset_state(self):
@@ -2360,8 +2591,11 @@ class Canvas(QWidget):
         self._mesh_grid = None
         self._mesh_grid_start = None
         self._mesh_drag_idx = (-1, -1)
+        self._perspective_mode = False
+        self._mesh_mode = False
         self._selection_rect = None
         self._lasso_mask = None
+        self._selection_outline_path = None
         self._lasso_points = []
         self._preview_start = None
         self._preview_end = None

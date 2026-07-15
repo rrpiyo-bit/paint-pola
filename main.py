@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QFileDialog,
                               QColorDialog, QLabel, QStatusBar, QMessageBox,
                               QDialog, QDialogButtonBox, QSlider, QFormLayout,
                               QSpinBox, QRadioButton, QButtonGroup, QGroupBox,
-                              QVBoxLayout, QSplitter)
+                              QVBoxLayout, QSplitter, QPushButton)
 from PyQt6.QtCore import Qt, QSize, QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QRectF, pyqtSignal
 from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
                           QFont, QPainter, QIcon)
@@ -540,6 +540,18 @@ class TransformPercentDialog(QDialog):
 
         form.addRow(_HSeparator())
 
+        # 反転
+        flip_row = QHBoxLayout()
+        self._flip_h_btn = QPushButton("左右反転")
+        self._flip_v_btn = QPushButton("上下反転")
+        self._flip_h_btn.clicked.connect(self._on_flip_h)
+        self._flip_v_btn.clicked.connect(self._on_flip_v)
+        flip_row.addWidget(self._flip_h_btn)
+        flip_row.addWidget(self._flip_v_btn)
+        form.addRow("反転", flip_row)
+
+        form.addRow(_HSeparator())
+
         # 回転
         rot_row = QHBoxLayout()
         self._rot_spin = QSpinBox()
@@ -636,6 +648,12 @@ class TransformPercentDialog(QDialog):
             self._sy_spin.value(),
             self._rot_spin.value(),
         )
+
+    def _on_flip_h(self):
+        self._canvas.flip_transform_horizontal()
+
+    def _on_flip_v(self):
+        self._canvas.flip_transform_vertical()
 
     def _on_ok(self):
         self._canvas._commit_transform()
@@ -749,6 +767,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.merge_down_requested.connect(self._merge_down)
         self.layer_panel.merge_all_requested.connect(self._merge_all_visible)
         self.layer_panel.merge_folder_requested.connect(self._merge_selected)
+        self.layer_panel.select_alpha_requested.connect(self.canvas.select_layer_alpha)
         # 数字キーで不透明度変更 → スライダー同期＋再描画
         self.canvas.layer_opacity_changed.connect(self.layer_panel.set_opacity)
         self.canvas.layer_opacity_changed.connect(lambda _: self.canvas.update())
@@ -815,6 +834,7 @@ class MainWindow(QMainWindow):
             shape_fill=self.canvas.shape_fill,
             fill_expand=self.canvas.fill_expand,
             select_mode=self.canvas.select_mode,
+            transform_mode=self.canvas.transform_mode,
         )
         # ツールに応じたカーソル
         self.canvas._tool_cursor = self._tool_cursors.get(tool)
@@ -913,10 +933,12 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "やり直し", self.canvas.redo, "Ctrl+Y")
         edit_menu.addSeparator()
         self._add_action(edit_menu, "コピー", self.canvas.copy_selection, "Ctrl+C")
+        self._add_action(edit_menu, "切り取り", self.canvas.cut_selection, "Ctrl+X")
         self._add_action(edit_menu, "貼り付け", self.canvas.paste_selection, "Ctrl+V")
         self._add_action(edit_menu, "削除", self.canvas.delete_selection, "Delete")
         edit_menu.addSeparator()
         self._add_action(edit_menu, "すべて選択", self.canvas.select_all, "Ctrl+A")
+        self._add_action(edit_menu, "選択を反転", self.canvas.invert_selection, "Ctrl+Shift+I")
         self._add_action(edit_menu, "選択解除", self.canvas.deselect, "Escape")
 
         image_menu = mb.addMenu("画像")
@@ -1477,13 +1499,16 @@ class MainWindow(QMainWindow):
         self.navigator.refresh()
 
     def _open_transform_percent_dialog(self):
-        """変形メニュー: 既にlift済みの変形状態に%ゲージを開く。lift済みでなければ先にliftする。"""
+        """変形メニュー: 既にlift済みの変形状態に%ゲージを開く。
+        lift済みでなければ、選択範囲があればそれを、なければレイヤー全体をliftする。"""
         if not self.canvas._transform_image:
             layer = self.layer_stack.active
             if not layer or layer.is_group:
                 QMessageBox.warning(self, "変形", "通常レイヤーを選択してください。")
                 return
-            if not self.canvas.lift_whole_layer():
+            if self.canvas._selection_rect is not None:
+                self.canvas._lift_selection(layer)  # type: ignore
+            elif not self.canvas.lift_whole_layer():
                 return
         dlg = TransformPercentDialog(self.canvas, self)
         dlg.exec()

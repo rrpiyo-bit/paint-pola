@@ -53,6 +53,7 @@ class LayerRow(QWidget):
     reference_changed  = pyqtSignal(object, bool)
     rename_requested   = pyqtSignal(object)              # (layer,)
     select_requested   = pyqtSignal(object)              # (layer,)
+    select_alpha_requested = pyqtSignal(object)           # (layer,) サムネイルCtrlクリック
     toggle_collapse    = pyqtSignal(object)              # GroupLayer のみ
 
     def __init__(self, layer: Layer | GroupLayer,
@@ -190,6 +191,10 @@ class LayerRow(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if (event.modifiers() & Qt.KeyboardModifier.ControlModifier
+                    and self._thumb_label.geometry().contains(event.pos())):
+                self.select_alpha_requested.emit(self._layer)
+                return
             self._drag_start_pos = event.pos()
             self.select_requested.emit(self._layer)
 
@@ -218,6 +223,7 @@ class LayerPanel(QWidget):
     merge_down_requested = pyqtSignal()
     merge_all_requested = pyqtSignal()
     merge_folder_requested = pyqtSignal()
+    select_alpha_requested = pyqtSignal(object)          # (layer,) サムネイルCtrlクリック
 
     def __init__(self, layer_stack: LayerStack, parent=None):
         super().__init__(parent)
@@ -533,6 +539,7 @@ class LayerPanel(QWidget):
         row.reference_changed.connect(self._on_reference)
         row.rename_requested.connect(self._on_rename)
         row.select_requested.connect(self._on_select)
+        row.select_alpha_requested.connect(self.select_alpha_requested)
         row.toggle_collapse.connect(self._on_toggle_collapse)
 
     def _insert_rows_recursive(self, items: list, path_prefix: list[int],

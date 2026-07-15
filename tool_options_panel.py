@@ -70,7 +70,8 @@ class ToolOptionsPanel(QWidget):
                  pen_size: int = 5, eraser_size: int = 20,
                  brush_key: str = "round", symmetry: bool = False,
                  shape_fill: str = "none", fill_expand: int = 0,
-                 select_mode: str = "select"):
+                 select_mode: str = "select",
+                 transform_mode: str = "standard"):
         self._current_tool = tool
         self._clear()
 
@@ -121,11 +122,11 @@ class ToolOptionsPanel(QWidget):
 
         elif tool in (Tool.SELECT_RECT, Tool.LASSO):
             self._add_select_mode_combo(select_mode)
-            self._add_transform_mode_combo()
+            self._add_transform_mode_combo(transform_mode)
             self._add_pivot_selector()
 
         elif tool == Tool.TRANSFORM:
-            self._add_transform_mode_combo()
+            self._add_transform_mode_combo(transform_mode)
             self._add_pivot_selector()
 
         elif tool == Tool.MOVE:
@@ -227,26 +228,27 @@ class ToolOptionsPanel(QWidget):
     def _add_select_mode_combo(self, current: str):
         cb = QComboBox()
         cb.addItem("選択のみ", "select")
-        cb.addItem("変形（移動・拡縮・回転）", "transform")
+        cb.addItem("選択範囲内クリックで変形", "transform")
         idx = 0 if current == "select" else 1
         cb.setCurrentIndex(idx)
         cb.currentIndexChanged.connect(
             lambda i: self.select_mode_changed.emit(cb.itemData(i)))
-        self._add_row("選択モード", cb)
+        self._add_row("クリック時の動作", cb)
 
-    def _add_transform_mode_combo(self):
+    def _add_transform_mode_combo(self, current: str = "standard"):
         cb = QComboBox()
         cb.addItem("拡縮・回転", "standard")
-        cb.addItem("自由変形（パース）", "perspective")
+        cb.addItem("自由変形（4隅を個別に動かす）", "perspective")
         cb.addItem("メッシュ変形", "mesh")
-        cb.setCurrentIndex(0)
+        idx = {"standard": 0, "perspective": 1, "mesh": 2}.get(current, 0)
+        cb.setCurrentIndex(idx)
 
         mesh_div = QSpinBox()
         mesh_div.setRange(2, 8)
         mesh_div.setValue(3)
         mesh_div.setPrefix("分割: ")
         mesh_div.setSuffix(" ×")
-        mesh_div.setVisible(False)
+        mesh_div.setVisible(current == "mesh")
         mesh_div.valueChanged.connect(lambda v: self.mesh_div_changed.emit(v))
 
         def on_mode(i):
