@@ -133,9 +133,13 @@ class NavigatorView(QWidget):
 
 class NavigatorPanel(QWidget):
     def __init__(self, layer_stack: LayerStack, canvas, scroll_area: QScrollArea,
-                 parent=None):
+                 parent=None, content_widget=None):
         super().__init__(parent)
         self._canvas = canvas
+        # スクロール量の正規化に使うウィジェット。canvas が余白付きラッパーに
+        # 収められている場合、実際にスクロールされるのはラッパーの方なので、
+        # そのサイズを基準にしないと枠の表示位置・クリックスクロールがずれる。
+        self._content = content_widget if content_widget is not None else canvas
         self._scroll = scroll_area
         self.setFixedWidth(260)
 
@@ -159,6 +163,11 @@ class NavigatorPanel(QWidget):
         reset_btn.setToolTip("100% + 中央表示")
         reset_btn.clicked.connect(self._reset_view)
         zoom_row.addWidget(reset_btn)
+        fit_btn = QPushButton("全体")
+        fit_btn.setFixedHeight(24)
+        fit_btn.setToolTip("キャンバス全体が画面に収まる倍率にして中央表示")
+        fit_btn.clicked.connect(self._fit_view)
+        zoom_row.addWidget(fit_btn)
         layout.addLayout(zoom_row)
 
         rot_row = QHBoxLayout()
@@ -202,8 +211,19 @@ class NavigatorPanel(QWidget):
 
     # ── internal ─────────────────────────────────────────────────────────────
 
+    def _canvas_origin_in_content(self) -> tuple[int, int]:
+        """余白ラッパー内でのキャンバスの左上位置（余白ラッパー座標系）。
+        余白のない構成（content_widget 未指定）では常に (0, 0)。"""
+        if self._content is self._canvas:
+            return 0, 0
+        pos = self._canvas.mapTo(self._content, self._canvas.rect().topLeft())
+        return pos.x(), pos.y()
+
     def _sync_frame(self):
-        """スクロールバーの現在位置からビュー枠の正規化座標を計算する。"""
+        """スクロールバーの現在位置からビュー枠の正規化座標を計算する。
+        枠はサムネイル（キャンバス本体のみ）基準の正規化座標なので、
+        余白ラッパー座標系のスクロール位置からキャンバス原点オフセット分を
+        差し引いてからキャンバスサイズで正規化する。"""
         sv = self._scroll.viewport()
         if sv is None:
             return
@@ -211,36 +231,27 @@ class NavigatorPanel(QWidget):
         if cw == 0 or ch == 0:
             return
 
+        ox, oy = self._canvas_origin_in_content()
         hbar = self._scroll.horizontalScrollBar()
         vbar = self._scroll.verticalScrollBar()
         vp_w = sv.width()
         vp_h = sv.height()
 
-        # スクロールバーの maximum() = コンテンツ幅 - ビューポート幅
-        # x_ratio = 現在位置 / コンテンツ幅 = hbar.value() / cw (cw > vp_w のとき)
-        # キャンバスがビューポートより小さい場合は枠 = 全体
-        if cw > vp_w:
-            x_ratio = hbar.value() / cw
-        else:
-            x_ratio = 0.0
-
-        if ch > vp_h:
-            y_ratio = vbar.value() / ch
-        else:
-            y_ratio = 0.0
-
-        w_ratio = min(1.0, vp_w / cw)
-        h_ratio = min(1.0, vp_h / ch)
+        x_ratio = (hbar.value() - ox) / cw
+        y_ratio = (vbar.value() - oy) / ch
+        w_ratio = vp_w / cw
+        h_ratio = vp_h / ch
 
         self._view.set_view_rect(QRectF(x_ratio, y_ratio, w_ratio, h_ratio))
 
     def _on_scroll_requested(self, nx: float, ny: float):
-        """正規化座標をスクロールバー値に変換してスクロールする。"""
+        """正規化座標（キャンバス基準）をスクロールバー値に変換してスクロールする。"""
         cw, ch = self._canvas.width(), self._canvas.height()
+        ox, oy = self._canvas_origin_in_content()
         hbar = self._scroll.horizontalScrollBar()
         vbar = self._scroll.verticalScrollBar()
-        hbar.setValue(int(nx * cw))
-        vbar.setValue(int(ny * ch))
+        hbar.setValue(int(nx * cw) + ox)
+        vbar.setValue(int(ny * ch) + oy)
 
     def _zoom(self, factor: float):
         new_zoom = self._canvas.zoom * factor
@@ -256,4 +267,24 @@ class NavigatorPanel(QWidget):
         vbar = self._scroll.verticalScrollBar()
         hbar.setValue((hbar.maximum()) // 2)
         vbar.setValue((vbar.maximum()) // 2)
+        self.refresh()
+
+    def _fit_view(self):
+        """キャンバス全体がビューポートに収まるズーム倍率にして中央に表示する。"""
+        sv = self._scroll.viewport()
+        if sv is None:
+            return
+        ls = self._canvas.layer_stack
+        cw, ch = ls.width, ls.height
+        if self._canvas._rotation % 180 != 0:
+            cw, ch = ch, cw
+        if cw == 0 or ch == 0:
+            return
+        # 少しだけ余裕を持たせて全体が確実に見えるようにする
+        zoom = min(sv.width() / cw, sv.height() / ch) * 0.95
+        self._canvas.set_zoom(zoom)
+        hbar = self._scroll.horizontalScrollBar()
+        vbar = self._scroll.verticalScrollBar()
+        hbar.setValue(hbar.maximum() // 2)
+        vbar.setValue(vbar.maximum() // 2)
         self.refresh()

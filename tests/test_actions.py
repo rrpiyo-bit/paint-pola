@@ -405,3 +405,195 @@ class TestPopout:
         result = execute_popout(ls, layer, params)
         for child in result.children:
             assert _has_nonzero_pixels(child.image)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 新効果7種 + アクションガチャ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from actions import (
+    execute_offset_border, execute_silkscreen, execute_collage,
+    execute_wobble, execute_stamp, execute_kaleidoscope, execute_contour,
+    execute_gacha, execute_path_repeat,
+    _gacha_random_params, _gacha_random_path,
+    _GACHA_POOL, _GACHA_EXEC, GACHA_PALETTES,
+)
+
+
+def _make_stack_with_closed_shape() -> tuple[LayerStack, Layer]:
+    """閉じた領域を持つ線画レイヤー（円）を作る。"""
+    ls = LayerStack(W, H)
+    layer = ls.add("線画")
+    from PyQt6.QtGui import QPen
+    p = QPainter(layer.image)
+    pen = QPen(QColor(0, 0, 0, 255)); pen.setWidth(3)
+    p.setPen(pen)
+    p.drawEllipse(20, 20, 60, 60)
+    p.end()
+    return ls, layer
+
+
+def _alpha_count(img: QImage) -> int:
+    import numpy as np
+    img32 = img.convertToFormat(QImage.Format.Format_ARGB32)
+    ptr = img32.bits()
+    ptr.setsize(img32.height() * img32.width() * 4)
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(img32.height(), img32.width(), 4)
+    return int((arr[:, :, 3] > 0).sum())
+
+
+class TestOffsetBorder:
+    def test_basic(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_offset_border(ls, layer, {
+            "color": QColor(255, 255, 255), "size": 5, "shift": 8, "gap": 20})
+        assert isinstance(result, GroupLayer)
+        assert len(result.children) == 2
+        assert _has_nonzero_pixels(result.children[1].image)
+        assert not layer.visible
+
+    def test_no_shift_no_gap(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_offset_border(ls, layer, {
+            "color": QColor(255, 0, 0), "size": 3, "shift": 0, "gap": 0})
+        assert result is not None
+
+    def test_group_rejected(self):
+        ls = LayerStack(W, H)
+        group = ls.add_group("g")
+        assert execute_offset_border(ls, group, {
+            "color": QColor(255, 255, 255), "size": 5, "shift": 0, "gap": 0}) is None
+
+
+class TestSilkscreen:
+    def test_basic(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_silkscreen(ls, layer, {
+            "colors": [QColor(255, 0, 0), QColor(0, 0, 255)],
+            "shift": 10, "opacity": 90})
+        assert isinstance(result, GroupLayer)
+        # 元コピー + 色版2枚
+        assert len(result.children) == 3
+        for plate in result.children[1:]:
+            assert _has_nonzero_pixels(plate.image)
+
+
+class TestCollage:
+    def test_closed_region_filled(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_collage(ls, layer, {
+            "colors": [QColor(255, 100, 100)], "coverage": 100,
+            "expand": 2, "shift": 2})
+        assert isinstance(result, GroupLayer)
+        # 円の内側が塗られている
+        assert _alpha_count(result.children[1].image) > 500
+
+    def test_no_closed_region_returns_none(self):
+        ls, layer = _make_stack_with_lineart()  # 十字線は閉領域なし
+        result = execute_collage(ls, layer, {
+            "colors": [QColor(255, 0, 0)], "coverage": 100,
+            "expand": 0, "shift": 0})
+        assert result is None
+
+
+class TestWobble:
+    def test_distorts(self):
+        ls, layer = _make_stack_with_closed_shape()
+        before = _alpha_count(layer.image)
+        result = execute_wobble(ls, layer, {
+            "strength": 5, "wavelength": 30, "gap": 0})
+        assert result is not None
+        after = _alpha_count(result.image)
+        assert before * 0.5 < after < before * 2.5
+
+    def test_gap_reduces_area(self):
+        ls, layer = _make_stack_with_closed_shape()
+        before = _alpha_count(layer.image)
+        result = execute_wobble(ls, layer, {
+            "strength": 2, "wavelength": 30, "gap": 60})
+        assert result is not None
+        assert _alpha_count(result.image) < before
+
+
+class TestStamp:
+    def test_fades(self):
+        ls, layer = _make_stack_with_closed_shape()
+        before = _alpha_count(layer.image)
+        result = execute_stamp(ls, layer, {
+            "strength": 50, "grain": 2, "blots": False})
+        assert result is not None
+        after = _alpha_count(result.image)
+        assert 0 < after < before
+
+
+class TestKaleidoscope:
+    def test_multiplies(self):
+        ls, layer = _make_stack_with_lineart()
+        # 非対称な図形にする
+        layer.image.fill(Qt.GlobalColor.transparent)
+        p = QPainter(layer.image)
+        p.fillRect(10, 10, 20, 10, QColor(0, 0, 0)); p.end()
+        before = _alpha_count(layer.image)
+        result = execute_kaleidoscope(ls, layer, {"segments": 4, "mirror": True})
+        assert result is not None
+        assert result.image.width() == ls.width
+        assert _alpha_count(result.image) > before
+
+    def test_offset_source(self):
+        ls, layer = _make_stack_with_closed_shape()
+        layer.offset_x = 10; layer.offset_y = -5
+        assert execute_kaleidoscope(ls, layer, {"segments": 3, "mirror": False}) is not None
+
+
+class TestContour:
+    def test_rings_generated(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_contour(ls, layer, {
+            "count": 3, "spacing": 5, "color": QColor(255, 255, 255),
+            "thickness": 1, "fade": True})
+        assert isinstance(result, GroupLayer)
+        assert _alpha_count(result.children[1].image) > 100
+
+
+class TestGacha:
+    def test_pool_excludes_bg_pattern(self):
+        assert all(k != "bg" and "背景" not in lbl for k, lbl in _GACHA_POOL)
+
+    def test_random_params_valid_for_all_pool(self):
+        colors = [QColor(c) for c in GACHA_PALETTES[0][1]]
+        for key, label in _GACHA_POOL:
+            ls, layer = _make_stack_with_closed_shape()
+            params = _gacha_random_params(key, colors)
+            if key == "path":
+                result = execute_path_repeat(
+                    ls, layer, _gacha_random_path(W, H), params)
+            else:
+                result = _GACHA_EXEC[key](ls, layer, params)
+            assert result is not None, f"{label} が None を返した"
+
+    def test_gacha_returns_flat_layer_with_recipe(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_gacha(ls, layer, {"count": 0, "palette": "auto"})
+        assert result is not None
+        assert not result.is_group
+        assert "ガチャ" in result.name
+        assert _has_nonzero_pixels(result.image)
+        assert ls.layers[0] is result
+        assert not layer.visible
+
+    def test_gacha_palette_choice(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_gacha(ls, layer, {"count": 2, "palette": "レトロ印刷"})
+        assert result is not None
+        assert "レトロ印刷" in result.name
+
+    def test_gacha_empty_layer(self):
+        ls = LayerStack(W, H)
+        layer = ls.add("空")
+        # 空レイヤーでもクラッシュせず None
+        assert execute_gacha(ls, layer, {"count": 0, "palette": "auto"}) is None
+
+    def test_gacha_group_rejected(self):
+        ls = LayerStack(W, H)
+        group = ls.add_group("g")
+        assert execute_gacha(ls, group, {"count": 0, "palette": "auto"}) is None

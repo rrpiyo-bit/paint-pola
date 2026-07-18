@@ -63,6 +63,28 @@ def _constrain_corner_shift(pt: QPointF, fixed_x: float, fixed_y: float,
         return QPointF(fixed_x + sign_x * moved_h * ratio, pt.y())
 
 
+def _constrain_shape_shift(tool, start: QPoint, end: QPoint) -> QPoint:
+    """図形ツール（直線・四角形・楕円）用の Shift 拘束。
+    直線: 45度刻みにスナップする。四角形/楕円: 正方形/正円にする（長い方の辺に合わせる）。
+    """
+    dx = end.x() - start.x()
+    dy = end.y() - start.y()
+    if tool == Tool.LINE:
+        dist = math.hypot(dx, dy)
+        if dist == 0:
+            return end
+        angle = math.atan2(dy, dx)
+        step = math.pi / 4  # 45度刻み
+        snapped = round(angle / step) * step
+        return QPoint(round(start.x() + dist * math.cos(snapped)),
+                      round(start.y() + dist * math.sin(snapped)))
+    else:
+        side = max(abs(dx), abs(dy))
+        sx = 1 if dx >= 0 else -1
+        sy = 1 if dy >= 0 else -1
+        return QPoint(start.x() + sx * side, start.y() + sy * side)
+
+
 # ── 塗りつぶし ──────────────────────────────────────────────────────────────────
 
 def _alpha(pixel: int) -> int:
@@ -426,7 +448,6 @@ class Canvas(QWidget):
         h = int(self.layer_stack.height * self.zoom)
         if self._rotation % 180 != 0:
             w, h = h, w
-        self.setMinimumSize(QSize(w, h))
         self.resize(w, h)
         self.update()
 
@@ -1055,6 +1076,8 @@ class Canvas(QWidget):
         if layer is not None and not layer.is_group:
             # 元画像をバックアップ
             orig_img = layer.image  # type: ignore
+            ox = getattr(layer, 'offset_x', 0)
+            oy = getattr(layer, 'offset_y', 0)
             # 消去済みコピーを作成
             erased = QImage(orig_img.width(), orig_img.height(),
                             QImage.Format.Format_ARGB32_Premultiplied)
@@ -1063,10 +1086,10 @@ class Canvas(QWidget):
             ep.drawImage(0, 0, orig_img)
             if self._transform_erase_mask:
                 ep.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
-                ep.drawImage(0, 0, self._transform_erase_mask)
+                ep.drawImage(-ox, -oy, self._transform_erase_mask)
             elif self._transform_erase_rect:
                 ep.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-                ep.fillRect(self._transform_erase_rect, Qt.GlobalColor.transparent)
+                ep.fillRect(self._transform_erase_rect.translated(-ox, -oy), Qt.GlobalColor.transparent)
             ep.end()
             layer.image = erased.convertToFormat(QImage.Format.Format_ARGB32)  # type: ignore
             base = self.layer_stack.composite()
@@ -1400,6 +1423,13 @@ class Canvas(QWidget):
         elif self.tool == Tool.FILL:
             self._save_history()
             ref_img = self._build_fill_reference(layer)
+            if ref_img is not None:
+                lw, lh = layer.image.width(), layer.image.height()  # type: ignore
+                if ref_img.width() != lw or ref_img.height() != lh or lox or loy:
+                    # 参照画像はキャンバス座標系の合成画像なので、対象レイヤーの
+                    # ローカル座標系（offset_x/offset_y 分ずれている）に合わせて切り出す
+                    # （_apply_lasso_fill と同じ考え方）。
+                    ref_img = ref_img.copy(lox, loy, lw, lh)
             _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img, self.fill_expand)  # type: ignore
             self.update()
 
@@ -1626,6 +1656,9 @@ class Canvas(QWidget):
             self.update()
 
         elif self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.SELECT_RECT):
+            if (self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start
+                    and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier):
+                cp = _constrain_shape_shift(self.tool, self._preview_start, cp)
             self._preview_end = cp
             self.update()
 
@@ -1664,6 +1697,8 @@ class Canvas(QWidget):
             return
 
         if self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                cp = _constrain_shape_shift(self.tool, self._preview_start, cp)
             # ドラッグせずクリックしただけ（始点=終点）の場合は退化図形なので何も描かない。
             # QRect(a, a) は幅・高さ 1 になるため、点の一致で判定する。
             is_zero = (self._preview_start == cp)
@@ -1740,19 +1775,21 @@ class Canvas(QWidget):
         self._last_pos = None
 
     def _build_fill_reference(self, layer) -> QImage | None:
-        """塗りつぶしの境界判定に使う参照画像（自分以外の参照レイヤーの合成）を作る。"""
+        """塗りつぶしの境界判定に使う参照画像（自分以外の参照レイヤーの合成、
+        キャンバス座標系・offset 0,0 に正規化したもの）を作る。
+        通常レイヤーはローカル画像に offset_x/offset_y が付いているため、
+        グループの composite() 結果（既にキャンバスサイズ・offset 0,0）と
+        混在しても正しく重なるよう、必ず offset 付きで描画してから返す。"""
         refs = [r for r in self.layer_stack.references if r is not layer]
         if len(refs) == 0:
             return None
-        if len(refs) == 1:
-            return refs[0].image
         w, h = self.layer_stack.width, self.layer_stack.height
         ref_img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         ref_img.fill(Qt.GlobalColor.transparent)
         rp = QPainter(ref_img)
         for r in reversed(refs):
             rp.setOpacity(r.opacity / 255)
-            rp.drawImage(0, 0, r.image)
+            rp.drawImage(getattr(r, 'offset_x', 0), getattr(r, 'offset_y', 0), r.image)
         rp.end()
         return ref_img.convertToFormat(QImage.Format.Format_ARGB32)
 
@@ -1901,7 +1938,9 @@ class Canvas(QWidget):
         painter = QPainter(layer.image)  # type: ignore
         painter.setFont(font)
         painter.setPen(QPen(color))
-        painter.drawText(self._text_pos, text)
+        # _text_pos はキャンバス座標。レイヤーローカル座標に変換して描く
+        painter.drawText(self._text_pos - QPoint(getattr(layer, 'offset_x', 0),
+                                                 getattr(layer, 'offset_y', 0)), text)
         painter.end()
         self._text_pos = None
         self.update()
@@ -2370,7 +2409,11 @@ class Canvas(QWidget):
     def _ensure_layer_bounds(self, layer, canvas_rect: QRect):
         """canvas_rect（キャンバス座標系）が layer.image に収まるよう、必要なら
         image を拡張し offset_x/offset_y を調整する。拡大縮小でキャンバス外に
-        絵がはみ出すと、layer.image のサイズで描画がクリップされてしまうため。"""
+        絵がはみ出すと、layer.image のサイズで描画がクリップされてしまうため。
+        編集中はここでは上限を設けない（はみ出した絵をキャンバスを広げて後で
+        復活させられるようにするため）。肥大化したファイルが保存後に開けなく
+        なる問題は、保存時の _trim_layer_overflow_for_save 側でキャンバス外の
+        不透明部分を切り詰めることで対処する。"""
         ox = getattr(layer, 'offset_x', 0)
         oy = getattr(layer, 'offset_y', 0)
         img: QImage = layer.image  # type: ignore
@@ -2508,7 +2551,10 @@ class Canvas(QWidget):
         self.set_transform_mode("perspective" if enabled else "standard")
 
     def lift_whole_layer(self) -> bool:
-        """アクティブレイヤー全体をフローティング化して変形モードに入る。選択範囲は使わない。"""
+        """アクティブレイヤー全体をフローティング化して変形モードに入る。選択範囲は使わない。
+        拡大縮小・回転の基準点がキャンバス中心ではなくイラスト（不透明部分）の中心になるよう、
+        select_layer_alpha で不透明部分の外接矩形を求めてからliftする。
+        レイヤーが全透明などで不透明部分が無い場合はキャンバス全体にフォールバックする。"""
         layer = self.layer_stack.active
         if not layer or layer.is_group:
             return False
@@ -2516,20 +2562,26 @@ class Canvas(QWidget):
         self._selection_rect = None
         self._lasso_mask = None
         self._selection_outline_path = None
+        if not self.select_layer_alpha(layer):
+            self._selection_rect = None
+            self._lasso_mask = None
+            self._selection_outline_path = None
         self._lift_selection(layer)  # type: ignore
         return True
 
-    def apply_transform_percentage(self, scale_x_pct: float, scale_y_pct: float, angle_deg: float):
+    def apply_transform_percentage(self, scale_x_pct: float, scale_y_pct: float, angle_deg: float,
+                                    offset_x: float = 0.0, offset_y: float = 0.0):
         """フローティング変形中に拡縮率(%)と回転角を適用してリアルタイムプレビューを更新する。
         scale_x_pct / scale_y_pct は元サイズを100%として指定する。
-        _transform_rect の中心を固定しながらサイズを変える。"""
+        offset_x / offset_y は元の中心からのキャンバス座標系での移動量（px）。
+        _transform_orig_rect の中心 + offset を新しい中心としてサイズを変える。"""
         if not self._transform_image or not self._transform_orig_rect:
             return
         orig = self._transform_orig_rect
         new_w = orig.width()  * scale_x_pct / 100.0
         new_h = orig.height() * scale_y_pct / 100.0
-        cx = orig.center().x()
-        cy = orig.center().y()
+        cx = orig.center().x() + offset_x
+        cy = orig.center().y() + offset_y
         self._transform_rect = QRectF(cx - new_w / 2, cy - new_h / 2, new_w, new_h)
         self._transform_angle = angle_deg
         self.update()

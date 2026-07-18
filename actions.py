@@ -1,6 +1,7 @@
 """アクション機能 — ワンクリックで複雑なレイヤー操作を実行する。"""
 from __future__ import annotations
 
+import math
 import random
 
 import numpy as np
@@ -9,7 +10,8 @@ import cv2
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QDialog,
                               QLabel, QSpinBox, QCheckBox, QHBoxLayout,
                               QDialogButtonBox, QGroupBox, QFormLayout,
-                              QComboBox, QColorDialog, QFrame, QMessageBox)
+                              QComboBox, QColorDialog, QFrame, QMessageBox,
+                              QScrollArea)
 from PyQt6.QtGui import (QImage, QPainter, QColor, QTransform, QLinearGradient,
                           QRadialGradient, QBrush, QPen)
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF
@@ -941,14 +943,47 @@ class RandomTileDialog(QDialog):
         }
 
 
+def _render_tile(src: QImage, angle: float, scale: float) -> QImage:
+    """回転・拡縮したタイル画像を、はみ出さない十分なサイズで描画して返す。
+    _shift_image は元画像と同サイズで返すため、回転や拡大で四隅が
+    クリップされてしまう。タイルは対角線長を基準にした正方形に描く。"""
+    sw, sh = src.width(), src.height()
+    side = max(1, int(math.hypot(sw, sh) * scale) + 2)
+    out = QImage(side, side, QImage.Format.Format_ARGB32)
+    out.fill(Qt.GlobalColor.transparent)
+    t = QTransform()
+    t.translate(side / 2, side / 2)
+    t.rotate(angle)
+    t.scale(scale, scale)
+    t.translate(-sw / 2, -sh / 2)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    p.setTransform(t)
+    p.drawImage(0, 0, src)
+    p.end()
+    return out
+
+
 def execute_random_tile(layer_stack: LayerStack, source_layer: Layer,
                         params: dict) -> Layer | GroupLayer | None:
     if source_layer.is_group:
         return None
     src_img: QImage = source_layer.image
-    sw, sh = src_img.width(), src_img.height()
-    if sw == 0 or sh == 0:
+    if src_img.width() == 0 or src_img.height() == 0:
         return None
+
+    # イラストはキャンバスサイズのレイヤーの一部に描かれていることが多い。
+    # レイヤー画像全体をタイルとして扱うと、タイル1個＝ほぼキャンバスサイズと
+    # 誤認して格子がほとんど作れず（指定個数に届かない）、配置位置も大半が
+    # キャンバス外になる。まず不透明部分の外接矩形だけを切り出す。
+    arr = _qimage_to_array(src_img)
+    ys, xs = np.nonzero(arr[:, :, 3] > 10)
+    if len(xs) == 0:
+        return None
+    x0, y0 = int(xs.min()), int(ys.min())
+    src_img = src_img.copy(x0, y0, int(xs.max()) - x0 + 1, int(ys.max()) - y0 + 1)
+    sw, sh = src_img.width(), src_img.height()
+
     cw, ch = layer_stack.width, layer_stack.height
     src_idx = _find_top_index(layer_stack, source_layer)
 
@@ -959,30 +994,41 @@ def execute_random_tile(layer_stack: LayerStack, source_layer: Layer,
     overlap = params["overlap"]
     do_merge = params["merge"]
 
+    avg_scale = (scale_min + scale_max) / 2.0
     spacing_factor = max(0.2, 1.0 - overlap)
-    cell = max(int(max(sw, sh) * spacing_factor), 1)
-    cols = max(1, cw // cell + 2)
-    rows = max(1, ch // cell + 2)
+    cell = max(int(max(sw, sh) * avg_scale * spacing_factor), 1)
+    cols = max(1, (cw + cell - 1) // cell)
+    rows = max(1, (ch + cell - 1) // cell)
 
-    placements = []
+    # 配置位置は「タイルの中心」のキャンバス座標。格子＋ジッターで散らし、
+    # 指定個数に足りない分はキャンバス内のランダム位置で補う（以前は格子が
+    # 個数より少ないと黙って減っていた）。
+    centers = []
     for r in range(rows):
         for c in range(cols):
-            base_x = c * cell - cell // 2
-            base_y = r * cell - cell // 2
-            jitter_x = random.randint(-cell // 3, cell // 3)
-            jitter_y = random.randint(-cell // 3, cell // 3)
-            placements.append((base_x + jitter_x, base_y + jitter_y))
-    random.shuffle(placements)
-    placements = placements[:count] if len(placements) > count else placements
+            base_x = c * cell + cell // 2
+            base_y = r * cell + cell // 2
+            jitter = cell // 3
+            centers.append((base_x + random.randint(-jitter, jitter),
+                            base_y + random.randint(-jitter, jitter)))
+    random.shuffle(centers)
+    centers = centers[:count]
+    while len(centers) < count:
+        centers.append((random.randint(0, cw - 1), random.randint(0, ch - 1)))
+    # 中心は必ずキャンバス内に収める（端で見切れるのはパターンとして自然だが、
+    # 完全にキャンバス外へ出てしまう配置は「消えた」ように見えるため）
+    centers = [(min(max(cx, 0), cw - 1), min(max(cy, 0), ch - 1))
+               for cx, cy in centers]
 
     children = []
-    for i, (px, py) in enumerate(placements):
+    for i, (cx, cy) in enumerate(centers):
         scale = random.uniform(scale_min, scale_max)
         angle = random.uniform(-rotate_max, rotate_max)
-        tile = Layer(f"{source_layer.name} {i+1}", sw, sh)
-        tile.image = _shift_image(src_img, 0, 0, angle, scale)
-        tile.offset_x = px
-        tile.offset_y = py
+        img = _render_tile(src_img, angle, scale)
+        tile = Layer(f"{source_layer.name} {i+1}", img.width(), img.height())
+        tile.image = img
+        tile.offset_x = cx - img.width() // 2
+        tile.offset_y = cy - img.height() // 2
         children.append(tile)
 
     if do_merge:
@@ -1286,6 +1332,989 @@ def execute_paper_grain(layer_stack: LayerStack, source_layer: Layer,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 新効果 共通ユーティリティ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _filled_silhouette(alpha: np.ndarray) -> np.ndarray:
+    """不透明部分の穴埋め済みシルエット（0/255）を返す。"""
+    opaque = (alpha > 127).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(opaque, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    sil = np.zeros_like(opaque)
+    if contours:
+        cv2.drawContours(sil, contours, -1, 255, thickness=cv2.FILLED)
+    return sil
+
+
+def _coarse_noise(w: int, h: int, cell: int) -> np.ndarray:
+    """0〜1 の滑らかなランダムノイズ（約 cell px のうねり）を返す。"""
+    cell = max(1, cell)
+    gw = max(2, w // cell)
+    gh = max(2, h // cell)
+    g = np.random.rand(gh, gw).astype(np.float32)
+    return np.clip(cv2.resize(g, (w, h), interpolation=cv2.INTER_CUBIC), 0.0, 1.0)
+
+
+def _shift_mask(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    """uint8 マスクを (dx, dy) 平行移動する（はみ出しは 0 埋め）。"""
+    h, w = mask.shape
+    m = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(mask, m, (w, h))
+
+
+def _insert_result_layer(layer_stack: LayerStack, source_layer: Layer,
+                         result) -> None:
+    """アクション結果をソースの位置に挿入し、ソースを隠して選択する。"""
+    src_idx = _find_top_index(layer_stack, source_layer)
+    layer_stack.layers.insert(src_idx, result)
+    layer_stack.active_path = [src_idx]
+    source_layer.visible = False
+
+
+def _group_with_original(source_layer: Layer, suffix: str) -> tuple[GroupLayer, Layer]:
+    """元レイヤーのコピーを最上段に持つグループを作って返す。"""
+    w, h = source_layer.image.width(), source_layer.image.height()
+    group = GroupLayer(f"{source_layer.name} - {suffix}", w, h)
+    top = Layer(f"{source_layer.name} (元)", w, h)
+    top.image = source_layer.image.copy()
+    _copy_offset(source_layer, top)
+    group.children.append(top)
+    return group, top
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. ずれ縁取り
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class OffsetBorderDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ずれ縁取り")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._color_btn = _color_button(QColor(255, 255, 255), self)
+        form.addRow("縁の色", self._color_btn)
+
+        self._size = QSpinBox()
+        self._size.setRange(2, 40)
+        self._size.setValue(8)
+        self._size.setSuffix(" px")
+        form.addRow("縁の太さ", self._size)
+
+        self._shift = QSpinBox()
+        self._shift.setRange(0, 60)
+        self._shift.setValue(12)
+        self._shift.setSuffix(" px")
+        self._shift.setToolTip("縁マスクをランダムにずらす最大量")
+        form.addRow("ずらし量（最大）", self._shift)
+
+        self._gap = QSpinBox()
+        self._gap.setRange(0, 90)
+        self._gap.setValue(30)
+        self._gap.setSuffix(" %")
+        self._gap.setToolTip("縁をランダムに欠けさせる割合")
+        form.addRow("欠け", self._gap)
+
+        layout.addLayout(form)
+
+        desc = QLabel("縁取りをわざとずらして「変なところに縁が付く」\n"
+                      "偶然の面白さを再現します。欠けで途切れ感も出せます。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "color": self._color_btn._color,
+            "size": self._size.value(),
+            "shift": self._shift.value(),
+            "gap": self._gap.value(),
+        }
+
+
+def execute_offset_border(layer_stack: LayerStack, source_layer: Layer,
+                          params: dict) -> GroupLayer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+    arr = _qimage_to_array(src_img)
+    alpha = arr[:, :, 3]
+    if not alpha.any():
+        return None
+
+    sil = _filled_silhouette(alpha)
+    size = params["size"]
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size * 2 + 1, size * 2 + 1))
+    dilated = cv2.dilate(sil, kernel)
+
+    shift = params.get("shift", 0)
+    dx = random.randint(-shift, shift) if shift else 0
+    dy = random.randint(-shift, shift) if shift else 0
+    shifted = _shift_mask(dilated, dx, dy)
+
+    border_area = (shifted > 0) & (sil == 0)
+    gap = params.get("gap", 0)
+    if gap > 0:
+        noise = _coarse_noise(w, h, max(8, size * 3))
+        border_area &= noise > (gap / 100.0)
+
+    bc: QColor = params["color"]
+    border = np.zeros((h, w, 4), dtype=np.uint8)
+    border[border_area] = [bc.blue(), bc.green(), bc.red(), bc.alpha()]
+
+    group, _top = _group_with_original(source_layer, "ずれ縁取り")
+    border_layer = Layer("ずれ縁", w, h)
+    border_layer.image = _array_to_qimage(border)
+    _copy_offset(source_layer, border_layer)
+    group.children.append(border_layer)
+
+    _insert_result_layer(layer_stack, source_layer, group)
+    return group
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. リソ風版ずれ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SilkscreenDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("リソ風版ずれ")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._color_btns = []
+        for i, c in enumerate([QColor(242, 160, 177), QColor(245, 224, 75),
+                               QColor(87, 201, 177)]):
+            btn = _color_button(c, self)
+            self._color_btns.append(btn)
+            form.addRow(f"色版 {i + 1}", btn)
+
+        self._shift = QSpinBox()
+        self._shift.setRange(0, 100)
+        self._shift.setValue(25)
+        self._shift.setSuffix(" px")
+        form.addRow("版ずれ量（最大）", self._shift)
+
+        self._opacity = QSpinBox()
+        self._opacity.setRange(10, 100)
+        self._opacity.setValue(90)
+        self._opacity.setSuffix(" %")
+        form.addRow("色版の不透明度", self._opacity)
+
+        layout.addLayout(form)
+
+        desc = QLabel("線画のシルエットを色版にして、それぞれランダムに\n"
+                      "ずらして重ねます。リソグラフ印刷の版ずれ風。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "colors": [b._color for b in self._color_btns],
+            "shift": self._shift.value(),
+            "opacity": self._opacity.value(),
+        }
+
+
+def execute_silkscreen(layer_stack: LayerStack, source_layer: Layer,
+                       params: dict) -> GroupLayer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+    arr = _qimage_to_array(src_img)
+    alpha = arr[:, :, 3]
+    if not alpha.any():
+        return None
+
+    sil = _filled_silhouette(alpha)
+    shift = params.get("shift", 0)
+    plate_alpha = int(params.get("opacity", 100) * 255 / 100)
+
+    group, _top = _group_with_original(source_layer, "リソ風版ずれ")
+    for i, color in enumerate(params["colors"]):
+        dx = random.randint(-shift, shift) if shift else 0
+        dy = random.randint(-shift, shift) if shift else 0
+        mask = _shift_mask(sil, dx, dy)
+        plate = np.zeros((h, w, 4), dtype=np.uint8)
+        plate[mask > 0] = [color.blue(), color.green(), color.red(), plate_alpha]
+        layer = Layer(f"色版{i + 1}", w, h)
+        layer.image = _array_to_qimage(plate)
+        _copy_offset(source_layer, layer)
+        group.children.append(layer)
+
+    _insert_result_layer(layer_stack, source_layer, group)
+    return group
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. 切り絵コラージュ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CollageDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("切り絵コラージュ")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._color_btns = []
+        for i, c in enumerate([QColor(242, 160, 177), QColor(245, 224, 75),
+                               QColor(87, 201, 177), QColor(150, 180, 255)]):
+            btn = _color_button(c, self)
+            self._color_btns.append(btn)
+            form.addRow(f"色紙 {i + 1}", btn)
+
+        self._coverage = QSpinBox()
+        self._coverage.setRange(10, 100)
+        self._coverage.setValue(70)
+        self._coverage.setSuffix(" %")
+        self._coverage.setToolTip("閉じた領域のうち色を塗る割合")
+        form.addRow("塗る割合", self._coverage)
+
+        self._expand = QSpinBox()
+        self._expand.setRange(0, 30)
+        self._expand.setValue(6)
+        self._expand.setSuffix(" px")
+        self._expand.setToolTip("色紙を線からはみ出させる量")
+        form.addRow("はみ出し", self._expand)
+
+        self._shift = QSpinBox()
+        self._shift.setRange(0, 30)
+        self._shift.setValue(6)
+        self._shift.setSuffix(" px")
+        form.addRow("ずらし量（最大）", self._shift)
+
+        layout.addLayout(form)
+
+        desc = QLabel("線画の閉じた領域をランダムに拾って色紙で塗り、\n"
+                      "少しはみ出し・ずらして貼った切り絵風にします。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "colors": [b._color for b in self._color_btns],
+            "coverage": self._coverage.value(),
+            "expand": self._expand.value(),
+            "shift": self._shift.value(),
+        }
+
+
+def execute_collage(layer_stack: LayerStack, source_layer: Layer,
+                    params: dict) -> GroupLayer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+    arr = _qimage_to_array(src_img)
+    alpha = arr[:, :, 3]
+    if not alpha.any():
+        return None
+
+    # 線（不透明部）で区切られた透明領域のうち、画像の外周に接していない
+    # 「閉じた領域」だけを塗り対象にする
+    free = (alpha <= 10).astype(np.uint8)
+    n_labels, labels = cv2.connectedComponents(free, connectivity=4)
+    edge_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) \
+        | set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
+
+    coverage = params.get("coverage", 70) / 100.0
+    expand = params.get("expand", 0)
+    shift = params.get("shift", 0)
+    colors = params["colors"]
+    expand_kernel = None
+    if expand > 0:
+        expand_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (expand * 2 + 1, expand * 2 + 1))
+
+    candidates = []
+    for lab in range(1, n_labels):
+        if lab in edge_labels:
+            continue
+        mask = (labels == lab).astype(np.uint8) * 255
+        if int(np.count_nonzero(mask)) < 30:  # ノイズ領域は無視
+            continue
+        candidates.append(mask)
+    if not candidates:
+        return None
+
+    chosen_masks = [m for m in candidates if random.random() <= coverage]
+    if not chosen_masks:  # 最低1領域は必ず塗る
+        chosen_masks = [random.choice(candidates)]
+
+    fills = np.zeros((h, w, 4), dtype=np.uint8)
+    for mask in chosen_masks:
+        if expand_kernel is not None:
+            mask = cv2.dilate(mask, expand_kernel)
+        if shift:
+            mask = _shift_mask(mask, random.randint(-shift, shift),
+                               random.randint(-shift, shift))
+        color = random.choice(colors)
+        fills[mask > 0] = [color.blue(), color.green(), color.red(), color.alpha()]
+
+    group, _top = _group_with_original(source_layer, "切り絵コラージュ")
+    fill_layer = Layer("色紙", w, h)
+    fill_layer.image = _array_to_qimage(fills)
+    _copy_offset(source_layer, fill_layer)
+    group.children.append(fill_layer)
+
+    _insert_result_layer(layer_stack, source_layer, group)
+    return group
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. 線の揺らぎ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class WobbleDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("線の揺らぎ")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._strength = QSpinBox()
+        self._strength.setRange(1, 40)
+        self._strength.setValue(8)
+        self._strength.setSuffix(" px")
+        form.addRow("揺らぎの強さ", self._strength)
+
+        self._wavelength = QSpinBox()
+        self._wavelength.setRange(10, 300)
+        self._wavelength.setValue(60)
+        self._wavelength.setSuffix(" px")
+        self._wavelength.setToolTip("小さいほど細かく波打つ")
+        form.addRow("波の大きさ", self._wavelength)
+
+        self._gap = QSpinBox()
+        self._gap.setRange(0, 80)
+        self._gap.setValue(0)
+        self._gap.setSuffix(" %")
+        self._gap.setToolTip("線をランダムに途切れさせる割合")
+        form.addRow("破線化", self._gap)
+
+        layout.addLayout(form)
+
+        desc = QLabel("線をランダムに波打たせて「描き直したような」\n"
+                      "別テイクを作ります。破線化で途切れも加えられます。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "strength": self._strength.value(),
+            "wavelength": self._wavelength.value(),
+            "gap": self._gap.value(),
+        }
+
+
+def execute_wobble(layer_stack: LayerStack, source_layer: Layer,
+                   params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+    arr = _qimage_to_array(src_img)
+    if not arr[:, :, 3].any():
+        return None
+
+    strength = params["strength"]
+    wavelength = max(10, params["wavelength"])
+    nx = (_coarse_noise(w, h, wavelength) - 0.5) * 2.0 * strength
+    ny = (_coarse_noise(w, h, wavelength) - 0.5) * 2.0 * strength
+    xx, yy = np.meshgrid(np.arange(w, dtype=np.float32),
+                         np.arange(h, dtype=np.float32))
+    warped = cv2.remap(arr, xx + nx, yy + ny,
+                       interpolation=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    gap = params.get("gap", 0)
+    if gap > 0:
+        keep = _coarse_noise(w, h, max(6, wavelength // 4)) > (gap / 100.0)
+        warped[:, :, 3] = warped[:, :, 3] * keep
+
+    result = Layer(f"{source_layer.name} - 揺らぎ", w, h)
+    result.image = _array_to_qimage(warped)
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 14. スタンプ劣化
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StampDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("スタンプ劣化")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._strength = QSpinBox()
+        self._strength.setRange(5, 95)
+        self._strength.setValue(40)
+        self._strength.setSuffix(" %")
+        form.addRow("かすれ強度", self._strength)
+
+        self._grain = QSpinBox()
+        self._grain.setRange(1, 8)
+        self._grain.setValue(3)
+        self._grain.setSuffix(" x")
+        self._grain.setToolTip("かすれの粒の粗さ")
+        form.addRow("粒の粗さ", self._grain)
+
+        self._blots = QCheckBox("インク溜まりを足す")
+        self._blots.setChecked(True)
+        form.addRow("", self._blots)
+
+        layout.addLayout(form)
+
+        desc = QLabel("線をランダムにかすれさせて、ゴム版画・はんこの\n"
+                      "ような質感にします。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "strength": self._strength.value(),
+            "grain": self._grain.value(),
+            "blots": self._blots.isChecked(),
+        }
+
+
+def execute_stamp(layer_stack: LayerStack, source_layer: Layer,
+                  params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+    arr = _qimage_to_array(src_img)
+    alpha = arr[:, :, 3]
+    if not alpha.any():
+        return None
+
+    strength = params["strength"] / 100.0
+    grain = params["grain"]
+    # 細かい粒＋大きなムラの2段ノイズでかすれさせる
+    fine = _coarse_noise(w, h, grain * 3)
+    coarse = _coarse_noise(w, h, grain * 24)
+    keep = (fine > strength * 0.9) & (coarse > strength * 0.5)
+    out = arr.copy()
+    out[:, :, 3] = alpha * keep
+
+    if params.get("blots", False):
+        line_ys, line_xs = np.nonzero(alpha > 127)
+        if len(line_xs) > 0:
+            opaque = alpha > 127
+            rgb_mean = arr[opaque][:, :3].mean(axis=0).astype(np.uint8)
+            blot_mask = np.zeros((h, w), dtype=np.uint8)
+            n_blots = max(3, len(line_xs) // 4000)
+            for _ in range(n_blots):
+                i = random.randrange(len(line_xs))
+                cv2.circle(blot_mask, (int(line_xs[i]), int(line_ys[i])),
+                           random.randint(2, 6), 255, -1)
+            blot_area = blot_mask > 0
+            out[blot_area, 0] = rgb_mean[0]
+            out[blot_area, 1] = rgb_mean[1]
+            out[blot_area, 2] = rgb_mean[2]
+            out[blot_area, 3] = 255
+
+    result = Layer(f"{source_layer.name} - スタンプ", w, h)
+    result.image = _array_to_qimage(out)
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. 万華鏡
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class KaleidoDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("万華鏡")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._segments = QSpinBox()
+        self._segments.setRange(2, 12)
+        self._segments.setValue(6)
+        form.addRow("分割数", self._segments)
+
+        self._mirror = QCheckBox("交互に鏡映する")
+        self._mirror.setChecked(True)
+        form.addRow("", self._mirror)
+
+        layout.addLayout(form)
+
+        desc = QLabel("キャンバス中心の周りに回転コピーして\n"
+                      "万華鏡のような模様を作ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "segments": self._segments.value(),
+            "mirror": self._mirror.isChecked(),
+        }
+
+
+def execute_kaleidoscope(layer_stack: LayerStack, source_layer: Layer,
+                         params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    if src_img.width() == 0 or src_img.height() == 0:
+        return None
+    cw, ch = layer_stack.width, layer_stack.height
+    segments = max(2, params["segments"])
+    mirror = params.get("mirror", False)
+    ox = getattr(source_layer, 'offset_x', 0)
+    oy = getattr(source_layer, 'offset_y', 0)
+
+    buf = QImage(cw, ch, QImage.Format.Format_ARGB32_Premultiplied)
+    buf.fill(Qt.GlobalColor.transparent)
+    p = QPainter(buf)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    for i in range(segments):
+        t = QTransform()
+        t.translate(cw / 2, ch / 2)
+        t.rotate(360.0 * i / segments)
+        if mirror and i % 2 == 1:
+            t.scale(-1, 1)
+        t.translate(-cw / 2, -ch / 2)
+        p.setTransform(t)
+        p.drawImage(ox, oy, src_img)
+    p.end()
+
+    result = Layer(f"{source_layer.name} - 万華鏡", cw, ch)
+    result.image = buf.convertToFormat(QImage.Format.Format_ARGB32)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. 等高線
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ContourDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("等高線")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._count = QSpinBox()
+        self._count.setRange(1, 10)
+        self._count.setValue(4)
+        form.addRow("本数", self._count)
+
+        self._spacing = QSpinBox()
+        self._spacing.setRange(4, 60)
+        self._spacing.setValue(12)
+        self._spacing.setSuffix(" px")
+        form.addRow("間隔", self._spacing)
+
+        self._color_btn = _color_button(QColor(255, 255, 255), self)
+        form.addRow("線の色", self._color_btn)
+
+        self._thickness = QSpinBox()
+        self._thickness.setRange(1, 8)
+        self._thickness.setValue(2)
+        self._thickness.setSuffix(" px")
+        form.addRow("線の太さ", self._thickness)
+
+        self._fade = QCheckBox("外側ほど薄くする")
+        self._fade.setChecked(True)
+        form.addRow("", self._fade)
+
+        layout.addLayout(form)
+
+        desc = QLabel("シルエットの外側に輪郭線を何重にも生成します。\n"
+                      "地形図の等高線のような模様になります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "count": self._count.value(),
+            "spacing": self._spacing.value(),
+            "color": self._color_btn._color,
+            "thickness": self._thickness.value(),
+            "fade": self._fade.isChecked(),
+        }
+
+
+def execute_contour(layer_stack: LayerStack, source_layer: Layer,
+                    params: dict) -> GroupLayer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+    arr = _qimage_to_array(src_img)
+    alpha = arr[:, :, 3]
+    if not alpha.any():
+        return None
+
+    sil = _filled_silhouette(alpha)
+    count = params["count"]
+    spacing = params["spacing"]
+    thickness = params["thickness"]
+    fade = params.get("fade", True)
+    color: QColor = params["color"]
+
+    k_spacing = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (spacing * 2 + 1, spacing * 2 + 1))
+    k_thick = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (thickness * 2 + 1, thickness * 2 + 1))
+
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    cur = sil.copy()
+    for i in range(count):
+        cur = cv2.dilate(cur, k_spacing)
+        ring = (cur > 0) & (cv2.erode(cur, k_thick) == 0)
+        a = int(255 * (count - i) / (count + 1)) if fade else color.alpha()
+        out[ring] = [color.blue(), color.green(), color.red(), a]
+
+    group, _top = _group_with_original(source_layer, "等高線")
+    contour_layer = Layer("等高線", w, h)
+    contour_layer.image = _array_to_qimage(out)
+    _copy_offset(source_layer, contour_layer)
+    group.children.append(contour_layer)
+
+    _insert_result_layer(layer_stack, source_layer, group)
+    return group
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. アクションガチャ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+GACHA_PALETTES: list[tuple[str, list[str]]] = [
+    ("パステルポップ", ["#f2a0b1", "#f5e04b", "#57c9b1", "#ffffff"]),
+    ("レトロ印刷", ["#e63946", "#457b9d", "#f4a261", "#1d3557"]),
+    ("モノ＋差し色", ["#222222", "#ffffff", "#ff3366", "#cccccc"]),
+    ("ビタミン", ["#ff6b35", "#ffd23f", "#0ead69", "#3bceac"]),
+    ("ゆめかわ", ["#ffb3d9", "#b3d9ff", "#ffffb3", "#e6ccff"]),
+]
+
+# ガチャで使う効果（背景パターン生成は要素が違うため除外）
+_GACHA_POOL: list[tuple[str, str]] = [
+    ("chroma", "線画ずらし"),
+    ("glow", "グロー"),
+    ("shadow", "影付け"),
+    ("line_color", "線画色変え"),
+    ("popout", "ポップアウト"),
+    ("tile", "タイリング"),
+    ("path", "パス複製"),
+    ("grain", "紙質感"),
+    ("offset_border", "ずれ縁取り"),
+    ("silkscreen", "リソ風版ずれ"),
+    ("collage", "切り絵"),
+    ("wobble", "線の揺らぎ"),
+    ("stamp", "スタンプ劣化"),
+    ("kaleido", "万華鏡"),
+    ("contour", "等高線"),
+]
+
+
+def _gacha_random_path(w: int, h: int) -> list[tuple[float, float]]:
+    """ガチャ用: キャンバスを横切るゆるやかな波パスを作る。"""
+    n = random.randint(8, 14)
+    y0 = random.uniform(h * 0.2, h * 0.8)
+    y1 = random.uniform(h * 0.2, h * 0.8)
+    amp = random.uniform(h * 0.05, h * 0.25)
+    freq = random.uniform(1.0, 3.0)
+    pts = []
+    for i in range(n):
+        t = i / (n - 1)
+        x = t * (w - 1)
+        y = y0 + (y1 - y0) * t + math.sin(t * math.pi * freq) * amp
+        pts.append((x, min(max(y, 0.0), h - 1.0)))
+    if random.random() < 0.5:
+        pts = [(y * w / h, x * h / w) for x, y in pts]  # 縦方向バリエーション
+    return pts
+
+
+def _gacha_random_params(key: str, colors: list[QColor]) -> dict:
+    """効果ごとのランダムパラメータを共有パレットから生成する。"""
+    ri = random.randint
+    ru = random.uniform
+    rb = lambda p=0.5: random.random() < p
+    pick = lambda: random.choice(colors)
+    light = max(colors, key=lambda c: c.lightness())
+    dark = min(colors, key=lambda c: c.lightness())
+
+    if key == "chroma":
+        n = min(len(colors), ri(2, 3))
+        plates = [{"color": QColor(c.red(), c.green(), c.blue(), 200),
+                   "thickness": ri(-1, 2)} for c in random.sample(colors, n)]
+        return {"shift_px": ri(8, 45), "layers": plates,
+                "rotate": rb(0.4), "rotate_max": ri(1, 6),
+                "scale": rb(0.4), "scale_max": ri(2, 8)}
+    if key == "glow":
+        bg = QColor(dark)
+        return {"glow_color": light, "glow_size": ri(6, 24),
+                "glow_strength": ri(50, 90),
+                "bg_color": bg.darker(ri(150, 300)),
+                "bg_opacity": ri(0, 60)}
+    if key == "shadow":
+        c = QColor(dark) if rb(0.5) else QColor(0, 0, 0)
+        c.setAlpha(160)
+        return {"color": c, "offset_x": ri(-25, 25), "offset_y": ri(-25, 25),
+                "blur": ri(0, 10), "strength": ri(50, 90)}
+    if key == "line_color":
+        return {"color": pick()}
+    if key == "popout":
+        return {"outline_size": ri(3, 15),
+                "outline_color": light if rb(0.7) else pick(),
+                "shadow": rb(0.7), "shadow_offset": ri(2, 8)}
+    if key == "tile":
+        return {"count": ri(8, 40), "scale_min": ru(0.4, 0.8),
+                "scale_max": ru(0.9, 1.6), "rotate_max": ri(0, 60),
+                "overlap": ru(-0.4, 0.3), "merge": True}
+    if key == "path":
+        return {"spacing": ri(150, 450), "scale_min": ru(0.4, 0.7),
+                "scale_max": ru(0.7, 1.0), "rotate_max": ri(0, 40),
+                "follow_path": rb(0.5), "merge": True}
+    if key == "grain":
+        return {"strength": ru(0.15, 0.5), "scale": ri(1, 4),
+                "mode": random.choice(["overlay", "multiply"])}
+    if key == "offset_border":
+        return {"color": light if rb(0.7) else pick(),
+                "size": ri(4, 20), "shift": ri(5, 40), "gap": ri(0, 60)}
+    if key == "silkscreen":
+        n = min(len(colors), ri(2, 3))
+        return {"colors": random.sample(colors, n),
+                "shift": ri(10, 50), "opacity": ri(60, 100)}
+    if key == "collage":
+        return {"colors": colors, "coverage": ri(40, 90),
+                "expand": ri(0, 10), "shift": ri(0, 12)}
+    if key == "wobble":
+        return {"strength": ri(3, 18), "wavelength": ri(30, 180),
+                "gap": ri(0, 40)}
+    if key == "stamp":
+        return {"strength": ri(20, 60), "grain": ri(1, 5), "blots": rb(0.6)}
+    if key == "kaleido":
+        return {"segments": random.choice([3, 4, 5, 6, 8]), "mirror": rb(0.6)}
+    if key == "contour":
+        return {"count": ri(2, 6), "spacing": ri(8, 30),
+                "color": pick(), "thickness": ri(1, 4), "fade": rb(0.7)}
+    return {}
+
+
+_GACHA_EXEC = {
+    "chroma": execute_chroma_shift,
+    "glow": execute_glow,
+    "shadow": execute_drop_shadow,
+    "line_color": execute_line_color,
+    "popout": execute_popout,
+    "tile": execute_random_tile,
+    "grain": execute_paper_grain,
+    "offset_border": execute_offset_border,
+    "silkscreen": execute_silkscreen,
+    "collage": execute_collage,
+    "wobble": execute_wobble,
+    "stamp": execute_stamp,
+    "kaleido": execute_kaleidoscope,
+    "contour": execute_contour,
+}
+
+
+def _flatten_gacha_result(result, w: int, h: int) -> QImage:
+    """効果の結果（レイヤー or グループ）をキャンバスサイズ1枚に焼く。"""
+    buf = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    buf.fill(Qt.GlobalColor.transparent)
+    p = QPainter(buf)
+    if result.is_group:
+        p.drawImage(0, 0, result.composite())
+    else:
+        p.drawImage(getattr(result, 'offset_x', 0),
+                    getattr(result, 'offset_y', 0), result.image)
+    p.end()
+    return buf.convertToFormat(QImage.Format.Format_ARGB32)
+
+
+class GachaDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("アクションガチャ")
+        self.setMinimumWidth(320)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._count = QComboBox()
+        self._count.addItem("おまかせ（2〜4個）", 0)
+        for n in (2, 3, 4):
+            self._count.addItem(f"{n}個", n)
+        form.addRow("効果の数", self._count)
+
+        self._palette = QComboBox()
+        self._palette.addItem("おまかせ", "auto")
+        for name, _cols in GACHA_PALETTES:
+            self._palette.addItem(name, name)
+        self._palette.addItem("完全ランダム色", "random")
+        form.addRow("カラーパレット", self._palette)
+
+        layout.addLayout(form)
+
+        desc = QLabel("効果をランダムに選んでランダムな数値で連続適用します。\n"
+                      "どんな結果になるかはお楽しみ。気に入らなければ\n"
+                      "元に戻す（Ctrl+Z）してもう一回引けます。\n"
+                      "使ったレシピは新レイヤーの名前に残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = QDialogButtonBox()
+        roll = buttons.addButton("🎲 引く！", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        roll.setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "count": self._count.currentData(),
+            "palette": self._palette.currentData(),
+        }
+
+
+def execute_gacha(layer_stack: LayerStack, source_layer: Layer,
+                  params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    if src_img.width() == 0 or src_img.height() == 0:
+        return None
+    if not _qimage_to_array(src_img)[:, :, 3].any():
+        return None  # 空レイヤーにはかけない
+    w, h = layer_stack.width, layer_stack.height
+
+    count = params.get("count", 0) or random.randint(2, 4)
+    palette_key = params.get("palette", "auto")
+    if palette_key == "random":
+        palette_name = "ランダム色"
+        colors = [QColor(random.randint(0, 255), random.randint(0, 255),
+                         random.randint(0, 255)) for _ in range(4)]
+    else:
+        if palette_key == "auto":
+            palette_name, hex_colors = random.choice(GACHA_PALETTES)
+        else:
+            palette_name, hex_colors = next(
+                (n, c) for n, c in GACHA_PALETTES if n == palette_key)
+        colors = [QColor(c) for c in hex_colors]
+
+    chosen = random.sample(_GACHA_POOL, min(count, len(_GACHA_POOL)))
+
+    # ソースをキャンバスサイズの作業レイヤーに正規化してから順に適用する
+    work_img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    work_img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(work_img)
+    p.drawImage(getattr(source_layer, 'offset_x', 0),
+                getattr(source_layer, 'offset_y', 0), src_img)
+    p.end()
+    work = Layer("work", w, h)
+    work.image = work_img.convertToFormat(QImage.Format.Format_ARGB32)
+
+    temp_stack = LayerStack(w, h)
+    applied: list[str] = []
+    for key, label in chosen:
+        temp_stack.layers = [work]
+        temp_stack.active_path = [0]
+        eff_params = _gacha_random_params(key, colors)
+        try:
+            if key == "path":
+                result = execute_path_repeat(
+                    temp_stack, work, _gacha_random_path(w, h), eff_params)
+            else:
+                result = _GACHA_EXEC[key](temp_stack, work, eff_params)
+        except Exception:
+            result = None  # 1効果の失敗でガチャ全体を止めない
+        if result is None:
+            continue
+        next_work = Layer("work", w, h)
+        next_work.image = _flatten_gacha_result(result, w, h)
+        work = next_work
+        applied.append(label)
+
+    if not applied:
+        return None
+
+    final = Layer(f"{source_layer.name} - ガチャ({palette_name}: "
+                  f"{'→'.join(applied)})", w, h)
+    final.image = work.image
+    _insert_result_layer(layer_stack, source_layer, final)
+    return final
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # アクションパネル
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1298,7 +2327,17 @@ class ActionPanel(QWidget):
         self.layer_stack = layer_stack
         self.canvas = None  # main.py から注入される（パスピックモード用）
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+        inner = QWidget()
+        scroll.setWidget(inner)
+
+        layout = QVBoxLayout(inner)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
@@ -1312,6 +2351,7 @@ class ActionPanel(QWidget):
         layout.addWidget(desc)
 
         actions = [
+            ("🎰 アクションガチャ", "ランダムな効果をランダムな数値で一発適用", self._on_gacha),
             ("🎨 線画ずらし（色収差）", "色収差エフェクト", self._on_chroma_shift),
             ("✨ グロー / 発光", "暗背景＋発光エフェクト", self._on_glow),
             ("🔲 影付け", "ドロップシャドウ自動生成", self._on_drop_shadow),
@@ -1321,6 +2361,13 @@ class ActionPanel(QWidget):
             ("🔁 ランダムタイリング配置", "壁紙パターン風に複製配置", self._on_random_tile),
             ("〰️ パスに沿った連続複製", "クリックしたパスに沿って複製配置", self._on_path_repeat),
             ("📜 紙質感グレイン", "ザラついた紙の質感を加える", self._on_paper_grain),
+            ("🧩 ずれ縁取り", "縁取りをわざとずらす偶然アート", self._on_offset_border),
+            ("🖨️ リソ風版ずれ", "色版をずらして重ねる印刷風", self._on_silkscreen),
+            ("✂️ 切り絵コラージュ", "閉じた領域を色紙でランダムに塗る", self._on_collage),
+            ("〽️ 線の揺らぎ", "線を波打たせて別テイクを作る", self._on_wobble),
+            ("🪧 スタンプ劣化", "はんこ風にかすれさせる", self._on_stamp),
+            ("❄️ 万華鏡", "回転コピーで万華鏡模様", self._on_kaleidoscope),
+            ("🗺️ 等高線", "外側に輪郭線を何重にも生成", self._on_contour),
         ]
         for text, tip, slot in actions:
             btn = QPushButton(text)
@@ -1381,6 +2428,30 @@ class ActionPanel(QWidget):
 
     def _on_paper_grain(self):
         self._run("紙質感グレイン", PaperGrainDialog, execute_paper_grain)
+
+    def _on_offset_border(self):
+        self._run("ずれ縁取り", OffsetBorderDialog, execute_offset_border)
+
+    def _on_silkscreen(self):
+        self._run("リソ風版ずれ", SilkscreenDialog, execute_silkscreen)
+
+    def _on_collage(self):
+        self._run("切り絵コラージュ", CollageDialog, execute_collage)
+
+    def _on_wobble(self):
+        self._run("線の揺らぎ", WobbleDialog, execute_wobble)
+
+    def _on_stamp(self):
+        self._run("スタンプ劣化", StampDialog, execute_stamp)
+
+    def _on_kaleidoscope(self):
+        self._run("万華鏡", KaleidoDialog, execute_kaleidoscope)
+
+    def _on_contour(self):
+        self._run("等高線", ContourDialog, execute_contour)
+
+    def _on_gacha(self):
+        self._run("アクションガチャ", GachaDialog, execute_gacha)
 
     def _on_path_repeat(self):
         active = self._require_layer("パスに沿った連続複製")

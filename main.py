@@ -13,9 +13,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QFileDialog,
                               QDialog, QDialogButtonBox, QSlider, QFormLayout,
                               QSpinBox, QRadioButton, QButtonGroup, QGroupBox,
                               QVBoxLayout, QSplitter, QPushButton)
-from PyQt6.QtCore import Qt, QSize, QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QRect, QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QRectF, QEvent, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
-                          QFont, QPainter, QIcon)
+                          QFont, QPainter, QIcon, QImageReader)
 
 from layer import LayerStack, Layer, GroupLayer, CANVAS_W, CANVAS_H
 from animation_panel import AnimationPanel
@@ -117,6 +117,37 @@ class LineExtractionDialog(QDialog):
         bgra = np.zeros((h, w, 4), dtype=np.uint8)
         bgra[mask > 0] = [0, 0, 0, 255]
         return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+
+
+def _selection_mask_for_layer(layer, sel, mask) -> np.ndarray | None:
+    """選択範囲（キャンバス座標の矩形 sel / 投げなわマスク mask）を、レイヤーローカル
+    座標のブールマスク（layer.image と同サイズ）に変換して返す。選択がなければ None。
+    レイヤー画像は offset_x/offset_y 分ずれていたり、変形でキャンバスより大きく
+    なっていたりするため、キャンバス座標をそのまま配列インデックスに使えない。"""
+    if sel is None and mask is None:
+        return None
+    w, h = layer.image.width(), layer.image.height()
+    lox = getattr(layer, 'offset_x', 0)
+    loy = getattr(layer, 'offset_y', 0)
+    local = np.zeros((h, w), dtype=bool)
+    if mask is not None:
+        m_bits = mask.bits()
+        m_bits.setsize(mask.sizeInBytes())
+        m_arr = np.frombuffer(m_bits, dtype=np.uint8).reshape(
+            mask.height(), mask.width(), 4)
+        sel_mask = m_arr[:, :, 3] > 0
+        # ローカル (lx,ly) はキャンバス (lx+lox, ly+loy) に対応する
+        lx0, ly0 = max(0, -lox), max(0, -loy)
+        lx1 = min(w, mask.width() - lox)
+        ly1 = min(h, mask.height() - loy)
+        if lx1 > lx0 and ly1 > ly0:
+            local[ly0:ly1, lx0:lx1] = \
+                sel_mask[ly0 + loy:ly1 + loy, lx0 + lox:lx1 + lox]
+    else:
+        r = sel.translated(-lox, -loy).intersected(QRect(0, 0, w, h))
+        if not r.isEmpty():
+            local[r.top():r.top() + r.height(), r.left():r.left() + r.width()] = True
+    return local
 
 
 class DespeckleDialog(QDialog):
@@ -540,6 +571,26 @@ class TransformPercentDialog(QDialog):
 
         form.addRow(_HSeparator())
 
+        # 位置（X/Y移動）
+        pos_row = QHBoxLayout()
+        self._x_spin = QSpinBox()
+        self._x_spin.setRange(-99999, 99999)
+        self._x_spin.setValue(0)
+        self._x_spin.setSuffix(" px")
+        self._x_spin.setFixedWidth(80)
+        self._y_spin = QSpinBox()
+        self._y_spin.setRange(-99999, 99999)
+        self._y_spin.setValue(0)
+        self._y_spin.setSuffix(" px")
+        self._y_spin.setFixedWidth(80)
+        pos_row.addWidget(QLabel("X"))
+        pos_row.addWidget(self._x_spin)
+        pos_row.addWidget(QLabel("Y"))
+        pos_row.addWidget(self._y_spin)
+        form.addRow("位置", pos_row)
+
+        form.addRow(_HSeparator())
+
         # 反転
         flip_row = QHBoxLayout()
         self._flip_h_btn = QPushButton("左右反転")
@@ -583,6 +634,8 @@ class TransformPercentDialog(QDialog):
         self._sy_slider.valueChanged.connect(self._on_sy_slider)
         self._rot_spin.valueChanged.connect(self._on_rot_spin)
         self._rot_slider.valueChanged.connect(self._on_rot_slider)
+        self._x_spin.valueChanged.connect(lambda _: self._apply())
+        self._y_spin.valueChanged.connect(lambda _: self._apply())
 
         self._updating = False  # スピン↔スライダー相互更新ループ防止
 
@@ -615,6 +668,9 @@ class TransformPercentDialog(QDialog):
             return
         self._updating = True
         self._sy_slider.setValue(v)
+        if self._lock.isChecked():
+            self._sx_spin.setValue(v)
+            self._sx_slider.setValue(v)
         self._updating = False
         self._apply()
 
@@ -623,6 +679,9 @@ class TransformPercentDialog(QDialog):
             return
         self._updating = True
         self._sy_spin.setValue(v)
+        if self._lock.isChecked():
+            self._sx_spin.setValue(v)
+            self._sx_slider.setValue(v)
         self._updating = False
         self._apply()
 
@@ -647,6 +706,8 @@ class TransformPercentDialog(QDialog):
             self._sx_spin.value(),
             self._sy_spin.value(),
             self._rot_spin.value(),
+            self._x_spin.value(),
+            self._y_spin.value(),
         )
 
     def _on_flip_h(self):
@@ -677,9 +738,40 @@ def _HSeparator() -> QWidget:
     return f
 
 
+class _CanvasPad(QWidget):
+    """Canvas ウィジェットの周囲に常に一定の余白を確保するラッパー。
+    Canvas 自身のサイズ・座標系（_widget_to_canvas 等）には一切手を加えず、
+    QScrollArea にはこのラッパーを乗せることで、どれだけ拡大してもキャンバスの
+    四隅の外側までマウスを動かせるようにする（塗り作業のしやすさ、および
+    キャンバス外から直線を引きたいという要望への対応）。"""
+
+    MARGIN_RATIO = 0.5
+    MIN_MARGIN = 200
+
+    def __init__(self, canvas: QWidget, parent=None):
+        super().__init__(parent)
+        self._canvas = canvas
+        canvas.setParent(self)
+        canvas.installEventFilter(self)
+        self.setStyleSheet("background: #808080;")
+        self._relayout()
+
+    def eventFilter(self, obj, event):
+        if obj is self._canvas and event.type() == QEvent.Type.Resize:
+            self._relayout()
+        return super().eventFilter(obj, event)
+
+    def _relayout(self):
+        cw, ch = self._canvas.width(), self._canvas.height()
+        margin = max(self.MIN_MARGIN, int(min(cw, ch) * self.MARGIN_RATIO))
+        self.resize(cw + margin * 2, ch + margin * 2)
+        self._canvas.move(margin, margin)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._settings = QSettings("PaintPola", "PaintPola")
         self._current_path: str | None = None  # 現在開いている .pola ファイルのパス
         self.setWindowTitle("PaintPola")
         icon_path = os.path.join(os.path.dirname(__file__), "images", "pola_block.png")
@@ -728,6 +820,12 @@ class MainWindow(QMainWindow):
         self.canvas.zoom_changed.connect(self._on_zoom_changed)
 
         self.resize(1200, 800)
+
+        saved_theme = self._settings.value("theme", "default")
+        if saved_theme in self._theme_actions:
+            self._apply_theme(saved_theme)
+        # ウィンドウ表示・レイアウト確定後でないと表示領域が0のままフィットできない
+        QTimer.singleShot(0, lambda: self.navigator._fit_view())
 
     def _init_canvas(self, w: int, h: int):
         self.layer_stack.layers.clear()
@@ -835,6 +933,9 @@ class MainWindow(QMainWindow):
             fill_expand=self.canvas.fill_expand,
             select_mode=self.canvas.select_mode,
             transform_mode=self.canvas.transform_mode,
+            blur_size=self.canvas.blur_size,
+            blur_strength=int(round(self.canvas.blur_strength * 100)),
+            mesh_div=self.canvas._mesh_div,
         )
         # ツールに応じたカーソル
         self.canvas._tool_cursor = self._tool_cursors.get(tool)
@@ -879,8 +980,9 @@ class MainWindow(QMainWindow):
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(0)
 
+        self._canvas_pad = _CanvasPad(self.canvas)
         self._scroll = QScrollArea()
-        self._scroll.setWidget(self.canvas)
+        self._scroll.setWidget(self._canvas_pad)
         self._scroll.setWidgetResizable(False)
         self._scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._scroll.setStyleSheet(
@@ -897,7 +999,8 @@ class MainWindow(QMainWindow):
         right_splitter.setFixedWidth(260)
         right_splitter.setChildrenCollapsible(False)
 
-        self.navigator = NavigatorPanel(self.layer_stack, self.canvas, self._scroll)
+        self.navigator = NavigatorPanel(self.layer_stack, self.canvas, self._scroll,
+                                         content_widget=self._canvas_pad)
         right_splitter.addWidget(self.navigator)
 
         right_splitter.addWidget(self.color_panel)
@@ -938,6 +1041,7 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "削除", self.canvas.delete_selection, "Delete")
         edit_menu.addSeparator()
         self._add_action(edit_menu, "すべて選択", self.canvas.select_all, "Ctrl+A")
+        self._add_action(edit_menu, "イラストを選択", self._select_layer_alpha, "Ctrl+Shift+A")
         self._add_action(edit_menu, "選択を反転", self.canvas.invert_selection, "Ctrl+Shift+I")
         self._add_action(edit_menu, "選択解除", self.canvas.deselect, "Escape")
 
@@ -960,6 +1064,9 @@ class MainWindow(QMainWindow):
         zoom_menu = view_menu.addMenu("ズーム")
         for label, zoom in [("25%", 0.25), ("50%", 0.5), ("100%", 1.0), ("150%", 1.5), ("200%", 2.0)]:
             self._add_action(zoom_menu, label, lambda _, z=zoom: self.canvas.set_zoom(z))
+        zoom_menu.addSeparator()
+        self._add_action(zoom_menu, "全体表示（キャンバスを画面に収める）",
+                         lambda: self.navigator._fit_view(), "Ctrl+Shift+0")
 
         view_menu.addSeparator()
         self._add_action(view_menu, "左に回転", self.canvas.rotate_ccw, "Ctrl+[")
@@ -1075,6 +1182,28 @@ class MainWindow(QMainWindow):
             path += ".pola"
         self._write_pola(path)
 
+    @staticmethod
+    def _clip_layer_image_for_save(image: QImage, offset_x: int, offset_y: int,
+                                    canvas_w: int, canvas_h: int) -> tuple[QImage, int, int]:
+        """保存用にレイヤー画像をキャンバス範囲へクロップする。
+        拡大縮小・移動でキャンバス外にはみ出した絵は編集中は画素データとして
+        保持されるが（_ensure_layer_bounds）、その分だけ .pola ファイルが
+        際限なく肥大化し、Qtの画像読み込み上限を超えて保存後に開けなくなる
+        バグの原因になったため、保存時はキャンバス外を切り捨てる。
+        編集中のレイヤーオブジェクト自体は変更しない（保存用コピーのみ）。"""
+        img_rect = QRect(offset_x, offset_y, image.width(), image.height())
+        canvas_rect = QRect(0, 0, canvas_w, canvas_h)
+        if canvas_rect.contains(img_rect):
+            return image, offset_x, offset_y
+        clipped_rect = img_rect.intersected(canvas_rect)
+        if clipped_rect.isEmpty():
+            # レイヤーが完全にキャンバス外: 空画像として保存する
+            empty = QImage(1, 1, QImage.Format.Format_ARGB32)
+            empty.fill(Qt.GlobalColor.transparent)
+            return empty, 0, 0
+        local_rect = clipped_rect.translated(-offset_x, -offset_y)
+        return image.copy(local_rect), clipped_rect.x(), clipped_rect.y()
+
     def _write_pola(self, path: str):
         """レイヤー構造を .pola（ZIP）形式で保存する。"""
         ls = self.layer_stack
@@ -1134,10 +1263,14 @@ class MainWindow(QMainWindow):
                         info["hsl_hue"] = lyr.hsl_hue
                         info["hsl_saturation"] = lyr.hsl_saturation
                         info["hsl_lightness"] = lyr.hsl_lightness
+                        save_img, save_ox, save_oy = self._clip_layer_image_for_save(
+                            lyr.image, lyr.offset_x, lyr.offset_y, ls.width, ls.height)
+                        info["offset_x"] = save_ox
+                        info["offset_y"] = save_oy
                         buf = QByteArray()
                         buf_io = QBuffer(buf)
                         buf_io.open(QIODevice.OpenModeFlag.WriteOnly)
-                        lyr.image.save(buf_io, "PNG")
+                        save_img.save(buf_io, "PNG")
                         buf_io.close()
                         fname = f"layer_{img_index}.png"
                         zf.writestr(fname, bytes(buf))
@@ -1355,6 +1488,7 @@ class MainWindow(QMainWindow):
         for k, action in self._theme_actions.items():
             action.setChecked(k == key)
         self._current_theme = key
+        self._settings.setValue("theme", key)
 
     def _toggle_anim_mode(self, enabled: bool):
         self._anim_mode = enabled
@@ -1409,7 +1543,19 @@ class MainWindow(QMainWindow):
             new_img.fill(Qt.GlobalColor.transparent)
             p = QPainter(new_img)
             if scale_mode:
-                scaled = lyr.image.scaled(
+                # lyr.image は offset_x/offset_y 分ずれていたり、変形操作で
+                # キャンバスより大きく拡張されていたりするため、offset を無視して
+                # そのままスケーリングすると絵の位置がずれる。まず元キャンバス
+                # サイズ（old_w×old_h）のバッファに offset 付きで正しく配置して
+                # から、それを新サイズへスケーリングする。
+                lox = getattr(lyr, 'offset_x', 0)
+                loy = getattr(lyr, 'offset_y', 0)
+                canvas_buf = QImage(old_w, old_h, QImage.Format.Format_ARGB32_Premultiplied)
+                canvas_buf.fill(Qt.GlobalColor.transparent)
+                cp = QPainter(canvas_buf)
+                cp.drawImage(lox, loy, lyr.image)
+                cp.end()
+                scaled = canvas_buf.scaled(
                     nw, nh,
                     Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.SmoothTransformation)
@@ -1483,6 +1629,15 @@ class MainWindow(QMainWindow):
         self.layer_panel.refresh()
         self.canvas.update()
         self.navigator.refresh()
+
+    def _select_layer_alpha(self):
+        """編集メニュー: アクティブレイヤーの不透明部分（イラスト）の形で選択範囲を作る。"""
+        layer = self.layer_stack.active
+        if not layer or layer.is_group:
+            self.statusBar().showMessage("通常レイヤーを選択してください", 3000)
+            return
+        if not self.canvas.select_layer_alpha(layer):
+            self.statusBar().showMessage("選択できる不透明ピクセルがありません", 3000)
 
     def _transform_layer_dialog(self):
         """画像メニュー: レイヤー全体をliftしてからTransformPercentDialogを開く。"""
@@ -1619,27 +1774,15 @@ class MainWindow(QMainWindow):
 
         sel = self.canvas._selection_rect
         mask = self.canvas._lasso_mask
+        # 選択範囲はキャンバス座標なので、レイヤーローカルのマスクに変換してから使う
+        local_mask = _selection_mask_for_layer(layer, sel, mask)
 
-        if mask:
-            # 投げなわ選択: マスク領域のみぼかす
-            m_bits = mask.bits()
-            m_bits.setsize(mask.sizeInBytes())
-            m_arr = np.frombuffer(m_bits, dtype=np.uint8).reshape(mask.height(), mask.width(), 4)
-            alpha_mask = m_arr[:, :, 3] > 0
-            blurred = cv2.GaussianBlur(arr, (k, k), 0)
-            arr[alpha_mask] = blurred[alpha_mask]
-        elif sel:
-            # 矩形選択: 選択範囲のみぼかす
-            x0 = max(0, sel.left())
-            y0 = max(0, sel.top())
-            x1 = min(img.width(), sel.right() + 1)
-            y1 = min(img.height(), sel.bottom() + 1)
-            region = arr[y0:y1, x0:x1].copy()
-            blurred = cv2.GaussianBlur(region, (k, k), 0)
-            arr[y0:y1, x0:x1] = blurred
-        else:
+        if local_mask is None:
             # 選択なし: レイヤー全体
             arr[:] = cv2.GaussianBlur(arr, (k, k), 0)
+        else:
+            blurred = cv2.GaussianBlur(arr, (k, k), 0)
+            arr[local_mask] = blurred[local_mask]
 
         result = QImage(arr.data, img.width(), img.height(), arr.strides[0],
                         QImage.Format.Format_ARGB32).copy()
@@ -1656,22 +1799,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "ゴミ取り", "通常レイヤーを選択してください。")
             return
 
-        area_mask = None
-        sel = self.canvas._selection_rect
-        mask = self.canvas._lasso_mask
-        w, h = layer.image.width(), layer.image.height()
-        if mask is not None:
-            m_bits = mask.bits()
-            m_bits.setsize(mask.sizeInBytes())
-            m_arr = np.frombuffer(m_bits, dtype=np.uint8).reshape(mask.height(), mask.width(), 4)
-            area_mask = (m_arr[:, :, 3] > 0).astype(np.uint8)
-        elif sel:
-            area_mask = np.zeros((h, w), dtype=np.uint8)
-            x0 = max(0, sel.left())
-            y0 = max(0, sel.top())
-            x1 = min(w, sel.right() + 1)
-            y1 = min(h, sel.bottom() + 1)
-            area_mask[y0:y1, x0:x1] = 1
+        # 選択範囲はキャンバス座標なので、レイヤーローカルのマスクに変換してから使う
+        local_mask = _selection_mask_for_layer(
+            layer, self.canvas._selection_rect, self.canvas._lasso_mask)
+        area_mask = local_mask.astype(np.uint8) if local_mask is not None else None
 
         self.canvas._save_history()
         dlg = DespeckleDialog(self.canvas, layer, area_mask, self)
@@ -1690,6 +1821,10 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # デフォルト256MBだと、過去に肥大化したレイヤー画像を含む .pola が
+    # 保存後に開けなくなることがあった（QImage.fromData が黙ってnull画像を返す）ため、
+    # 読み込み時の安全上限を引き上げておく。
+    QImageReader.setAllocationLimit(1024)
     app = QApplication(sys.argv)
     app.setApplicationName("PaintPola")
     win = MainWindow()

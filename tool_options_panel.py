@@ -9,6 +9,67 @@ from tools import Tool
 from brush import BRUSH_LABELS
 
 
+class _SliderSpin(QWidget):
+    """スライダーと数値入力を横に並べた複合ウィジェット。
+    ドラッグで大まかに、スピンボックスで正確に調整できる。"""
+
+    def __init__(self, value: int, lo: int, hi: int, suffix: str = "", parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(lo, hi)
+        self._slider.setValue(value)
+        self._spin = QSpinBox()
+        self._spin.setRange(lo, hi)
+        self._spin.setValue(value)
+        if suffix:
+            self._spin.setSuffix(suffix)
+        self._spin.setFixedWidth(64)
+        row.addWidget(self._slider, 1)
+        row.addWidget(self._spin)
+        self._callbacks = []
+        self._slider.valueChanged.connect(self._on_slider)
+        self._spin.valueChanged.connect(self._on_spin)
+
+    def _on_slider(self, v: int):
+        if self._spin.value() != v:
+            self._spin.blockSignals(True)
+            self._spin.setValue(v)
+            self._spin.blockSignals(False)
+        self._emit(v)
+
+    def _on_spin(self, v: int):
+        if self._slider.value() != v:
+            self._slider.blockSignals(True)
+            self._slider.setValue(v)
+            self._slider.blockSignals(False)
+        self._emit(v)
+
+    def _emit(self, v: int):
+        if not self.signalsBlocked():
+            for cb in self._callbacks:
+                cb(v)
+
+    def connect_changed(self, callback):
+        self._callbacks.append(callback)
+
+    def setValue(self, v: int):
+        """外部からの同期用。コールバックは発火しない。"""
+        blocked = self.blockSignals(True)
+        self._slider.blockSignals(True)
+        self._spin.blockSignals(True)
+        self._slider.setValue(v)
+        self._spin.setValue(v)
+        self._slider.blockSignals(False)
+        self._spin.blockSignals(False)
+        self.blockSignals(blocked)
+
+    def value(self) -> int:
+        return self._spin.value()
+
+
 class ToolOptionsPanel(QWidget):
     """ツールごとの詳細設定パネル。ツール切替で内容が変わる。"""
 
@@ -53,10 +114,20 @@ class ToolOptionsPanel(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; background: #f5f5f5; }")
         self._content = QWidget()
-        self._content.setStyleSheet("background: #f5f5f5;")
+        self._content.setStyleSheet("""
+            QWidget { background: #f5f5f5; }
+            QLabel { font-size: 12px; color: #222; }
+            QSpinBox, QComboBox { min-height: 24px; font-size: 12px; }
+            QCheckBox { font-size: 12px; color: #222; }
+            QSlider::groove:horizontal {
+                height: 4px; background: #c8c8c8; border-radius: 2px; }
+            QSlider::handle:horizontal {
+                width: 14px; height: 14px; margin: -6px 0;
+                background: #4a90d9; border-radius: 7px; }
+        """)
         self._content_layout = QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(8, 8, 8, 8)
-        self._content_layout.setSpacing(6)
+        self._content_layout.setContentsMargins(10, 10, 10, 10)
+        self._content_layout.setSpacing(10)
         self._content_layout.addStretch()
         scroll.setWidget(self._content)
         outer.addWidget(scroll, 1)
@@ -71,7 +142,9 @@ class ToolOptionsPanel(QWidget):
                  brush_key: str = "round", symmetry: bool = False,
                  shape_fill: str = "none", fill_expand: int = 0,
                  select_mode: str = "select",
-                 transform_mode: str = "standard"):
+                 transform_mode: str = "standard",
+                 blur_size: int = 30, blur_strength: int = 50,
+                 mesh_div: int = 3):
         self._current_tool = tool
         self._clear()
 
@@ -110,9 +183,12 @@ class ToolOptionsPanel(QWidget):
                               tooltip="正: 塗り範囲を広げる  負: 塗り範囲を縮める")
 
         elif tool == Tool.BLUR:
-            self._add_spinbox("ブラシサイズ", 30, 1, 200,
-                              lambda v: self.blur_size_changed.emit(v))
-            self._add_blur_strength_slider()
+            self._add_spinbox("ブラシサイズ", blur_size, 1, 200,
+                              lambda v: self.blur_size_changed.emit(v),
+                              key="blur_size")
+            self._add_spinbox("ぼかし強度", blur_strength, 1, 100,
+                              lambda v: self.blur_strength_changed.emit(v),
+                              suffix=" %")
 
         elif tool in (Tool.RECT, Tool.ELLIPSE, Tool.LINE):
             self._add_spinbox("線の太さ", pen_size, 1, 200,
@@ -122,11 +198,11 @@ class ToolOptionsPanel(QWidget):
 
         elif tool in (Tool.SELECT_RECT, Tool.LASSO):
             self._add_select_mode_combo(select_mode)
-            self._add_transform_mode_combo(transform_mode)
+            self._add_transform_mode_combo(transform_mode, mesh_div)
             self._add_pivot_selector()
 
         elif tool == Tool.TRANSFORM:
-            self._add_transform_mode_combo(transform_mode)
+            self._add_transform_mode_combo(transform_mode, mesh_div)
             self._add_pivot_selector()
 
         elif tool == Tool.MOVE:
@@ -177,23 +253,22 @@ class ToolOptionsPanel(QWidget):
         self._widgets.append(widget)
 
     def _add_spinbox(self, label: str, value: int, lo: int, hi: int,
-                     callback, tooltip: str = "", key: str = ""):
-        sb = QSpinBox()
-        sb.setRange(lo, hi)
-        sb.setValue(value)
+                     callback, tooltip: str = "", key: str = "",
+                     suffix: str = ""):
+        w = _SliderSpin(value, lo, hi, suffix)
         if tooltip:
-            sb.setToolTip(tooltip)
+            w.setToolTip(tooltip)
         if not key:
             # label から自動判定
-            if "ブラシ" in label or "線の太さ" in label:
+            if label in ("ブラシサイズ", "線の太さ"):
                 key = "pen_size"
             elif "消しゴム" in label:
                 key = "eraser_size"
             elif "拡張" in label:
                 key = "fill_expand"
-        sb._opt_key = key  # type: ignore
-        sb.valueChanged.connect(callback)
-        self._add_row(label, sb, tooltip)
+        w._opt_key = key  # type: ignore
+        w.connect_changed(callback)
+        self._add_row(label, w, tooltip)
 
     def _add_brush_combo(self, current_key: str):
         cb = QComboBox()
@@ -235,7 +310,8 @@ class ToolOptionsPanel(QWidget):
             lambda i: self.select_mode_changed.emit(cb.itemData(i)))
         self._add_row("クリック時の動作", cb)
 
-    def _add_transform_mode_combo(self, current: str = "standard"):
+    def _add_transform_mode_combo(self, current: str = "standard",
+                                  mesh_div_value: int = 3):
         cb = QComboBox()
         cb.addItem("拡縮・回転", "standard")
         cb.addItem("自由変形（4隅を個別に動かす）", "perspective")
@@ -245,7 +321,7 @@ class ToolOptionsPanel(QWidget):
 
         mesh_div = QSpinBox()
         mesh_div.setRange(2, 8)
-        mesh_div.setValue(3)
+        mesh_div.setValue(mesh_div_value)
         mesh_div.setPrefix("分割: ")
         mesh_div.setSuffix(" ×")
         mesh_div.setVisible(current == "mesh")
@@ -293,32 +369,6 @@ class ToolOptionsPanel(QWidget):
             self.pivot_mode_changed.emit(mode)
 
         mode_cb.currentIndexChanged.connect(on_mode_change)
-
-    def _add_blur_strength_slider(self):
-        row = QWidget()
-        rl = QVBoxLayout(row)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(2)
-        lbl_title = QLabel("ぼかし強度")
-        lbl_title.setStyleSheet("font-size:11px; color:#333;")
-        rl.addWidget(lbl_title)
-        slider_row = QHBoxLayout()
-        slider_row.setSpacing(4)
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(1, 100)
-        slider.setValue(50)
-        val_lbl = QLabel("50%")
-        val_lbl.setFixedWidth(36)
-        val_lbl.setStyleSheet("font-size:11px; color:#333;")
-        def on_change(v):
-            val_lbl.setText(f"{v}%")
-            self.blur_strength_changed.emit(v)
-        slider.valueChanged.connect(on_change)
-        slider_row.addWidget(slider)
-        slider_row.addWidget(val_lbl)
-        rl.addLayout(slider_row)
-        self._content_layout.insertWidget(self._content_layout.count() - 1, row)
-        self._widgets.append(slider)
 
     def _add_label(self, text: str):
         lbl = QLabel(text)

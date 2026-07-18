@@ -76,16 +76,22 @@ class Layer:
         alpha = arr[:, :, 3]
         ksize = self.border_size * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-        dilated = cv2.dilate(alpha, kernel)
-        # alpha==0 の完全透明部分だけでなく dilated 領域全体を縁色で塗る。
-        # 線画のアンチエイリアシングで生じる半透明の縁ピクセル（alpha 1~254）の下にも
-        # 縁色を敷いておかないと、元画像を上から通常合成した際に背景色とブレンドされた
-        # 薄い色がそのまま残り、線と縁の境目に隙間のような段差が見えてしまうため。
-        border_area = dilated > 0
-        result = arr.copy()
+        # 線画の内部の線1本1本にも縁がにじまないよう、まず不透明部分全体を
+        # 「塗りつぶしたシルエット」（穴埋め済みの外形のみ）にしてから、その
+        # シルエットを dilate する。これでイラスト全体の最外周にだけ縁が付く。
+        opaque = (alpha > 127).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(opaque, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        silhouette = np.zeros_like(opaque)
+        if contours:
+            cv2.drawContours(silhouette, contours, -1, 255, thickness=cv2.FILLED)
+        dilated = cv2.dilate(silhouette, kernel)
+        # シルエットの外側にはみ出た dilate 領域だけを縁色で塗る。シルエット内部
+        # （線画のアンチエイリアシング縁を含む）は縁色を敷かず、元画像のみを使う。
+        border_area = (dilated > 0) & (silhouette == 0)
+        border = np.zeros_like(arr)
         bc = self.border_color
-        result[border_area] = [bc.blue(), bc.green(), bc.red(), bc.alpha()]
-        border_img = QImage(result.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+        border[border_area] = [bc.blue(), bc.green(), bc.red(), bc.alpha()]
+        border_img = QImage(border.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
         out = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         out.fill(Qt.GlobalColor.transparent)
         p = QPainter(out)
@@ -248,29 +254,42 @@ class GroupLayer:
             child = children[i]
             if not child.visible:
                 continue
-            if child.is_group:
-                p.setOpacity(child.opacity / 255)
-                p.drawImage(0, 0, child.composite())
-                continue
-            ox = getattr(child, 'offset_x', 0)
-            oy = getattr(child, 'offset_y', 0)
-            if (child.clipping  # type: ignore
-                    and i < len(children) - 1
-                    and not children[i + 1].is_group):
+            clipping = child.clipping and i < len(children) - 1
+            if clipping:
+                # クリッピング元・クリップ先のどちらがグループでも動くよう、
+                # グループは composite()（キャンバスサイズ・offset 0,0）で扱う
+                # （LayerStack.composite と同じロジック）。
                 below = children[i + 1]
-                box = getattr(below, 'offset_x', 0)
-                boy = getattr(below, 'offset_y', 0)
+                if child.is_group:
+                    src_img = child.composite()
+                    ox = oy = 0
+                else:
+                    src_img = child.image_with_effects()  # type: ignore
+                    ox = getattr(child, 'offset_x', 0)
+                    oy = getattr(child, 'offset_y', 0)
+                if below.is_group:
+                    below_img = below.composite()
+                    box = boy = 0
+                else:
+                    below_img = below.image_with_effects()  # type: ignore
+                    box = getattr(below, 'offset_x', 0)
+                    boy = getattr(below, 'offset_y', 0)
                 mask_img = QImage(self._w, self._h, QImage.Format.Format_ARGB32)
                 mask_img.fill(Qt.GlobalColor.transparent)
                 mp = QPainter(mask_img)
                 mp.setOpacity(child.opacity / 255)
-                mp.drawImage(ox, oy, child.image_with_effects())  # type: ignore
+                mp.drawImage(ox, oy, src_img)
                 mp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-                mp.drawImage(box, boy, below.image_with_effects())  # type: ignore
+                mp.drawImage(box, boy, below_img)
                 mp.end()
                 p.setOpacity(1.0)
                 p.drawImage(0, 0, mask_img)
+            elif child.is_group:
+                p.setOpacity(child.opacity / 255)
+                p.drawImage(0, 0, child.composite())
             else:
+                ox = getattr(child, 'offset_x', 0)
+                oy = getattr(child, 'offset_y', 0)
                 blend = BLEND_KEY_TO_MODE.get(getattr(child, 'blend_mode', 'normal'))
                 if blend:
                     p.setCompositionMode(blend)
@@ -396,9 +415,11 @@ class LayerStack:
         グループは composite() で合成した画像を持つ疑似オブジェクトとして扱う。
         戻り値は .image を持つオブジェクトのリスト。"""
         class _RefProxy:
-            def __init__(self, img, opacity):
+            def __init__(self, img, opacity, offset_x=0, offset_y=0):
                 self.image = img
                 self.opacity = opacity
+                self.offset_x = offset_x
+                self.offset_y = offset_y
 
         result = []
         def _collect(items: list[Layer | GroupLayer]):
@@ -407,7 +428,8 @@ class LayerStack:
                     continue
                 if layer.reference:
                     if layer.is_group:
-                        result.append(_RefProxy(layer.composite(), layer.opacity))  # type: ignore
+                        # composite() はキャンバス全体サイズでオフセット 0,0 の画像を返す
+                        result.append(_RefProxy(layer.composite(), layer.opacity, 0, 0))  # type: ignore
                     else:
                         result.append(layer)
                 elif layer.is_group:
@@ -474,6 +496,9 @@ class LayerStack:
         p.setOpacity(lower.opacity / 255)
         p.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
         p.setOpacity(upper.opacity / 255)
+        blend = BLEND_KEY_TO_MODE.get(getattr(upper, 'blend_mode', 'normal'))
+        if blend:
+            p.setCompositionMode(blend)
         p.drawImage(u_ox - min_x, u_oy - min_y, upper.image_with_effects())
         p.end()
         lower.image = merged.convertToFormat(QImage.Format.Format_ARGB32)
@@ -602,30 +627,42 @@ class LayerStack:
             child = layers[i]
             if not child.visible:
                 continue
-            if child.is_group:
-                p.setOpacity(child.opacity / 255)
-                self._draw_layers_to(p, child.children, off_x, off_y)
-                continue
-            ox = getattr(child, 'offset_x', 0) - off_x
-            oy = getattr(child, 'offset_y', 0) - off_y
-            if (child.clipping  # type: ignore
-                    and i < len(layers) - 1
-                    and not layers[i + 1].is_group):
+            clipping = child.clipping and i < len(layers) - 1
+            if clipping:
+                # グループが絡むクリッピングは composite()（キャンバス座標・offset 0,0）
+                # で扱う（GroupLayer.composite / LayerStack.composite と同じロジック）。
                 below = layers[i + 1]
-                box = getattr(below, 'offset_x', 0) - off_x
-                boy = getattr(below, 'offset_y', 0) - off_y
+                if child.is_group:
+                    src_img = child.composite()
+                    ox, oy = -off_x, -off_y
+                else:
+                    src_img = child.image_with_effects()  # type: ignore
+                    ox = getattr(child, 'offset_x', 0) - off_x
+                    oy = getattr(child, 'offset_y', 0) - off_y
+                if below.is_group:
+                    below_img = below.composite()
+                    box, boy = -off_x, -off_y
+                else:
+                    below_img = below.image_with_effects()  # type: ignore
+                    box = getattr(below, 'offset_x', 0) - off_x
+                    boy = getattr(below, 'offset_y', 0) - off_y
                 bw, bh = p.device().width(), p.device().height()
                 mask_img = QImage(bw, bh, QImage.Format.Format_ARGB32)
                 mask_img.fill(Qt.GlobalColor.transparent)
                 mp = QPainter(mask_img)
                 mp.setOpacity(child.opacity / 255)
-                mp.drawImage(ox, oy, child.image_with_effects())  # type: ignore
+                mp.drawImage(ox, oy, src_img)
                 mp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-                mp.drawImage(box, boy, below.image_with_effects())  # type: ignore
+                mp.drawImage(box, boy, below_img)
                 mp.end()
                 p.setOpacity(1.0)
                 p.drawImage(0, 0, mask_img)
+            elif child.is_group:
+                p.setOpacity(child.opacity / 255)
+                self._draw_layers_to(p, child.children, off_x, off_y)
             else:
+                ox = getattr(child, 'offset_x', 0) - off_x
+                oy = getattr(child, 'offset_y', 0) - off_y
                 blend = BLEND_KEY_TO_MODE.get(getattr(child, 'blend_mode', 'normal'))
                 if blend:
                     p.setCompositionMode(blend)

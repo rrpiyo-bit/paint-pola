@@ -354,6 +354,65 @@ class TestLayerStack:
         c = px(merged, 50, 50)
         assert c.green() > 200 and c.red() < 50
 
+    # ── フォルダ内のグループが絡むクリッピング ──────────────────────────────
+    # フォルダ内では「クリップ先がサブフォルダ」「クリッピングフラグ付きサブフォルダ」
+    # のどちらも無視され、クリップ側が全面にそのまま描画されるバグの回帰確認。
+    # （トップレベルの LayerStack.composite では従来から正しく動いていた）
+
+    @staticmethod
+    def _solid(x, y, w, h, color):
+        from PyQt6.QtGui import QPainter
+        lyr = Layer("l", W, H)
+        p = QPainter(lyr.image)
+        p.fillRect(x, y, w, h, color)
+        p.end()
+        return lyr
+
+    def test_nested_clip_onto_subfolder_in_composite(self):
+        # フォルダ内: 全面赤(clipping=True) の下にサブフォルダ（青四角）
+        red = self._solid(0, 0, W, H, QColor(255, 0, 0, 255))
+        red.clipping = True
+        sub = GroupLayer("sub", W, H)
+        sub.children = [self._solid(20, 20, 30, 30, QColor(0, 0, 255, 255))]
+        outer = GroupLayer("outer", W, H)
+        outer.children = [red, sub]
+        ls = LayerStack(W, H)
+        ls.layers = [outer]
+        img = ls.composite()
+        assert px(img, 30, 30).red() > 200        # 四角の内側は赤
+        assert px(img, 80, 80).alpha() == 0        # 外側は透明のまま
+
+    def test_nested_clipping_flagged_subfolder_in_composite(self):
+        # フォルダ内: クリッピングフラグ付きサブフォルダ（全面緑）の下に青四角
+        sub = GroupLayer("sub", W, H)
+        sub.children = [self._solid(0, 0, W, H, QColor(0, 255, 0, 255))]
+        sub.clipping = True
+        base = self._solid(20, 20, 30, 30, QColor(0, 0, 255, 255))
+        outer = GroupLayer("outer", W, H)
+        outer.children = [sub, base]
+        ls = LayerStack(W, H)
+        ls.layers = [outer]
+        img = ls.composite()
+        assert px(img, 30, 30).green() > 200
+        assert px(img, 80, 80).alpha() == 0
+
+    def test_nested_clip_onto_subfolder_in_merge(self):
+        # 統合（_draw_layers_to）でも同じクリッピングが反映されること
+        red = self._solid(0, 0, W, H, QColor(255, 0, 0, 255))
+        red.clipping = True
+        sub = GroupLayer("sub", W, H)
+        sub.children = [self._solid(20, 20, 30, 30, QColor(0, 0, 255, 255))]
+        outer = GroupLayer("outer", W, H)
+        outer.children = [red, sub]
+        ls = LayerStack(W, H)
+        ls.layers = [outer]
+        ls.active_path = [0]
+        assert ls.merge_all_visible() is True
+        merged = ls.layers[0]
+        ox, oy = merged.offset_x, merged.offset_y
+        assert px(merged.image, 30 - ox, 30 - oy).red() > 200
+        assert px(merged.image, 80 - ox, 80 - oy).alpha() == 0
+
     # ── composite ─────────────────────────────────────────────────────────────
 
     def test_composite_transparent_background(self):

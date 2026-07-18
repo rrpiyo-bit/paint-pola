@@ -487,6 +487,7 @@ class ColorPanel(QWidget):
     def _on_swatch_click(self, color: QColor):
         self.set_color(color)
         self.color_changed.emit(color)
+        self.color_committed.emit(color)
 
     def _on_palette_right_click(self, color: QColor):
         """右クリックで現在色をそのスウォッチに上書き登録。"""
@@ -501,6 +502,7 @@ class ColorPanel(QWidget):
         if c.isValid():
             self.set_color(c)
             self.color_changed.emit(c)
+            self.color_committed.emit(c)
 
     def _on_palette_change(self, name: str):
         self._load_palette(name)

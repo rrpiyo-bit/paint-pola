@@ -369,6 +369,10 @@ class TestCommitTransformGrowsLayer:
         lyr = Layer("shape", 100, 100)
         lyr.image.fill(Qt.GlobalColor.transparent)
         p = QPainter(lyr.image)
+        # lift_whole_layer は不透明部分の外接矩形を変形基準にするため、この矩形
+        # (40,40,20,20) が拡縮の中心・基準サイズになる。500%に拡大するとその
+        # 中心 (50,50) を軸に 100x100 まで広がり、ちょうどキャンバスと同サイズに
+        # なってしまいはみ出さないため、余裕を持って 900% まで拡大する。
         p.fillRect(40, 40, 20, 20, QColor(255, 0, 0, 255))
         p.end()
         stack.layers = [lyr]
@@ -376,8 +380,8 @@ class TestCommitTransformGrowsLayer:
 
         c = Canvas(stack)
         assert c.lift_whole_layer() is True
-        # 500%に拡大 → 中心固定なのでキャンバスの外まで大きくはみ出す
-        c.apply_transform_percentage(500.0, 500.0, 0.0)
+        # 900%に拡大 → 中心固定なのでキャンバスの外まで大きくはみ出す
+        c.apply_transform_percentage(900.0, 900.0, 0.0)
         c._commit_transform()
 
         # レイヤーの端（かつてのキャンバス境界付近）に赤色が残っている＝クリップされていない
@@ -396,7 +400,10 @@ class TestCommitTransformGrowsLayer:
         lyr = Layer("shape", 100, 100)
         lyr.image.fill(Qt.GlobalColor.transparent)
         p = QPainter(lyr.image)
-        p.fillRect(45, 10, 10, 10, QColor(0, 255, 0, 255))
+        # lift_whole_layer は不透明部分の外接矩形 (0,0,100,100 の全面) を基準に
+        # するよう、キャンバス全域に近い矩形を塗って回転後のバウンディングボックス
+        # が確実にキャンバスをはみ出すようにする。
+        p.fillRect(5, 5, 90, 90, QColor(0, 255, 0, 255))
         p.end()
         stack.layers = [lyr]
         stack.active_path = [0]
