@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QDialog,
                               QComboBox, QColorDialog, QFrame, QMessageBox,
                               QScrollArea)
 from PyQt6.QtGui import (QImage, QPainter, QColor, QTransform, QLinearGradient,
-                          QRadialGradient, QBrush, QPen)
+                          QRadialGradient, QBrush, QPen, QPainterPath)
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF
 
 from layer import Layer, GroupLayer, LayerStack
@@ -1361,6 +1361,37 @@ def _shift_mask(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
     return cv2.warpAffine(mask, m, (w, h))
 
 
+def _split_mask(mask: np.ndarray, k: int) -> list[np.ndarray]:
+    """マスクをランダムな種点からのボロノイ分割で k 個の紙片に分ける。"""
+    ys, xs = np.nonzero(mask)
+    k = min(k, len(xs))
+    if k <= 1:
+        return [mask]
+    idx = np.random.choice(len(xs), size=k, replace=False)
+    sy, sx = ys[idx].astype(np.int64), xs[idx].astype(np.int64)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    gy, gx = np.mgrid[y0:y1, x0:x1]
+    best_d = None
+    best_i = np.zeros((y1 - y0, x1 - x0), dtype=np.int32)
+    for i in range(k):
+        d = (gy - sy[i]) ** 2 + (gx - sx[i]) ** 2
+        if best_d is None:
+            best_d = d
+        else:
+            closer = d < best_d
+            best_i[closer] = i
+            best_d = np.where(closer, d, best_d)
+    sub = mask[y0:y1, x0:x1] > 0
+    pieces = []
+    for i in range(k):
+        pm = np.zeros_like(mask)
+        pm[y0:y1, x0:x1][(best_i == i) & sub] = 255
+        if pm.any():
+            pieces.append(pm)
+    return pieces
+
+
 def _insert_result_layer(layer_stack: LayerStack, source_layer: Layer,
                          result) -> None:
     """アクション結果をソースの位置に挿入し、ソースを隠して選択する。"""
@@ -1608,7 +1639,8 @@ class CollageDialog(QDialog):
         layout.addLayout(form)
 
         desc = QLabel("線画の閉じた領域をランダムに拾って色紙で塗り、\n"
-                      "少しはみ出し・ずらして貼った切り絵風にします。")
+                      "少しはみ出し・ずらして貼った切り絵風にします。\n"
+                      "広い領域は自動で複数の紙片に分けて塗り分けます。")
         desc.setStyleSheet("color: #666; font-size: 11px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -1671,14 +1703,29 @@ def execute_collage(layer_stack: LayerStack, source_layer: Layer,
     if not chosen_masks:  # 最低1領域は必ず塗る
         chosen_masks = [random.choice(candidates)]
 
-    fills = np.zeros((h, w, 4), dtype=np.uint8)
+    # 大きい領域は複数の紙片に分割する。実際の線画は内部がひと続きの
+    # 領域になりがちで、そのままだと1色しか使われないため。
+    piece_size = max(60, min(w, h) // 6)
+    pieces: list[np.ndarray] = []
     for mask in chosen_masks:
+        area = int(np.count_nonzero(mask))
+        k = min(8, max(1, area // (piece_size * piece_size)))
+        if k <= 1:
+            pieces.append(mask)
+        else:
+            pieces.extend(_split_mask(mask, k))
+
+    # 全色をまんべんなく使うため、シャッフルした色を順番に割り当てる
+    palette = list(colors)
+    random.shuffle(palette)
+    fills = np.zeros((h, w, 4), dtype=np.uint8)
+    for i, mask in enumerate(pieces):
         if expand_kernel is not None:
             mask = cv2.dilate(mask, expand_kernel)
         if shift:
             mask = _shift_mask(mask, random.randint(-shift, shift),
                                random.randint(-shift, shift))
-        color = random.choice(colors)
+        color = palette[i % len(palette)]
         fills[mask > 0] = [color.blue(), color.green(), color.red(), color.alpha()]
 
     group, _top = _group_with_original(source_layer, "切り絵コラージュ")
@@ -1897,8 +1944,8 @@ class KaleidoDialog(QDialog):
 
         layout.addLayout(form)
 
-        desc = QLabel("キャンバス中心の周りに回転コピーして\n"
-                      "万華鏡のような模様を作ります。")
+        desc = QLabel("絵柄を扇形に切り取り、中心の周りに回転コピーして\n"
+                      "万華鏡のような模様を作ります。コピー同士は重なりません。")
         desc.setStyleSheet("color: #666; font-size: 11px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -1927,20 +1974,50 @@ def execute_kaleidoscope(layer_stack: LayerStack, source_layer: Layer,
     mirror = params.get("mirror", False)
     ox = getattr(source_layer, 'offset_x', 0)
     oy = getattr(source_layer, 'offset_y', 0)
+    cx, cy = cw / 2.0, ch / 2.0
+    seg_angle = 360.0 / segments
+
+    # 各扇形には「扇形0にある絵柄」だけが複製される仕組みなので、
+    # 絵柄の重心が扇形0の中央に来るようソースを前回転させて中身を確保する
+    alpha = _qimage_to_array(src_img)[:, :, 3]
+    ys, xs = np.nonzero(alpha > 0)
+    base = 0.0
+    if len(xs) > 0:
+        mx, my = float(xs.mean()) + ox, float(ys.mean()) + oy
+        theta_c = math.degrees(math.atan2(my - cy, mx - cx))
+        base = seg_angle / 2.0 - theta_c
 
     buf = QImage(cw, ch, QImage.Format.Format_ARGB32_Premultiplied)
     buf.fill(Qt.GlobalColor.transparent)
     p = QPainter(buf)
     p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    radius = math.hypot(cw, ch)  # キャンバス全域を覆う十分な半径
     for i in range(segments):
+        p.save()
+        # 扇形 i にクリップして描くので、コピー同士は重ならない
+        wedge = QPainterPath()
+        wedge.moveTo(cx, cy)
+        steps = max(2, int(seg_angle // 10) + 1)
+        for s in range(steps + 1):
+            ang = math.radians(seg_angle * (i + s / steps))
+            wedge.lineTo(cx + radius * math.cos(ang),
+                         cy + radius * math.sin(ang))
+        wedge.closeSubpath()
+        p.setClipPath(wedge)
         t = QTransform()
-        t.translate(cw / 2, ch / 2)
-        t.rotate(360.0 * i / segments)
+        t.translate(cx, cy)
         if mirror and i % 2 == 1:
-            t.scale(-1, 1)
-        t.translate(-cw / 2, -ch / 2)
-        p.setTransform(t)
+            # 隣り合う扇形が鏡映で続くように、反転してから隣の境界へ回転
+            t.rotate(seg_angle * (i + 1))
+            t.scale(1, -1)
+        else:
+            t.rotate(seg_angle * i)
+        t.rotate(base)
+        t.translate(-cx, -cy)
+        p.setTransform(t, combine=True)
         p.drawImage(ox, oy, src_img)
+        p.restore()
     p.end()
 
     result = Layer(f"{source_layer.name} - 万華鏡", cw, ch)

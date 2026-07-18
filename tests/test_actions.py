@@ -597,3 +597,102 @@ class TestGacha:
         ls = LayerStack(W, H)
         group = ls.add_group("g")
         assert execute_gacha(ls, group, {"count": 0, "palette": "auto"}) is None
+
+
+class TestKaleidoscopeWedge:
+    """扇形クリップ方式（コピー同士が重ならない）の検証。"""
+
+    def _asym_stack(self):
+        ls = LayerStack(W, H)
+        layer = ls.add("非対称")
+        p = QPainter(layer.image)
+        p.fillRect(60, 20, 25, 12, QColor(0, 0, 0))
+        p.end()
+        return ls, layer
+
+    def test_rotational_symmetry(self):
+        # 各扇形は扇形0の回転コピーなので、90°回転で自己一致するはず
+        import numpy as np
+        ls, layer = self._asym_stack()
+        result = execute_kaleidoscope(ls, layer, {"segments": 4, "mirror": False})
+        assert result is not None
+        m = (_qimage_alpha(result.image) > 40).astype(np.uint8)
+        rot = np.rot90(m, 1)
+        total = int(m.sum())
+        assert total > 0
+        assert int((m != rot).sum()) <= total * 0.2
+
+    def test_mirror_symmetry(self):
+        # segments=2 + mirror: 上下扇形が境界(y=中心)で鏡映
+        import numpy as np
+        ls, layer = self._asym_stack()
+        result = execute_kaleidoscope(ls, layer, {"segments": 2, "mirror": True})
+        assert result is not None
+        m = (_qimage_alpha(result.image) > 40).astype(np.uint8)
+        total = int(m.sum())
+        assert total > 0
+        assert int((m != np.flipud(m)).sum()) <= total * 0.2
+
+    def test_corner_content_not_lost(self):
+        # 絵柄が隅にあっても前回転で扇形0に入り、結果が空にならない
+        ls, layer = self._asym_stack()
+        result = execute_kaleidoscope(ls, layer, {"segments": 6, "mirror": True})
+        assert result is not None
+        assert _alpha_count(result.image) > 100
+
+
+def _qimage_alpha(img: QImage):
+    import numpy as np
+    img32 = img.convertToFormat(QImage.Format.Format_ARGB32)
+    ptr = img32.bits()
+    ptr.setsize(img32.height() * img32.width() * 4)
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(img32.height(), img32.width(), 4)
+    return arr[:, :, 3]
+
+
+class TestCollageSplit:
+    """大きい閉領域の紙片分割（複数色が必ず使われる）の検証。"""
+
+    def _big_circle_stack(self, size=300):
+        from PyQt6.QtGui import QPen
+        ls = LayerStack(size, size)
+        layer = ls.add("大円")
+        p = QPainter(layer.image)
+        pen = QPen(QColor(0, 0, 0, 255)); pen.setWidth(4)
+        p.setPen(pen)
+        p.drawEllipse(20, 20, size - 40, size - 40)
+        p.end()
+        return ls, layer
+
+    def test_large_region_uses_multiple_colors(self):
+        import numpy as np
+        colors = [QColor(255, 0, 0), QColor(0, 255, 0),
+                  QColor(0, 0, 255), QColor(255, 255, 0)]
+        ls, layer = self._big_circle_stack()
+        result = execute_collage(ls, layer, {
+            "colors": colors, "coverage": 100, "expand": 0, "shift": 0})
+        assert result is not None
+        arr = _qimage_to_array_test(result.children[1].image)
+        op = arr[arr[:, :, 3] > 0]
+        assert len(np.unique(op[:, :3], axis=0)) >= 2
+
+    def test_small_region_single_piece(self):
+        import numpy as np
+        colors = [QColor(255, 0, 0), QColor(0, 255, 0)]
+        ls, layer = _make_stack_with_closed_shape()  # 100x100の小円
+        result = execute_collage(ls, layer, {
+            "colors": colors, "coverage": 100, "expand": 0, "shift": 0})
+        assert result is not None
+        arr = _qimage_to_array_test(result.children[1].image)
+        op = arr[arr[:, :, 3] > 0]
+        # 小領域は分割されず1色
+        assert len(np.unique(op[:, :3], axis=0)) == 1
+
+
+def _qimage_to_array_test(img: QImage):
+    import numpy as np
+    img32 = img.convertToFormat(QImage.Format.Format_ARGB32)
+    ptr = img32.bits()
+    ptr.setsize(img32.height() * img32.width() * 4)
+    return np.frombuffer(ptr, dtype=np.uint8).reshape(
+        img32.height(), img32.width(), 4).copy()
