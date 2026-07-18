@@ -303,6 +303,7 @@ class Canvas(QWidget):
     zoom_changed = pyqtSignal(float)
     layer_opacity_changed = pyqtSignal(int)  # 数字キーで不透明度が変わったとき
     tool_shortcut_pressed = pyqtSignal(object)  # Tool — キーボードショートカットでツール切替
+    edited = pyqtSignal()  # 絵・レイヤー構造が実際に変更されたとき（未保存マーク用）
 
     # テキスト入力ダイアログをキャンバス内で閉じるため、main から注入する
     ask_text_fn: object = None  # type: ignore  # Callable[[Canvas], None] | None
@@ -549,6 +550,7 @@ class Canvas(QWidget):
         self._redo_stack.clear()
         if len(self._history) > HISTORY_LIMIT:
             self._history.pop(0)
+        self.edited.emit()
 
     def _snapshot_layer(self, lyr) -> dict:
         if lyr.is_group:
@@ -609,6 +611,7 @@ class Canvas(QWidget):
         self._redo_stack.clear()
         if len(self._history) > HISTORY_LIMIT:
             self._history.pop(0)
+        self.edited.emit()
 
     def _apply_structure_snapshot(self, snap: dict):
         ls = self.layer_stack
@@ -681,6 +684,7 @@ class Canvas(QWidget):
             if self._on_structure_restored:
                 self._on_structure_restored()
         self.update()
+        self.edited.emit()
 
     def redo(self):
         if not self._redo_stack:
@@ -711,6 +715,7 @@ class Canvas(QWidget):
             if self._on_structure_restored:
                 self._on_structure_restored()
         self.update()
+        self.edited.emit()
 
     # Callback for main.py to refresh UI after structure undo/redo
     _on_structure_restored: object = None  # type: ignore
@@ -1378,6 +1383,7 @@ class Canvas(QWidget):
                     self._redo_stack.clear()
                     if len(self._history) > HISTORY_LIMIT:
                         self._history = self._history[-HISTORY_LIMIT:]
+                    self.edited.emit()
                     self._move_group_bases = [
                         (c, c.image.copy(), getattr(c, 'offset_x', 0), getattr(c, 'offset_y', 0))
                         for c in children]  # type: ignore
@@ -2739,6 +2745,7 @@ class Canvas(QWidget):
                         self._redo_stack.clear()
                         if len(self._history) > HISTORY_LIMIT:
                             self._history = self._history[-HISTORY_LIMIT:]
+                        self.edited.emit()
                         for child in children:
                             child.offset_x += ddx * step  # type: ignore
                             child.offset_y += ddy * step  # type: ignore

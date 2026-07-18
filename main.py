@@ -773,6 +773,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._settings = QSettings("PaintPola", "PaintPola")
         self._current_path: str | None = None  # 現在開いている .pola ファイルのパス
+        self._dirty = False  # 未保存の変更があるか（タイトルの * 印・終了時確認に使う）
         self.setWindowTitle("PaintPola")
         icon_path = os.path.join(os.path.dirname(__file__), "images", "pola_block.png")
         if os.path.exists(icon_path):
@@ -898,6 +899,7 @@ class MainWindow(QMainWindow):
         self.canvas.brush_size_changed.connect(self.tool_options.sync_pen_size)
 
     def _connect_navigator(self):
+        self.canvas.edited.connect(self._mark_dirty)
         self.canvas.repainted.connect(self.navigator.refresh)
         self.layer_panel.layers_changed.connect(self.navigator.refresh)
         self.navigator.refresh()
@@ -1108,12 +1110,8 @@ class MainWindow(QMainWindow):
         menu.addAction(action)
 
     def _new(self):
-        # 保存済みパスがあるか、未保存でも履歴がある（編集済み）場合のみ確認
-        has_changes = self._current_path is not None or bool(self.canvas._history)
-        if has_changes:
-            reply = QMessageBox.question(self, "新規", "現在の内容を破棄して新規作成しますか？")
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+        if not self._confirm_discard("新規作成"):
+            return
         dialog = NewCanvasDialog(self.layer_stack.width, self.layer_stack.height, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1123,11 +1121,14 @@ class MainWindow(QMainWindow):
         self.canvas._history.clear()
         self.canvas._redo_stack.clear()
         self._current_path = None
+        self._dirty = False
         self._update_title()
         self.layer_panel.refresh()
         self.canvas._update_size()
 
     def _open(self):
+        if not self._confirm_discard("ファイルを開く"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "開く", "",
             "すべて対応ファイル (*.pola *.png *.jpg *.jpeg *.bmp *.webp);;"
@@ -1160,6 +1161,7 @@ class MainWindow(QMainWindow):
         self.canvas._history.clear()
         self.canvas._redo_stack.clear()
         self._current_path = None
+        self._dirty = False
         self._update_title()
         self.layer_panel.refresh()
         self.canvas._update_size()
@@ -1285,6 +1287,7 @@ class MainWindow(QMainWindow):
             return
 
         self._current_path = path
+        self._dirty = False
         self._update_title()
 
     @staticmethod
@@ -1449,6 +1452,7 @@ class MainWindow(QMainWindow):
         self.canvas._rotation = meta.get("view_rotation", 0)
         self.canvas._flip_h = meta.get("view_flip_h", False)
         self._current_path = path
+        self._dirty = False
         self._update_title()
         self.layer_panel.refresh()
         self.canvas._update_size()
@@ -1507,12 +1511,47 @@ class MainWindow(QMainWindow):
         self._status_canvas_size.setText(
             f"{self.layer_stack.width} x {self.layer_stack.height} px")
 
+    def _mark_dirty(self):
+        if not self._dirty:
+            self._dirty = True
+            self._update_title()
+
     def _update_title(self):
+        mark = "*" if self._dirty else ""
         if self._current_path:
             name = os.path.basename(self._current_path)
-            self.setWindowTitle(f"PaintPola — {name}")
+            self.setWindowTitle(f"{mark}PaintPola — {name}")
         else:
-            self.setWindowTitle("PaintPola")
+            self.setWindowTitle(f"{mark}PaintPola")
+
+    def _confirm_discard(self, what: str) -> bool:
+        """未保存の変更があれば保存するか確認する。False なら操作を中止する。"""
+        if not self._dirty:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle(what)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("保存されていない変更があります。")
+        box.setInformativeText("変更を保存しますか？（保存しない場合、現在の内容は失われます）")
+        box.setStandardButtons(QMessageBox.StandardButton.Save
+                               | QMessageBox.StandardButton.Discard
+                               | QMessageBox.StandardButton.Cancel)
+        box.button(QMessageBox.StandardButton.Save).setText("保存する")
+        box.button(QMessageBox.StandardButton.Discard).setText("保存しない")
+        box.button(QMessageBox.StandardButton.Cancel).setText("キャンセル")
+        box.setDefaultButton(QMessageBox.StandardButton.Save)
+        reply = box.exec()
+        if reply == QMessageBox.StandardButton.Save:
+            self._save()
+            # 名前を付けて保存がキャンセルされた場合は dirty のまま → 操作も中止
+            return not self._dirty
+        return reply == QMessageBox.StandardButton.Discard
+
+    def closeEvent(self, event):
+        if self._confirm_discard("終了"):
+            event.accept()
+        else:
+            event.ignore()
 
     def _resize_canvas(self):
         composite = self.layer_stack.composite()
