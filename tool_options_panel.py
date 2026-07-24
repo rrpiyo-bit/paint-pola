@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QSpinBox, QSlider, QComboBox, QFrame,
-                              QSizePolicy, QScrollArea)
+                              QSizePolicy, QScrollArea, QAbstractSpinBox)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from tools import Tool
@@ -15,20 +15,25 @@ class _SliderSpin(QWidget):
 
     def __init__(self, value: int, lo: int, hi: int, suffix: str = "", parent=None):
         super().__init__(parent)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        col = QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(4)
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(lo, hi)
         self._slider.setValue(value)
         self._spin = QSpinBox()
+        self._spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
         self._spin.setRange(lo, hi)
         self._spin.setValue(value)
         if suffix:
             self._spin.setSuffix(suffix)
-        self._spin.setFixedWidth(64)
-        row.addWidget(self._slider, 1)
-        row.addWidget(self._spin)
+        self._spin.setMinimumWidth(90)
+        col.addWidget(self._slider)
+        spin_row = QHBoxLayout()
+        spin_row.setContentsMargins(0, 0, 0, 0)
+        spin_row.addStretch()
+        spin_row.addWidget(self._spin)
+        col.addLayout(spin_row)
         self._callbacks = []
         self._slider.valueChanged.connect(self._on_slider)
         self._spin.valueChanged.connect(self._on_spin)
@@ -117,7 +122,12 @@ class ToolOptionsPanel(QWidget):
         self._content.setStyleSheet("""
             QWidget { background: #f5f5f5; }
             QLabel { font-size: 12px; color: #222; }
-            QSpinBox, QComboBox { min-height: 24px; font-size: 12px; }
+            QSpinBox, QComboBox {
+                min-height: 24px; font-size: 12px;
+                background-color: #ffffff; color: #222;
+                border: 1px solid #bbb; border-radius: 3px;
+                padding-right: 2px;
+            }
             QCheckBox { font-size: 12px; color: #222; }
             QSlider::groove:horizontal {
                 height: 4px; background: #c8c8c8; border-radius: 2px; }
