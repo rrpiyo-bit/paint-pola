@@ -297,8 +297,7 @@ QCheckBox::indicator {
     background: #fff;
 }
 QCheckBox::indicator:checked {
-    image: none;
-    background: #fff;
+    background: #000080;
     border: 2px inset #808080;
 }
 QGroupBox {
@@ -838,5 +837,24 @@ def get_theme_label(key: str) -> str:
     return THEMES[key]["label"]
 
 
+# 各テーマの padding / border-radius だけを指定すると、スピンボックスの
+# ▲▼ ボタンの当たり判定が角丸の内側に潰れてクリックが効かなくなる。
+# 幅だけを確保し、矢印の描画は Qt 標準に任せる（border や height を
+# 指定すると矢印そのものが消えるため触らない）。
+_SPINBOX_BUTTON_QSS = """
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 18px;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-position: top right;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-position: bottom right;
+}
+"""
+
+
 def get_theme_qss(key: str) -> str:
-    return THEMES[key]["qss"]
+    return THEMES[key]["qss"] + _SPINBOX_BUTTON_QSS

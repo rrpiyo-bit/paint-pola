@@ -1,5 +1,14 @@
 """pytest 共通設定。QApplication をセッション単位で1つだけ生成する。"""
+import os
 import sys
+
+# テスト中はウィンドウを実画面に出さない（w.show() のたびに画面が
+# チラつき、フォーカスも奪われるため）。QApplication 生成前、かつ
+# PyQt のウィジェット系 import より前に設定する必要がある。
+# 実画面で目視確認したいときは PAINTPOLA_TEST_GUI=1 を付けて実行する。
+if not os.environ.get("PAINTPOLA_TEST_GUI"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import pytest
 from PyQt6.QtWidgets import QApplication, QMessageBox
 

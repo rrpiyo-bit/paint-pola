@@ -218,6 +218,16 @@ class StabilizedBrush(BrushBase):
     def reset(self):
         self._buf.clear()
 
+    def translate(self, delta) -> None:
+        """バッファはレイヤーローカル座標なので、レイヤー画像が拡張されて
+        原点がずれたときに蓄積済みの点をまとめて補正する。"""
+        if not self._buf:
+            return
+        dx, dy = float(delta.x()), float(delta.y())
+        if dx == 0.0 and dy == 0.0:
+            return
+        self._buf = [QPointF(p.x() + dx, p.y() + dy) for p in self._buf]
+
     def push(self, pt: QPoint) -> QPointF:
         """バッファに追加し、スムーズ済みの座標を返す。"""
         self._buf.append(QPointF(pt))

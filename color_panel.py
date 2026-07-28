@@ -27,8 +27,9 @@ class CollapsibleSection(QWidget):
         self._toggle_btn.setFlat(True)
         self._toggle_btn.setStyleSheet(
             "QPushButton { text-align: left; padding: 2px 4px; "
-            "font-weight: bold; background: #e8e8e8; border: none; }"
-            "QPushButton:hover { background: #d0d0d0; }")
+            # 背景色を固定しているので文字色も必ず指定する（暗いテーマ対策）
+            "font-weight: bold; background: #e8e8e8; color: #202020; border: none; }"
+            "QPushButton:hover { background: #d0d0d0; color: #202020; }")
         self._toggle_btn.setFixedHeight(22)
         self._toggle_btn.clicked.connect(self._toggle)
         outer.addWidget(self._toggle_btn)
@@ -395,8 +396,11 @@ class ColorPanel(QWidget):
         self._header.setFlat(True)
         self._header.setStyleSheet(
             "QPushButton { text-align: left; padding: 3px 6px; "
-            "font-weight: bold; background: #d0d8e8; border: none; border-bottom: 1px solid #aaa; }"
-            "QPushButton:hover { background: #b8c8e0; }")
+            # 背景色を固定しているので文字色も必ず指定する。省略すると
+            # 暗いテーマの明るい文字色が明るい背景に乗って読めなくなる。
+            "font-weight: bold; background: #d0d8e8; color: #202020; "
+            "border: none; border-bottom: 1px solid #aaa; }"
+            "QPushButton:hover { background: #b8c8e0; color: #202020; }")
         self._header.setFixedHeight(24)
         self._header.clicked.connect(self._toggle)
         outer.addWidget(self._header)

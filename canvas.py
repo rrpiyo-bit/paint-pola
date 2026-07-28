@@ -5,7 +5,7 @@ import cv2
 
 from PyQt6.QtWidgets import QWidget, QApplication, QInputDialog, QFontDialog, QColorDialog
 from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QFont, QPixmap,
-                          QTransform, QBrush, QPainterPath)
+                          QTransform, QBrush, QPainterPath, QFontMetrics)
 from PyQt6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal, QTimer
 
 from layer import LayerStack, Layer, BLEND_KEY_TO_MODE
@@ -32,6 +32,12 @@ _TOOL_KEY_MAP: dict[Qt.Key, Tool] = {
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
 HISTORY_LIMIT = 50
+# 履歴1件はレイヤー画像の丸ごとコピー（2500x2500 なら 25MB）なので、
+# 件数だけで制限すると 50 件で 1.2GB を超えてメモリ不足で落ちる。
+# 総バイト数でも打ち切り、大きなキャンバスでは件数が減るようにする。
+HISTORY_MEMORY_LIMIT = 512 * 1024 * 1024  # 512MB
+# ただし直近の操作を取り消せないと困るので、この件数までは必ず残す。
+HISTORY_MIN_ENTRIES = 5
 MIN_ZOOM = 0.05
 MIN_TRANSFORM_SIZE = 1
 HANDLE_HIT_RADIUS = 12
@@ -539,6 +545,31 @@ class Canvas(QWidget):
         self._stroke_layer = None
         self._stroke_bg_cache = None
 
+    @staticmethod
+    def _entry_bytes(entry) -> int:
+        """履歴エントリ1件が保持している画像バイト数のおおよその合計。"""
+        if entry[0] == "pixel":
+            img = entry[2]
+            return img.sizeInBytes() if hasattr(img, "sizeInBytes") else 0
+
+        def _snap_bytes(snap) -> int:
+            if snap.get("type") == "group":
+                return sum(_snap_bytes(c) for c in snap.get("children", []))
+            img = snap.get("image")
+            return img.sizeInBytes() if hasattr(img, "sizeInBytes") else 0
+
+        return sum(_snap_bytes(s) for s in entry[1].get("layers", []))
+
+    def _trim_history(self):
+        """履歴を件数と総メモリ量の両方で打ち切る。
+        件数だけで見ていると大きなキャンバスでは 50 件で 1GB を超え、
+        メモリ不足でアプリごと落ちるため、バイト数でも制限する。"""
+        while len(self._history) > HISTORY_LIMIT:
+            self._history.pop(0)
+        total = sum(self._entry_bytes(e) for e in self._history)
+        while len(self._history) > HISTORY_MIN_ENTRIES and total > HISTORY_MEMORY_LIMIT:
+            total -= self._entry_bytes(self._history.pop(0))
+
     def _save_history(self):
         lid = self._layer_id()
         layer = self.layer_stack.active
@@ -548,8 +579,7 @@ class Canvas(QWidget):
         oy = getattr(layer, 'offset_y', 0)
         self._history.append(("pixel", lid, layer.image.copy(), ox, oy))  # type: ignore
         self._redo_stack.clear()
-        if len(self._history) > HISTORY_LIMIT:
-            self._history.pop(0)
+        self._trim_history()
         self.edited.emit()
 
     def _snapshot_layer(self, lyr) -> dict:
@@ -609,8 +639,7 @@ class Canvas(QWidget):
         }
         self._history.append(("structure", snap))
         self._redo_stack.clear()
-        if len(self._history) > HISTORY_LIMIT:
-            self._history.pop(0)
+        self._trim_history()
         self.edited.emit()
 
     def _apply_structure_snapshot(self, snap: dict):
@@ -1381,8 +1410,7 @@ class Canvas(QWidget):
                         oy = getattr(child, 'offset_y', 0)
                         self._history.append(("pixel", id(child), child.image.copy(), ox, oy))  # type: ignore
                     self._redo_stack.clear()
-                    if len(self._history) > HISTORY_LIMIT:
-                        self._history = self._history[-HISTORY_LIMIT:]
+                    self._trim_history()
                     self.edited.emit()
                     self._move_group_bases = [
                         (c, c.image.copy(), getattr(c, 'offset_x', 0), getattr(c, 'offset_y', 0))
@@ -1404,6 +1432,12 @@ class Canvas(QWidget):
             return
 
         self._drawing = True
+
+        # 描く前にレイヤー画像を必要なだけ広げる（移動後などで筆跡が
+        # バッファ外になり消えるのを防ぐ）。塗りつぶしは既存ピクセルの
+        # 連結領域しか塗らないので拡張しない。
+        if self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
+            self._grow_for_draw(layer, cp, self._draw_margin())
 
         lox = getattr(layer, 'offset_x', 0)
         loy = getattr(layer, 'offset_y', 0)
@@ -1641,6 +1675,15 @@ class Canvas(QWidget):
         if layer.is_group:
             return
 
+        if self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
+            shift = self._grow_for_draw(layer, cp, self._draw_margin())
+            if not shift.isNull():
+                # レイヤーが広がった分だけローカル座標系の原点がずれるので、
+                # 前回位置を新しい原点に合わせ直す（ストロークの断裂防止）。
+                if self._last_pos is not None:
+                    self._last_pos = self._last_pos + shift
+                self._stabilizer.translate(shift)
+
         lox = getattr(layer, 'offset_x', 0)
         loy = getattr(layer, 'offset_y', 0)
         lp = QPoint(cp.x() - lox, cp.y() - loy)
@@ -1714,6 +1757,12 @@ class Canvas(QWidget):
                 if lid is not None and self._history and self._history[-1][0] == "pixel" and self._history[-1][1] == lid:
                     layer.image = self._history.pop()[2]  # type: ignore
             else:
+                # 図形の外接矩形（線幅ぶんの余白込み）がレイヤー画像に収まるよう
+                # 広げてから描く。はみ出す図形が切れるのを防ぐ。
+                pad = max(1, int(self.pen_size))
+                shape_rect = QRect(self._preview_start, cp).normalized()
+                shape_rect = shape_rect.adjusted(-pad, -pad, pad, pad)
+                self._ensure_layer_bounds(layer, shape_rect)
                 lox = getattr(layer, 'offset_x', 0)
                 loy = getattr(layer, 'offset_y', 0)
                 sa = QPoint(self._preview_start.x() - lox, self._preview_start.y() - loy)
@@ -1941,6 +1990,13 @@ class Canvas(QWidget):
         if not layer or layer.is_group or not self._text_pos:
             return
         self._save_history()
+        # 文字がレイヤー画像からはみ出して切れないよう、描画範囲を先に確保する。
+        # drawText の基準点はベースラインなので、上方向にも余白が要る。
+        fm = QFontMetrics(font)
+        br = fm.boundingRect(text)
+        text_rect = QRect(self._text_pos.x() + br.x(), self._text_pos.y() + br.y(),
+                          max(1, br.width()), max(1, br.height()))
+        self._ensure_layer_bounds(layer, text_rect.adjusted(-2, -2, 2, 2))
         painter = QPainter(layer.image)  # type: ignore
         painter.setFont(font)
         painter.setPen(QPen(color))
@@ -1983,6 +2039,10 @@ class Canvas(QWidget):
         if not layer or layer.is_group or not self._clipboard_image:
             return
         self._save_history()
+        # 貼り付け先がレイヤー画像の外に出る場合に切り捨てられないよう拡張する。
+        paste_rect = QRect(self._clipboard_offset,
+                           self._clipboard_image.size())
+        self._ensure_layer_bounds(layer, paste_rect)
         img: QImage = layer.image  # type: ignore
         ox = getattr(layer, 'offset_x', 0)
         oy = getattr(layer, 'offset_y', 0)
@@ -2436,6 +2496,30 @@ class Canvas(QWidget):
         layer.offset_x = needed.x()  # type: ignore
         layer.offset_y = needed.y()  # type: ignore
 
+    def _grow_for_draw(self, layer, cp: QPoint, margin: int) -> QPoint:
+        """cp（キャンバス座標）を中心に margin ぶんの余白が layer.image に
+        収まるよう拡張する。移動ツールでレイヤーをずらすと offset だけが
+        変わり image は広がらないため、そのまま描くとバッファ外の筆跡が
+        黙って捨てられてしまう。戻り値は offset の変化量で、レイヤー
+        ローカル座標でキャッシュしている座標（_last_pos など）の補正に使う。"""
+        if layer is None or getattr(layer, 'is_group', False):
+            return QPoint(0, 0)
+        before_x = getattr(layer, 'offset_x', 0)
+        before_y = getattr(layer, 'offset_y', 0)
+        m = max(1, int(margin))
+        rect = QRect(cp.x() - m, cp.y() - m, m * 2 + 1, m * 2 + 1)
+        self._ensure_layer_bounds(layer, rect)
+        return QPoint(before_x - getattr(layer, 'offset_x', 0),
+                      before_y - getattr(layer, 'offset_y', 0))
+
+    def _draw_margin(self) -> int:
+        """描画ツールが1回のスタンプで広がりうる半径。"""
+        if self.tool == Tool.ERASER:
+            return int(self.eraser_size)
+        if self.tool == Tool.BLUR:
+            return int(self.blur_size)
+        return int(self.pen_size)
+
     def _commit_transform(self):
         layer = self._transform_layer or self.layer_stack.active
         if not layer or layer.is_group or not self._transform_image or not self._transform_rect:
@@ -2743,8 +2827,7 @@ class Canvas(QWidget):
                             oy = getattr(child, 'offset_y', 0)
                             self._history.append(("pixel", id(child), child.image.copy(), ox, oy))  # type: ignore
                         self._redo_stack.clear()
-                        if len(self._history) > HISTORY_LIMIT:
-                            self._history = self._history[-HISTORY_LIMIT:]
+                        self._trim_history()
                         self.edited.emit()
                         for child in children:
                             child.offset_x += ddx * step  # type: ignore

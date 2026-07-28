@@ -2,6 +2,12 @@
 import sys, os, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# QApplication をこのモジュール直下で作るため、conftest.py と同じ
+# offscreen 指定をここでも行う（このファイルを直接指定して pytest を
+# 実行したときに、実画面へウィンドウが出てしまうのを防ぐ）。
+if not os.environ.get("PAINTPOLA_TEST_GUI"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import pytest
 import numpy as np
 from PyQt6.QtWidgets import QApplication

@@ -861,6 +861,10 @@ class MainWindow(QMainWindow):
         self.toolbar.undo_requested.connect(self.canvas.undo)
         self.toolbar.redo_requested.connect(self.canvas.redo)
         self.layer_panel.layers_changed.connect(self.canvas.update)
+        # 不透明度・表示・ブレンド・レイヤー効果などの変更も未保存扱いにする
+        # （canvas.edited はピクセル描画時にしか出ないため、これがないと
+        #   設定だけ変えて閉じたときに確認なしで失われる）
+        self.layer_panel.layers_changed.connect(self._mark_dirty)
         self.layer_panel.layer_structure_changed.connect(self.canvas.purge_orphan_history)
         self.layer_panel.structure_will_change.connect(self.canvas.save_structure_history)
         self.layer_panel.merge_down_requested.connect(self._merge_down)

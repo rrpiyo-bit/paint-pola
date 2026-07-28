@@ -533,6 +533,11 @@ class LayerPanel(QWidget):
             self._opacity.setValue(cur.opacity)
             self._opacity.blockSignals(False)
 
+        # レイヤー設定タブもアクティブレイヤーに追従させる。追加・削除・複製・
+        # undo などは _on_select を通らないため、ここで同期しないと前のレイヤーの
+        # 値が残り、スピンを触った瞬間に別レイヤーへ書き込まれてしまう。
+        self._sync_settings_tab()
+
     def _connect_row(self, row: LayerRow):
         row.visibility_changed.connect(self._on_visibility)
         row.clipping_changed.connect(self._on_clipping)
@@ -963,6 +968,8 @@ class LayerPanel(QWidget):
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
         if 0 < idx < len(container):
+            # 実際に入れ替わるときだけ履歴を積む（undo できるようにする）
+            self.structure_will_change.emit()
             container[idx], container[idx - 1] = container[idx - 1], container[idx]
             ls.set_active_path(path[:-1] + [idx - 1])
         self.refresh()
@@ -973,6 +980,7 @@ class LayerPanel(QWidget):
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
         if 0 <= idx < len(container) - 1:
+            self.structure_will_change.emit()
             container[idx], container[idx + 1] = container[idx + 1], container[idx]
             ls.set_active_path(path[:-1] + [idx + 1])
         self.refresh()
@@ -988,6 +996,7 @@ class LayerPanel(QWidget):
         above = container[idx - 1]
         if not above.is_group:
             return
+        self.structure_will_change.emit()
         layer = container.pop(idx)
         above.children.append(layer)
         new_child_idx = len(above.children) - 1
@@ -1004,6 +1013,7 @@ class LayerPanel(QWidget):
         container, idx = self._get_container_and_index(path)
         if idx >= len(container):
             return
+        self.structure_will_change.emit()
         layer = container.pop(idx)
         parent_path = path[:-1]
         parent_container, parent_idx = self._get_container_and_index(parent_path)

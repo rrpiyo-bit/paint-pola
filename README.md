@@ -218,7 +218,10 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-**253テスト** / 7ファイル / 全テストPASS
+**270テスト** / 7ファイル / 全テストPASS
+
+テスト中のウィンドウは既定でオフスクリーン描画され、実画面には表示されない。
+目視確認したいときだけ `PAINTPOLA_TEST_GUI=1` を付けて実行する。
 
 > **方針:** 修正・追加のたびに毎回このスイート全体を実行/更新する必要はない。
 > 修正・追加した部分にのみテストを行う（該当テストの追加/更新のみで十分）。
@@ -229,7 +232,7 @@ python -m pytest tests/ -v
 | test_unit_layer.py | 36 | Layer / GroupLayer / LayerStack のデータ操作 |
 | test_unit_canvas_logic.py | 14 | フラッドフィル（バケツ塗り）・囲み内塗りつぶしアルゴリズム |
 | test_rasterize.py | 7 | レイヤーラスタライズ・統合時のエフェクト焼き込み |
-| test_component_canvas.py | 44 | Canvas ウィジェットの操作・状態管理 |
+| test_component_canvas.py | 61 | Canvas ウィジェットの操作・状態管理・履歴メモリ上限 |
 | test_animation.py | 24 | AnimationPanel のフレーム管理・再生・GIF出力 |
 | test_e2e.py | 54 | MainWindow を通じた実際のユーザー操作フロー |
 | test_actions.py | 57 | 16のアクション+アクションガチャ全機能の検証 |
@@ -254,10 +257,12 @@ python -m pytest tests/ -v
 - Layer.rasterize(): 効果フラグを全て無効化、見た目を変えず焼き込み、縁取り色がピクセルに焼き込まれる、効果なし時はno-op
 - LayerStack.merge_down() のエフェクト焼き込み: 下レイヤーの縁取りを焼き込み、上レイヤーの効果も焼き込み、効果なしの通常統合は従来通り
 
-### test_component_canvas.py (44件)
+### test_component_canvas.py (61件)
 
 - 初期化、Undo/Redo（ピクセル・構造）、選択モード、状態リセット
 - ペン描画、消しゴム、矩形選択、グループ描画ブロック、Altスポイト、投げなわ
+- 履歴メモリ上限 (4件): 大キャンバスで総バイト数により打ち切り、最低件数は保持、小キャンバスは50件維持、打ち切り後もUndo/Redo可
+- 囲って塗る図形バリエーション (13件): 極小/大/自己交差/退化/重複点/キャンバス外/負座標/1px 等9形状でクラッシュしない、閉領域が塗られる、offset付き・負offsetレイヤー、グループ選択時の安全な拒否
 
 ### test_animation.py (24件)
 
@@ -332,25 +337,25 @@ MainWindow (main.py)
 ```
 paint_pola/
 ├── main.py               # メインウィンドウ・メニュー・ダイアログ・未保存保護 (1,880行)
-├── canvas.py             # キャンバス・描画・変形・Undo/Redo (2,840行)
+├── canvas.py             # キャンバス・描画・変形・Undo/Redo (2,920行)
 ├── layer.py              # Layer / GroupLayer / LayerStack (740行)
 ├── layer_panel.py        # レイヤーパネルUI・D&D (1,150行)
-├── actions.py            # アクション機能・アクションガチャ (2,550行)
-├── brush.py              # ブラシエンジン (260行)
+├── actions.py            # アクション機能・アクションガチャ (2,660行)
+├── brush.py              # ブラシエンジン (270行)
 ├── color_panel.py        # カラーピッカー・パレット (570行)
 ├── toolbar.py            # ツールバー・カスタムカーソル・カラーヒストリー (370行)
 ├── tool_options_panel.py # ツール別設定パネル (380行)
 ├── tools.py              # Tool enum (18行)
-├── themes.py             # テーマ定義 (840行)
+├── themes.py             # テーマ定義 (860行)
 ├── navigator.py          # ナビゲーター (290行)
 ├── animation_panel.py    # アニメーションタイムライン (450行)
 ├── generate_samples.py   # サンプル画像生成 (370行)
 ├── start.bat             # 起動スクリプト
 ├── images/               # アイコン・サンプル出力先
-└── tests/                # テスト (253件, 4,840行)
+└── tests/                # テスト (270件, 4,990行)
 ```
 
-合計: 約 12,700 行（プロダクション） + 4,840 行（テスト）
+合計: 約 12,900 行（プロダクション） + 4,990 行（テスト）
 
 ### 内部構造
 
@@ -364,7 +369,18 @@ paint_pola/
 - メッシュ変形: N×N 分割した格子の各セルに `cv2.warpPerspective` を適用して合成
 
 **履歴システム** — タグ付きタプルで2種類を管理:
-- `("pixel", layer_id, QImage)` — 描画前の画像コピー
+- `("pixel", layer_id, QImage, offset_x, offset_y)` — 描画前の画像コピーと、そのときのレイヤー位置
 - `("structure", snapshot)` — 全レイヤーの再帰的スナップショット
+
+履歴1件はレイヤー画像を丸ごとコピーするため、2500x2500 では1件あたり約25MBになる。
+件数だけで制限すると 50 件で 1.2GB を超えてメモリ不足で落ちるため、件数と総メモリ量の両方で打ち切る:
+
+| 定数 | 値 | 意味 |
+|------|----|------|
+| `HISTORY_LIMIT` | 50 | 最大件数 |
+| `HISTORY_MEMORY_LIMIT` | 512MB | 履歴全体の合計画像バイト数の上限 |
+| `HISTORY_MIN_ENTRIES` | 5 | メモリ超過時でも必ず残す件数 |
+
+小さいキャンバス（800x600 等）ではメモリ上限に当たらないため、従来どおり50件フルに保持される。
 
 **.pola 形式** — ZIP内に `meta.json`（レイヤー構成・エフェクト設定）+ 各レイヤーPNG。読み込み時にサイズ・パラメータ・パスのバリデーションを実施。

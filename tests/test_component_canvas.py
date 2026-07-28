@@ -457,3 +457,124 @@ class TestLasso:
         canvas._lasso_points = [QPoint(1, 1), QPoint(2, 2)]
         canvas.deselect()
         assert len(canvas._lasso_points) == 0
+
+
+class TestHistoryMemoryLimit:
+    """履歴はレイヤー画像の丸ごとコピーを持つため、件数だけで制限すると
+    大きなキャンバスで GB 級になりメモリ不足で落ちる。総バイト数でも
+    打ち切られることを確認する。"""
+
+    def _big_canvas(self):
+        import canvas as canvas_mod
+        ls = LayerStack(2500, 2500)
+        ls.add("レイヤー1")
+        c = canvas_mod.Canvas(ls)
+        c.resize(W, H)
+        return c
+
+    def test_history_capped_by_memory(self):
+        import canvas as canvas_mod
+        c = self._big_canvas()
+        for _ in range(canvas_mod.HISTORY_LIMIT + 20):
+            c._save_history()
+        total = sum(c._entry_bytes(e) for e in c._history)
+        assert total <= canvas_mod.HISTORY_MEMORY_LIMIT, \
+            f"履歴が {total/1e6:.0f}MB まで膨らんでいる"
+        assert len(c._history) < canvas_mod.HISTORY_LIMIT, \
+            "大きなキャンバスでは件数が上限より減るはず"
+
+    def test_history_keeps_minimum_entries(self):
+        import canvas as canvas_mod
+        c = self._big_canvas()
+        for _ in range(canvas_mod.HISTORY_LIMIT + 20):
+            c._save_history()
+        assert len(c._history) >= canvas_mod.HISTORY_MIN_ENTRIES, \
+            "直近の操作を取り消せる件数は必ず残す"
+
+    def test_small_canvas_keeps_full_depth(self, canvas):
+        """小さいキャンバスでは従来どおり件数上限まで残る。"""
+        import canvas as canvas_mod
+        for _ in range(canvas_mod.HISTORY_LIMIT + 10):
+            canvas._save_history()
+        assert len(canvas._history) == canvas_mod.HISTORY_LIMIT
+
+    def test_undo_redo_still_works_after_trim(self):
+        c = self._big_canvas()
+        layer = c.layer_stack.active
+        layer.image.fill(QColor(0, 0, 0, 0))
+        for i in range(60):
+            c._save_history()
+            layer.image.setPixelColor(i, 0, QColor(255, 0, 0, 255))
+        before = len(c._history)
+        c.undo()
+        assert len(c._history) == before - 1
+        assert len(c._redo_stack) == 1
+        c.redo()
+        assert len(c._history) == before
+
+
+class TestLassoFillShapes:
+    """囲って塗る（LASSO_FILL）が様々な形・大きさの投げなわで落ちないこと。
+    極小・自己交差・キャンバス外・負座標など異常な入力でも例外を投げない。"""
+
+    def _ring(self, cx, cy, r, n=24):
+        import math
+        return [QPoint(int(cx + r * math.cos(2 * math.pi * i / n)),
+                       int(cy + r * math.sin(2 * math.pi * i / n))) for i in range(n)]
+
+    @pytest.mark.parametrize("name", [
+        "tiny", "small", "large", "self_intersect", "degenerate",
+        "duplicate", "beyond_canvas", "negative", "one_px",
+    ])
+    def test_shapes_do_not_crash(self, canvas, name):
+        shapes = {
+            "tiny": [QPoint(5, 5), QPoint(15, 5), QPoint(10, 15)],
+            "small": self._ring(50, 50, 8),
+            "large": self._ring(100, 100, 500),
+            "self_intersect": [QPoint(10, 10), QPoint(150, 150), QPoint(150, 10), QPoint(10, 150)],
+            "degenerate": [QPoint(20, 20), QPoint(80, 20), QPoint(50, 20)],
+            "duplicate": [QPoint(30, 30)] * 5 + [QPoint(90, 30), QPoint(90, 90)],
+            "beyond_canvas": self._ring(100, 100, 5000),
+            "negative": [QPoint(-100, -100), QPoint(50, -100), QPoint(50, 50), QPoint(-100, 50)],
+            "one_px": [QPoint(60, 60), QPoint(61, 60), QPoint(61, 61), QPoint(60, 61)],
+        }
+        layer = canvas.layer_stack.active
+        layer.image.fill(QColor(0, 0, 0, 0))
+        canvas.pen_color = QColor(255, 0, 0, 255)
+        canvas._apply_lasso_fill(layer, shapes[name])
+
+    def test_fills_closed_region(self, canvas):
+        """閉じた線の内側が実際に塗られる。"""
+        layer = canvas.layer_stack.active
+        layer.image.fill(QColor(0, 0, 0, 0))
+        p = QPainter(layer.image)
+        p.setPen(Qt.GlobalColor.black)
+        p.drawRect(40, 40, 60, 60)
+        p.end()
+        canvas.pen_color = QColor(255, 0, 0, 255)
+        # 矩形を完全に含む半径で囲う（対角より大きく取る）
+        canvas._apply_lasso_fill(layer, self._ring(70, 70, 60, n=40))
+        assert px(layer.image, 70, 70).red() > 200
+
+    def test_offset_layer_does_not_crash(self, canvas):
+        """移動後（offset 付き・キャンバスと別サイズ）のレイヤーでも落ちない。"""
+        layer = canvas.layer_stack.active
+        layer.image = QImage(80, 80, QImage.Format.Format_ARGB32)
+        layer.image.fill(QColor(0, 0, 0, 0))
+        layer.offset_x, layer.offset_y = 60, 40
+        canvas.pen_color = QColor(0, 128, 255, 255)
+        canvas._apply_lasso_fill(layer, self._ring(100, 80, 50))
+
+    def test_negative_offset_layer_does_not_crash(self, canvas):
+        layer = canvas.layer_stack.active
+        layer.image = QImage(120, 120, QImage.Format.Format_ARGB32)
+        layer.image.fill(QColor(0, 0, 0, 0))
+        layer.offset_x, layer.offset_y = -70, -50
+        canvas.pen_color = QColor(0, 200, 0, 255)
+        canvas._apply_lasso_fill(layer, self._ring(20, 20, 60))
+
+    def test_group_layer_is_rejected_safely(self, canvas):
+        """グループレイヤーが対象でも例外にならず、何もしない。"""
+        from layer import GroupLayer
+        g = GroupLayer("g", W, H)
+        canvas._apply_lasso_fill(g, self._ring(50, 50, 30))

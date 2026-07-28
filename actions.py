@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import random
+import traceback
 
 import numpy as np
 import cv2
@@ -107,6 +108,28 @@ def _dilate_alpha(image: QImage, radius: int) -> QImage:
     out[:, :, 3] = dilated
     out[:, :, :3] = arr[:, :, :3]
     return _array_to_qimage(out)
+
+
+def _pad_image(image: QImage, margin: int) -> QImage:
+    """四方に margin ぶんの透明な余白を足した画像を返す。
+    膨張・ぼかし・ずらしは外側に広がるため、元画像と同じサイズのまま
+    処理すると画像の端で切り落とされる。先に余白を確保してから処理し、
+    レイヤーの offset を margin ぶん戻すことで見た目の位置を保つ。"""
+    if margin <= 0:
+        return image.copy()
+    w, h = image.width(), image.height()
+    out = QImage(w + margin * 2, h + margin * 2, QImage.Format.Format_ARGB32)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.drawImage(margin, margin, image)
+    p.end()
+    return out
+
+
+def _offset_layer(layer: Layer, margin: int) -> None:
+    """_pad_image で広げた分だけレイヤー位置を戻す。"""
+    layer.offset_x -= margin
+    layer.offset_y -= margin
 
 
 def _blur_image(image: QImage, radius: int) -> QImage:
@@ -325,22 +348,33 @@ def execute_chroma_shift(layer_stack: LayerStack, source_layer: Layer,
         ]
 
     src_idx = _find_top_index(layer_stack, source_layer)
-    group = GroupLayer(f"{source_layer.name} - 線画ずらし", w, h)
+    # グループはキャンバスサイズで作る（元画像サイズだと子がバッファ外に落ちて消える）
+    group = GroupLayer(f"{source_layer.name} - 線画ずらし",
+                       layer_stack.width, layer_stack.height)
+
+    # ずらし・太らせ・回転拡縮で外側に広がるぶんの余白を確保する
+    max_thick = max((ld.get("thickness", 0) for ld in layer_defs), default=0)
+    diag = int((w * w + h * h) ** 0.5)
+    grow = int(diag * (abs(scale_max) / 100.0) / 2) if do_scale else 0
+    if do_rotate:
+        grow += (diag - min(w, h)) // 2
+    cmargin = int(shift_px) + int(max_thick) + grow + 2
 
     for i, ld in enumerate(layer_defs):
         color: QColor = ld["color"]
         thickness: int = ld.get("thickness", 0)
-        base = _adjust_thickness(src_img.copy(), thickness)
+        base = _adjust_thickness(_pad_image(src_img, cmargin), thickness)
         colored_img = _apply_color_overlay(base, color)
         dx = random.randint(-shift_px, shift_px)
         dy = random.randint(-shift_px, shift_px)
         angle = random.uniform(-rot_max, rot_max) if do_rotate else 0.0
         scale = 1.0 + random.uniform(-scale_max, scale_max) / 100.0 if do_scale else 1.0
         shifted = _shift_image(colored_img, dx, dy, angle, scale)
-        layer = Layer(f"ずらし{i+1}", w, h)
+        layer = Layer(f"ずらし{i+1}", shifted.width(), shifted.height())
         layer.image = shifted
         layer.blend_mode = "screen"
         _copy_offset(source_layer, layer)
+        _offset_layer(layer, cmargin)
         group.children.append(layer)
 
     top = Layer(f"{source_layer.name} (元)", w, h)
@@ -420,7 +454,9 @@ def execute_glow(layer_stack: LayerStack, source_layer: Layer,
     w, h = src_img.width(), src_img.height()
     src_idx = _find_top_index(layer_stack, source_layer)
 
-    group = GroupLayer(f"{source_layer.name} - グロー", w, h)
+    # グループはキャンバスサイズで作る（元画像サイズだと子がバッファ外に落ちて消える）
+    group = GroupLayer(f"{source_layer.name} - グロー",
+                       layer_stack.width, layer_stack.height)
 
     # 背景レイヤー
     bg = Layer("背景", w, h)
@@ -437,15 +473,18 @@ def execute_glow(layer_stack: LayerStack, source_layer: Layer,
     glow_size = params["glow_size"]
     glow_strength = params["glow_strength"]
 
-    colored = _apply_color_overlay(src_img.copy(), glow_color)
+    # 膨張＋ぼかしで外側に広がるぶんの余白を先に確保する
+    gmargin = glow_size * 2 + 2
+    colored = _apply_color_overlay(_pad_image(src_img, gmargin), glow_color)
     dilated = _dilate_alpha(colored, glow_size)
     blurred = _blur_image(dilated, glow_size)
 
-    glow_layer = Layer("グロー", w, h)
+    glow_layer = Layer("グロー", blurred.width(), blurred.height())
     glow_layer.image = blurred
     glow_layer.opacity = int(glow_strength * 255 / 100)
     glow_layer.blend_mode = "screen"
     _copy_offset(source_layer, glow_layer)
+    _offset_layer(glow_layer, gmargin)
     group.children.insert(0, glow_layer)
 
     top = Layer(f"{source_layer.name} (元)", w, h)
@@ -530,27 +569,32 @@ def execute_drop_shadow(layer_stack: LayerStack, source_layer: Layer,
     w, h = src_img.width(), src_img.height()
     src_idx = _find_top_index(layer_stack, source_layer)
 
-    group = GroupLayer(f"{source_layer.name} - 影付き", w, h)
+    # グループはキャンバスサイズで作る（元画像サイズだと子がバッファ外に落ちて消える）
+    group = GroupLayer(f"{source_layer.name} - 影付き",
+                       layer_stack.width, layer_stack.height)
 
     # 影レイヤー
     shadow_color = params["color"]
-    colored = _apply_color_overlay(src_img.copy(), shadow_color)
-
     ox, oy = params["offset_x"], params["offset_y"]
-    shifted = QImage(w, h, QImage.Format.Format_ARGB32)
+    blur_r = params["blur"]
+    # ずらし量とぼかし半径のぶん、先に余白を確保する
+    dmargin = max(abs(int(ox)), abs(int(oy))) + int(blur_r) * 2 + 2
+    colored = _apply_color_overlay(_pad_image(src_img, dmargin), shadow_color)
+
+    shifted = QImage(colored.width(), colored.height(), QImage.Format.Format_ARGB32)
     shifted.fill(Qt.GlobalColor.transparent)
     p = QPainter(shifted)
     p.drawImage(ox, oy, colored)
     p.end()
 
-    blur_r = params["blur"]
     if blur_r > 0:
         shifted = _blur_image(shifted, blur_r)
 
-    shadow_layer = Layer("影", w, h)
+    shadow_layer = Layer("影", shifted.width(), shifted.height())
     shadow_layer.image = shifted
     shadow_layer.opacity = int(params["strength"] * 255 / 100)
     _copy_offset(source_layer, shadow_layer)
+    _offset_layer(shadow_layer, dmargin)
     group.children.append(shadow_layer)
 
     top = Layer(f"{source_layer.name} (元)", w, h)
@@ -833,7 +877,9 @@ def execute_popout(layer_stack: LayerStack, source_layer: Layer,
     w, h = src_img.width(), src_img.height()
     src_idx = _find_top_index(layer_stack, source_layer)
 
-    group = GroupLayer(f"{source_layer.name} - ポップアウト", w, h)
+    # グループはキャンバスサイズで作る（元画像サイズだと子がバッファ外に落ちて消える）
+    group = GroupLayer(f"{source_layer.name} - ポップアウト",
+                       layer_stack.width, layer_stack.height)
 
     outline_size = params["outline_size"]
     outline_color = params["outline_color"]
@@ -841,25 +887,31 @@ def execute_popout(layer_stack: LayerStack, source_layer: Layer,
     # 影レイヤー（最背面）
     if params["shadow"]:
         so = params["shadow_offset"]
-        dilated = _dilate_alpha(src_img, outline_size + 2)
+        # 膨張＋ずらし＋ぼかしのぶんの余白を先に確保する
+        smargin = outline_size + 2 + abs(int(so)) + 6
+        padded = _pad_image(src_img, smargin)
+        dilated = _dilate_alpha(padded, outline_size + 2)
         shadow_img = _apply_color_overlay(dilated, QColor(0, 0, 0, 140))
-        shifted = QImage(w, h, QImage.Format.Format_ARGB32)
+        shifted = QImage(padded.width(), padded.height(), QImage.Format.Format_ARGB32)
         shifted.fill(Qt.GlobalColor.transparent)
         p = QPainter(shifted)
         p.drawImage(so, so, shadow_img)
         p.end()
         blurred = _blur_image(shifted, 3)
-        shadow_layer = Layer("影", w, h)
+        shadow_layer = Layer("影", blurred.width(), blurred.height())
         shadow_layer.image = blurred
         _copy_offset(source_layer, shadow_layer)
+        _offset_layer(shadow_layer, smargin)
         group.children.append(shadow_layer)
 
     # 白縁レイヤー
-    dilated = _dilate_alpha(src_img, outline_size)
+    omargin = outline_size + 2
+    dilated = _dilate_alpha(_pad_image(src_img, omargin), outline_size)
     outline_img = _apply_color_overlay(dilated, outline_color)
-    outline_layer = Layer("縁", w, h)
+    outline_layer = Layer("縁", outline_img.width(), outline_img.height())
     outline_layer.image = outline_img
     _copy_offset(source_layer, outline_layer)
+    _offset_layer(outline_layer, omargin)
     group.children.insert(0, outline_layer)
 
     top = Layer(f"{source_layer.name} (元)", w, h)
@@ -1401,10 +1453,15 @@ def _insert_result_layer(layer_stack: LayerStack, source_layer: Layer,
     source_layer.visible = False
 
 
-def _group_with_original(source_layer: Layer, suffix: str) -> tuple[GroupLayer, Layer]:
-    """元レイヤーのコピーを最上段に持つグループを作って返す。"""
+def _group_with_original(source_layer: Layer, suffix: str,
+                         canvas_size: tuple[int, int]) -> tuple[GroupLayer, Layer]:
+    """元レイヤーのコピーを最上段に持つグループを作って返す。
+    グループは必ずキャンバスサイズで作る。GroupLayer.composite() は自身の
+    サイズのバッファに子をオフセット付きで描くため、元レイヤーの画像サイズ
+    （絵に密着した小さいサイズのことがある）で作ると子がバッファ外に落ちて
+    絵が丸ごと消えてしまう。"""
     w, h = source_layer.image.width(), source_layer.image.height()
-    group = GroupLayer(f"{source_layer.name} - {suffix}", w, h)
+    group = GroupLayer(f"{source_layer.name} - {suffix}", canvas_size[0], canvas_size[1])
     top = Layer(f"{source_layer.name} (元)", w, h)
     top.image = source_layer.image.copy()
     _copy_offset(source_layer, top)
@@ -1482,12 +1539,18 @@ def execute_offset_border(layer_stack: LayerStack, source_layer: Layer,
     if not alpha.any():
         return None
 
-    sil = _filled_silhouette(alpha)
     size = params["size"]
+    shift = params.get("shift", 0)
+    # 膨張とずらしで外側に広がるぶんの余白を確保してから処理する
+    margin = size + abs(int(shift)) + 2
+    alpha = cv2.copyMakeBorder(alpha, margin, margin, margin, margin,
+                               cv2.BORDER_CONSTANT, value=0)
+    ph, pw = alpha.shape[:2]
+
+    sil = _filled_silhouette(alpha)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size * 2 + 1, size * 2 + 1))
     dilated = cv2.dilate(sil, kernel)
 
-    shift = params.get("shift", 0)
     dx = random.randint(-shift, shift) if shift else 0
     dy = random.randint(-shift, shift) if shift else 0
     shifted = _shift_mask(dilated, dx, dy)
@@ -1495,17 +1558,19 @@ def execute_offset_border(layer_stack: LayerStack, source_layer: Layer,
     border_area = (shifted > 0) & (sil == 0)
     gap = params.get("gap", 0)
     if gap > 0:
-        noise = _coarse_noise(w, h, max(8, size * 3))
+        noise = _coarse_noise(pw, ph, max(8, size * 3))
         border_area &= noise > (gap / 100.0)
 
     bc: QColor = params["color"]
-    border = np.zeros((h, w, 4), dtype=np.uint8)
+    border = np.zeros((ph, pw, 4), dtype=np.uint8)
     border[border_area] = [bc.blue(), bc.green(), bc.red(), bc.alpha()]
 
-    group, _top = _group_with_original(source_layer, "ずれ縁取り")
-    border_layer = Layer("ずれ縁", w, h)
+    group, _top = _group_with_original(source_layer, "ずれ縁取り",
+                                     (layer_stack.width, layer_stack.height))
+    border_layer = Layer("ずれ縁", pw, ph)
     border_layer.image = _array_to_qimage(border)
     _copy_offset(source_layer, border_layer)
+    _offset_layer(border_layer, margin)
     group.children.append(border_layer)
 
     _insert_result_layer(layer_stack, source_layer, group)
@@ -1577,20 +1642,27 @@ def execute_silkscreen(layer_stack: LayerStack, source_layer: Layer,
     if not alpha.any():
         return None
 
-    sil = _filled_silhouette(alpha)
     shift = params.get("shift", 0)
     plate_alpha = int(params.get("opacity", 100) * 255 / 100)
+    # 版のずらし量ぶんの余白を確保してから処理する
+    margin = abs(int(shift)) + 2
+    alpha = cv2.copyMakeBorder(alpha, margin, margin, margin, margin,
+                               cv2.BORDER_CONSTANT, value=0)
+    ph, pw = alpha.shape[:2]
+    sil = _filled_silhouette(alpha)
 
-    group, _top = _group_with_original(source_layer, "リソ風版ずれ")
+    group, _top = _group_with_original(source_layer, "リソ風版ずれ",
+                                     (layer_stack.width, layer_stack.height))
     for i, color in enumerate(params["colors"]):
         dx = random.randint(-shift, shift) if shift else 0
         dy = random.randint(-shift, shift) if shift else 0
         mask = _shift_mask(sil, dx, dy)
-        plate = np.zeros((h, w, 4), dtype=np.uint8)
+        plate = np.zeros((ph, pw, 4), dtype=np.uint8)
         plate[mask > 0] = [color.blue(), color.green(), color.red(), plate_alpha]
-        layer = Layer(f"色版{i + 1}", w, h)
+        layer = Layer(f"色版{i + 1}", pw, ph)
         layer.image = _array_to_qimage(plate)
         _copy_offset(source_layer, layer)
+        _offset_layer(layer, margin)
         group.children.append(layer)
 
     _insert_result_layer(layer_stack, source_layer, group)
@@ -1718,8 +1790,14 @@ def execute_collage(layer_stack: LayerStack, source_layer: Layer,
     # 全色をまんべんなく使うため、シャッフルした色を順番に割り当てる
     palette = list(colors)
     random.shuffle(palette)
-    fills = np.zeros((h, w, 4), dtype=np.uint8)
+    # 紙片の膨張とずらしで外側に広がるぶんの余白を確保する。領域検出（labels）は
+    # 元サイズで行う必要があるため、塗り込み段階でだけ広げる。
+    margin = int(expand) + abs(int(shift)) + 2
+    ph, pw = h + margin * 2, w + margin * 2
+    fills = np.zeros((ph, pw, 4), dtype=np.uint8)
     for i, mask in enumerate(pieces):
+        mask = cv2.copyMakeBorder(mask, margin, margin, margin, margin,
+                                  cv2.BORDER_CONSTANT, value=0)
         if expand_kernel is not None:
             mask = cv2.dilate(mask, expand_kernel)
         if shift:
@@ -1728,10 +1806,12 @@ def execute_collage(layer_stack: LayerStack, source_layer: Layer,
         color = palette[i % len(palette)]
         fills[mask > 0] = [color.blue(), color.green(), color.red(), color.alpha()]
 
-    group, _top = _group_with_original(source_layer, "切り絵コラージュ")
-    fill_layer = Layer("色紙", w, h)
+    group, _top = _group_with_original(source_layer, "切り絵コラージュ",
+                                     (layer_stack.width, layer_stack.height))
+    fill_layer = Layer("色紙", pw, ph)
     fill_layer.image = _array_to_qimage(fills)
     _copy_offset(source_layer, fill_layer)
+    _offset_layer(fill_layer, margin)
     group.children.append(fill_layer)
 
     _insert_result_layer(layer_stack, source_layer, group)
@@ -1805,22 +1885,28 @@ def execute_wobble(layer_stack: LayerStack, source_layer: Layer,
 
     strength = params["strength"]
     wavelength = max(10, params["wavelength"])
-    nx = (_coarse_noise(w, h, wavelength) - 0.5) * 2.0 * strength
-    ny = (_coarse_noise(w, h, wavelength) - 0.5) * 2.0 * strength
-    xx, yy = np.meshgrid(np.arange(w, dtype=np.float32),
-                         np.arange(h, dtype=np.float32))
+    # 揺らぎの最大変位ぶんの余白を確保してから歪ませる
+    margin = int(strength) + 2
+    arr = cv2.copyMakeBorder(arr, margin, margin, margin, margin,
+                             cv2.BORDER_CONSTANT, value=0)
+    ph, pw = arr.shape[:2]
+    nx = (_coarse_noise(pw, ph, wavelength) - 0.5) * 2.0 * strength
+    ny = (_coarse_noise(pw, ph, wavelength) - 0.5) * 2.0 * strength
+    xx, yy = np.meshgrid(np.arange(pw, dtype=np.float32),
+                         np.arange(ph, dtype=np.float32))
     warped = cv2.remap(arr, xx + nx, yy + ny,
                        interpolation=cv2.INTER_LINEAR,
                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
     gap = params.get("gap", 0)
     if gap > 0:
-        keep = _coarse_noise(w, h, max(6, wavelength // 4)) > (gap / 100.0)
+        keep = _coarse_noise(pw, ph, max(6, wavelength // 4)) > (gap / 100.0)
         warped[:, :, 3] = warped[:, :, 3] * keep
 
-    result = Layer(f"{source_layer.name} - 揺らぎ", w, h)
+    result = Layer(f"{source_layer.name} - 揺らぎ", pw, ph)
     result.image = _array_to_qimage(warped)
     _copy_offset(source_layer, result)
+    _offset_layer(result, margin)
     _insert_result_layer(layer_stack, source_layer, result)
     return result
 
@@ -2110,7 +2196,14 @@ def execute_contour(layer_stack: LayerStack, source_layer: Layer,
     k_thick = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (thickness * 2 + 1, thickness * 2 + 1))
 
-    out = np.zeros((h, w, 4), dtype=np.uint8)
+    # 輪郭は外側へ count*spacing だけ広がるので、その分の余白を確保してから
+    # 膨張させる。余白がないとレイヤー画像の端でリングが切り落とされる。
+    margin = count * spacing + thickness + 1
+    sil = cv2.copyMakeBorder(sil, margin, margin, margin, margin,
+                             cv2.BORDER_CONSTANT, value=0)
+    ow, oh = w + margin * 2, h + margin * 2
+
+    out = np.zeros((oh, ow, 4), dtype=np.uint8)
     cur = sil.copy()
     for i in range(count):
         cur = cv2.dilate(cur, k_spacing)
@@ -2118,10 +2211,13 @@ def execute_contour(layer_stack: LayerStack, source_layer: Layer,
         a = int(255 * (count - i) / (count + 1)) if fade else color.alpha()
         out[ring] = [color.blue(), color.green(), color.red(), a]
 
-    group, _top = _group_with_original(source_layer, "等高線")
-    contour_layer = Layer("等高線", w, h)
+    group, _top = _group_with_original(source_layer, "等高線",
+                                     (layer_stack.width, layer_stack.height))
+    contour_layer = Layer("等高線", ow, oh)
     contour_layer.image = _array_to_qimage(out)
     _copy_offset(source_layer, contour_layer)
+    contour_layer.offset_x -= margin
+    contour_layer.offset_y -= margin
     group.children.append(contour_layer)
 
     _insert_result_layer(layer_stack, source_layer, group)
@@ -2269,7 +2365,11 @@ def _flatten_gacha_result(result, w: int, h: int) -> QImage:
     buf.fill(Qt.GlobalColor.transparent)
     p = QPainter(buf)
     if result.is_group:
-        p.drawImage(0, 0, result.composite())
+        # グループも offset を持ちうるので明示的に反映する。現状の効果は
+        # キャンバスサイズのグループしか作らないので 0 のままだが、
+        # 0 決め打ちだとサイズ違いのグループが来た瞬間に位置がずれる。
+        p.drawImage(getattr(result, 'offset_x', 0),
+                    getattr(result, 'offset_y', 0), result.composite())
     else:
         p.drawImage(getattr(result, 'offset_x', 0),
                     getattr(result, 'offset_y', 0), result.image)
@@ -2373,7 +2473,10 @@ def execute_gacha(layer_stack: LayerStack, source_layer: Layer,
             else:
                 result = _GACHA_EXEC[key](temp_stack, work, eff_params)
         except Exception:
-            result = None  # 1効果の失敗でガチャ全体を止めない
+            # 1効果の失敗でガチャ全体を止めない。ただし黙って握り潰すと
+            # 本当の不具合に気づけないので、内容だけは残す。
+            traceback.print_exc()
+            result = None
         if result is None:
             continue
         next_work = Layer("work", w, h)
