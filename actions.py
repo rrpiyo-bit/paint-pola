@@ -89,6 +89,16 @@ def _qimage_to_array(img: QImage) -> np.ndarray:
     return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
 
 
+def _bgr(color: QColor) -> tuple[int, int, int]:
+    """QColor を _qimage_to_array のチャンネル順(B,G,R)に並べ替える。
+
+    _qimage_to_array が返す配列は ARGB32 のバイト列そのままなので、
+    index 0 が Blue・2 が Red。ここを (R,G,B) の順で書くと赤と青が
+    入れ替わった色になるため、配列へ色を書き込むときは必ずこれを通す。
+    """
+    return (color.blue(), color.green(), color.red())
+
+
 def _array_to_qimage(arr: np.ndarray) -> QImage:
     h, w, _ = arr.shape
     return QImage(arr.data, w, h, w * 4,
@@ -1940,6 +1950,48 @@ class StampDialog(QDialog):
         self._blots.setChecked(True)
         form.addRow("", self._blots)
 
+        self._blot_min = QSpinBox()
+        self._blot_min.setRange(1, 40)
+        self._blot_min.setValue(2)
+        self._blot_min.setSuffix(" px")
+        self._blot_min.setToolTip("インク溜まりの最小半径")
+        form.addRow("インク溜まり 最小", self._blot_min)
+
+        self._blot_max = QSpinBox()
+        self._blot_max.setRange(1, 40)
+        self._blot_max.setValue(6)
+        self._blot_max.setSuffix(" px")
+        self._blot_max.setToolTip("インク溜まりの最大半径")
+        form.addRow("インク溜まり 最大", self._blot_max)
+
+        # 最小 > 最大 の状態を作れないように連動させる
+        self._blot_min.valueChanged.connect(
+            lambda v: self._blot_max.setValue(v) if v > self._blot_max.value() else None)
+        self._blot_max.valueChanged.connect(
+            lambda v: self._blot_min.setValue(v) if v < self._blot_min.value() else None)
+
+        self._auto_color = QCheckBox("線と同じ色を使う")
+        self._auto_color.setChecked(True)
+        self._auto_color.setToolTip("オフにすると下の色でインク溜まりを描きます")
+        form.addRow("", self._auto_color)
+
+        self._blot_color = _color_button(QColor(20, 20, 20), self)
+        form.addRow("インク溜まりの色", self._blot_color)
+
+        # 「線と同じ色」のときは色ボタンを触れないようにする
+        self._auto_color.toggled.connect(
+            lambda on: self._blot_color.setEnabled(not on))
+        self._blot_color.setEnabled(False)
+
+        # インク溜まりOFFなら関連項目をまとめて無効化する
+        def _sync_blot_enabled(on: bool):
+            self._blot_min.setEnabled(on)
+            self._blot_max.setEnabled(on)
+            self._auto_color.setEnabled(on)
+            self._blot_color.setEnabled(on and not self._auto_color.isChecked())
+
+        self._blots.toggled.connect(_sync_blot_enabled)
+
         layout.addLayout(form)
 
         desc = QLabel("線をランダムにかすれさせて、ゴム版画・はんこの\n"
@@ -1958,6 +2010,11 @@ class StampDialog(QDialog):
             "strength": self._strength.value(),
             "grain": self._grain.value(),
             "blots": self._blots.isChecked(),
+            "blot_min": self._blot_min.value(),
+            "blot_max": self._blot_max.value(),
+            # 「線と同じ色」なら色は None にして自動判定に任せる
+            "blot_color": None if self._auto_color.isChecked()
+                          else self._blot_color._color,
         }
 
 
@@ -1987,17 +2044,27 @@ def execute_stamp(layer_stack: LayerStack, source_layer: Layer,
         line_ys, line_xs = np.nonzero(alpha > 127)
         if len(line_xs) > 0:
             opaque = alpha > 127
-            rgb_mean = arr[opaque][:, :3].mean(axis=0).astype(np.uint8)
+            # 半径の指定。最小 > 最大 で渡ってきても落ちないよう入れ替える
+            r_min = max(1, int(params.get("blot_min", 2)))
+            r_max = max(1, int(params.get("blot_max", 6)))
+            if r_min > r_max:
+                r_min, r_max = r_max, r_min
+            blot_color = params.get("blot_color")
+            if blot_color is None:
+                # 色指定なし = 線の平均色になじませる（従来の挙動）
+                rgb_blot = arr[opaque][:, :3].mean(axis=0).astype(np.uint8)
+            else:
+                rgb_blot = np.array(_bgr(blot_color), dtype=np.uint8)
             blot_mask = np.zeros((h, w), dtype=np.uint8)
             n_blots = max(3, len(line_xs) // 4000)
             for _ in range(n_blots):
                 i = random.randrange(len(line_xs))
                 cv2.circle(blot_mask, (int(line_xs[i]), int(line_ys[i])),
-                           random.randint(2, 6), 255, -1)
+                           random.randint(r_min, r_max), 255, -1)
             blot_area = blot_mask > 0
-            out[blot_area, 0] = rgb_mean[0]
-            out[blot_area, 1] = rgb_mean[1]
-            out[blot_area, 2] = rgb_mean[2]
+            out[blot_area, 0] = rgb_blot[0]
+            out[blot_area, 1] = rgb_blot[1]
+            out[blot_area, 2] = rgb_blot[2]
             out[blot_area, 3] = 255
 
     result = Layer(f"{source_layer.name} - スタンプ", w, h)
@@ -2008,112 +2075,7 @@ def execute_stamp(layer_stack: LayerStack, source_layer: Layer,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 15. 万華鏡
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class KaleidoDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("万華鏡")
-        self.setMinimumWidth(300)
-        layout = QVBoxLayout(self)
-
-        form = QFormLayout()
-        self._segments = QSpinBox()
-        self._segments.setRange(2, 12)
-        self._segments.setValue(6)
-        form.addRow("分割数", self._segments)
-
-        self._mirror = QCheckBox("交互に鏡映する")
-        self._mirror.setChecked(True)
-        form.addRow("", self._mirror)
-
-        layout.addLayout(form)
-
-        desc = QLabel("絵柄を扇形に切り取り、中心の周りに回転コピーして\n"
-                      "万華鏡のような模様を作ります。コピー同士は重なりません。")
-        desc.setStyleSheet("color: #666; font-size: 11px;")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
-
-        buttons = _std_buttons()
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def params(self) -> dict:
-        return {
-            "segments": self._segments.value(),
-            "mirror": self._mirror.isChecked(),
-        }
-
-
-def execute_kaleidoscope(layer_stack: LayerStack, source_layer: Layer,
-                         params: dict) -> Layer | None:
-    if source_layer.is_group:
-        return None
-    src_img: QImage = source_layer.image
-    if src_img.width() == 0 or src_img.height() == 0:
-        return None
-    cw, ch = layer_stack.width, layer_stack.height
-    segments = max(2, params["segments"])
-    mirror = params.get("mirror", False)
-    ox = getattr(source_layer, 'offset_x', 0)
-    oy = getattr(source_layer, 'offset_y', 0)
-    cx, cy = cw / 2.0, ch / 2.0
-    seg_angle = 360.0 / segments
-
-    # 各扇形には「扇形0にある絵柄」だけが複製される仕組みなので、
-    # 絵柄の重心が扇形0の中央に来るようソースを前回転させて中身を確保する
-    alpha = _qimage_to_array(src_img)[:, :, 3]
-    ys, xs = np.nonzero(alpha > 0)
-    base = 0.0
-    if len(xs) > 0:
-        mx, my = float(xs.mean()) + ox, float(ys.mean()) + oy
-        theta_c = math.degrees(math.atan2(my - cy, mx - cx))
-        base = seg_angle / 2.0 - theta_c
-
-    buf = QImage(cw, ch, QImage.Format.Format_ARGB32_Premultiplied)
-    buf.fill(Qt.GlobalColor.transparent)
-    p = QPainter(buf)
-    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    radius = math.hypot(cw, ch)  # キャンバス全域を覆う十分な半径
-    for i in range(segments):
-        p.save()
-        # 扇形 i にクリップして描くので、コピー同士は重ならない
-        wedge = QPainterPath()
-        wedge.moveTo(cx, cy)
-        steps = max(2, int(seg_angle // 10) + 1)
-        for s in range(steps + 1):
-            ang = math.radians(seg_angle * (i + s / steps))
-            wedge.lineTo(cx + radius * math.cos(ang),
-                         cy + radius * math.sin(ang))
-        wedge.closeSubpath()
-        p.setClipPath(wedge)
-        t = QTransform()
-        t.translate(cx, cy)
-        if mirror and i % 2 == 1:
-            # 隣り合う扇形が鏡映で続くように、反転してから隣の境界へ回転
-            t.rotate(seg_angle * (i + 1))
-            t.scale(1, -1)
-        else:
-            t.rotate(seg_angle * i)
-        t.rotate(base)
-        t.translate(-cx, -cy)
-        p.setTransform(t, combine=True)
-        p.drawImage(ox, oy, src_img)
-        p.restore()
-    p.end()
-
-    result = Layer(f"{source_layer.name} - 万華鏡", cw, ch)
-    result.image = buf.convertToFormat(QImage.Format.Format_ARGB32)
-    _insert_result_layer(layer_stack, source_layer, result)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 16. 等高線
+# 15. 等高線
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ContourDialog(QDialog):
@@ -2225,7 +2187,745 @@ def execute_contour(layer_stack: LayerStack, source_layer: Layer,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 17. アクションガチャ
+# 新効果 共通ユーティリティ（網点・ディザ・ハッチング）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _luma(rgb: np.ndarray) -> np.ndarray:
+    """RGB(float32) から知覚的な明度(0-255)を求める。"""
+    return (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2])
+
+
+def _halftone_plane(value: np.ndarray, pitch: int, angle_deg: float,
+                    supersample: int = 2) -> np.ndarray:
+    """1版ぶんの網点を描く。value は 0-255 の濃度（大きいほど点が大きい）。
+
+    セル中心を angle_deg だけ回転した格子に置き、セル内の平均濃度に比例した
+    半径の円を描く。版ごとに角度を変えるとモアレが出にくくなり、実際の
+    カラー印刷らしい点々になる。戻り値は 0-255 のカバレッジ。
+    """
+    h, w = value.shape
+    ss = max(1, supersample)          # アンチエイリアス用の拡大率
+    theta = math.radians(angle_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+    # セル中心の1ピクセルだけを読むと、細い線画では線がセル中心を外れた
+    # 瞬間に濃度0とみなされ、網点が1つも打たれず真っ白になる。
+    # セル幅で平均化した濃度マップから読むことで、セル内のどこかに線が
+    # あれば必ず点が立つようにする。
+    box = max(1, pitch)
+    sampled = cv2.blur(value, (box, box))
+
+    # 回転しても画像全体を覆えるよう、格子の走査範囲を対角長ぶん広げる
+    diag = int(math.hypot(w, h)) + pitch * 2
+    canvas = np.zeros((h * ss, w * ss), dtype=np.uint8)
+    # 濃度 100% で点の面積がセルの面積とちょうど等しくなる半径。
+    # πr² = pitch² より r = pitch/√π。セルの対角(pitch/2·√2)まで伸ばすと
+    # 中間調で既に隣の点とつながってしまい、全部真っ黒に潰れる。
+    max_r = pitch * ss / math.sqrt(math.pi)
+
+    for gy in range(-diag // pitch, diag // pitch + 1):
+        for gx in range(-diag // pitch, diag // pitch + 1):
+            # 格子座標 → 画像座標（回転を適用）
+            ux, uy = gx * pitch, gy * pitch
+            cx = ux * cos_t - uy * sin_t + w * 0.5
+            cy = ux * sin_t + uy * cos_t + h * 0.5
+            if not (-pitch <= cx < w + pitch and -pitch <= cy < h + pitch):
+                continue
+            # セル中心付近の平均濃度を読む
+            sx = min(w - 1, max(0, int(cx)))
+            sy = min(h - 1, max(0, int(cy)))
+            v = float(sampled[sy, sx]) / 255.0
+            if v <= 0.001:
+                continue
+            # 面積が濃度に比例するよう半径は sqrt を取る
+            r = max_r * math.sqrt(min(1.0, v))
+            if r < 0.3:
+                continue
+            cv2.circle(canvas, (int(round(cx * ss)), int(round(cy * ss))),
+                       int(round(r)), 255, -1, lineType=cv2.LINE_AA)
+
+    if ss > 1:
+        canvas = cv2.resize(canvas, (w, h), interpolation=cv2.INTER_AREA)
+    return canvas
+
+
+_BAYER4 = np.array([
+    [0, 8, 2, 10],
+    [12, 4, 14, 6],
+    [3, 11, 1, 9],
+    [15, 7, 13, 5],
+], dtype=np.float32) / 16.0
+
+
+def _quantize_to_palette(rgb: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    """各ピクセルをパレット中の最近傍色に置き換える。"""
+    h, w, _ = rgb.shape
+    flat = rgb.reshape(-1, 1, 3)
+    dist = np.sum((flat - palette.reshape(1, -1, 3)) ** 2, axis=2)
+    idx = np.argmin(dist, axis=1)
+    return palette[idx].reshape(h, w, 3)
+
+
+def _hatch_lines(shape: tuple[int, int], angle_deg: float,
+                 spacing: int, thickness: int) -> np.ndarray:
+    """指定角度の等間隔な平行線マスク(0/255)を作る。"""
+    h, w = shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+    theta = math.radians(angle_deg)
+    dx, dy = math.cos(theta), math.sin(theta)
+    length = int(math.hypot(w, h)) + spacing * 2
+    cx, cy = w * 0.5, h * 0.5
+    # 線に垂直な方向へ spacing ずつずらしながら引く
+    nx, ny = -dy, dx
+    for i in range(-length // spacing, length // spacing + 1):
+        ox, oy = nx * i * spacing, ny * i * spacing
+        p1 = (int(cx + ox - dx * length), int(cy + oy - dy * length))
+        p2 = (int(cx + ox + dx * length), int(cy + oy + dy * length))
+        cv2.line(mask, p1, p2, 255, max(1, thickness), lineType=cv2.LINE_AA)
+    return mask
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. カラーハーフトーン（網点）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HalftoneDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("カラーハーフトーン")
+        self.setMinimumWidth(320)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._pitch = QSpinBox()
+        self._pitch.setRange(3, 40)
+        self._pitch.setValue(10)
+        self._pitch.setSuffix(" px")
+        self._pitch.setToolTip("網点の間隔。小さいほど細かい網点になる")
+        form.addRow("網点の間隔", self._pitch)
+
+        self._mode = QComboBox()
+        self._mode.addItem("カラー（RGB3版・版ごとに角度を変える）", "rgb")
+        self._mode.addItem("モノクロ（1版）", "mono")
+        form.addRow("種類", self._mode)
+
+        self._bg = QComboBox()
+        self._bg.addItem("白地に印刷", "white")
+        self._bg.addItem("背景は透明のまま", "transparent")
+        form.addRow("背景", self._bg)
+
+        self._smooth = QCheckBox("アンチエイリアスをかける")
+        self._smooth.setChecked(True)
+        form.addRow("", self._smooth)
+
+        layout.addLayout(form)
+
+        desc = QLabel("絵を印刷物のような網点（点々）に変換します。\n"
+                      "カラーは元画像の RGB 成分を3版に分解し、版ごとに\n"
+                      "角度を変えて重ねます（CMYK 分版ではありません）。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "pitch": self._pitch.value(),
+            "mode": self._mode.currentData(),
+            "background": self._bg.currentData(),
+            "smooth": self._smooth.isChecked(),
+        }
+
+
+def execute_halftone(layer_stack: LayerStack, source_layer: Layer,
+                     params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    pitch = max(3, int(params.get("pitch", 10)))
+    mode = params.get("mode", "rgb")
+    background = params.get("background", "white")
+    ss = 2 if params.get("smooth", True) else 1
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    # 透明部分は「紙の白」として扱う。そうしないと背景まで真っ黒な網点になる。
+    cover = (alpha / 255.0)[:, :, None]
+    on_white = rgb * cover + 255.0 * (1.0 - cover)
+
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    if mode == "mono":
+        # 明度が低いほど点を大きくする（インクが乗る量）
+        density = 255.0 - _luma(on_white)
+        dots = _halftone_plane(density, pitch, 45.0, ss).astype(np.float32)
+        out[:, :, :3] = 0.0
+        out[:, :, 3] = dots
+    else:
+        # 元画像の R/G/B 成分をそのまま3版に分解する（CMYK 分版ではない）。
+        # 各版は「その色の光がどれだけ強いか」を点の大きさで表し、
+        # 3版を加法混色で重ねると元の色に戻る。赤い面は赤い点が大きく、
+        # 緑青の点が小さくなる、という見え方になる。
+        # 版の角度は実際の印刷の慣用値に近い 15/75/0 度を使い、モアレを避ける。
+        angles = (15.0, 75.0, 0.0)
+        planes = []
+        for ch, ang in zip(range(3), angles):
+            density = on_white[:, :, ch]
+            planes.append(_halftone_plane(density, pitch, ang, ss).astype(np.float32) / 255.0)
+        if background == "white":
+            # 紙に刷る場合は減法混色。各版の点は「その色の光を吸うインク」なので、
+            # 濃度は 255-チャンネル値（暗いほど大きな点）で描き直す。
+            inks = []
+            for ch, ang in zip(range(3), angles):
+                density = 255.0 - on_white[:, :, ch]
+                inks.append(_halftone_plane(density, pitch, ang, ss).astype(np.float32) / 255.0)
+            # R版のインクは R 以外を吸う…ではなく、R成分そのものを落とす
+            out[:, :, 0] = 255.0 * (1.0 - inks[0])
+            out[:, :, 1] = 255.0 * (1.0 - inks[1])
+            out[:, :, 2] = 255.0 * (1.0 - inks[2])
+            out[:, :, 3] = 255.0
+        else:
+            out[:, :, 0] = planes[0] * 255.0
+            out[:, :, 1] = planes[1] * 255.0
+            out[:, :, 2] = planes[2] * 255.0
+            # どれか1版でも点が乗っていれば不透明にする
+            ink = np.maximum.reduce(planes)
+            out[:, :, 3] = ink * 255.0
+
+    if background == "white" and mode == "mono":
+        # 紙を敷く。網点が乗っていないところは白のまま残る。
+        # （カラーは上の分岐で紙ごと描き切っている）
+        a = (out[:, :, 3:4] / 255.0)
+        out[:, :, :3] = out[:, :, :3] * a + 255.0 * (1.0 - a)
+        out[:, :, 3] = 255.0
+
+    result = Layer(f"{source_layer.name} - 網点", w, h)
+    result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. ディザ / レトロ減色
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DitherDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ディザ / レトロ減色")
+        self.setMinimumWidth(320)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._method = QComboBox()
+        self._method.addItem("Bayer 4x4（規則的な網目・ゲーム機風）", "bayer")
+        self._method.addItem("誤差拡散（きめ細かい・粒状）", "diffusion")
+        form.addRow("ディザ方式", self._method)
+
+        self._levels = QSpinBox()
+        self._levels.setRange(2, 16)
+        self._levels.setValue(4)
+        self._levels.setToolTip("各色チャンネルの階調数。少ないほどレトロになる")
+        form.addRow("階調数", self._levels)
+
+        self._pixel = QSpinBox()
+        self._pixel.setRange(1, 16)
+        self._pixel.setValue(4)
+        self._pixel.setSuffix(" x")
+        self._pixel.setToolTip("ドットの粗さ。1 で等倍、大きいほど粗いドット絵になる")
+        form.addRow("ドットの粗さ", self._pixel)
+
+        layout.addLayout(form)
+
+        desc = QLabel("色数を落としてディザをかけ、レトロゲームの画面や\n"
+                      "初期パソコンの絵のような見た目にします。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "method": self._method.currentData(),
+            "levels": self._levels.value(),
+            "pixel": self._pixel.value(),
+        }
+
+
+def execute_dither(layer_stack: LayerStack, source_layer: Layer,
+                   params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    method = params.get("method", "bayer")
+    levels = max(2, int(params.get("levels", 4)))
+    pixel = max(1, int(params.get("pixel", 4)))
+    palette = params.get("palette")     # ガチャから色を渡された場合に使う
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3].copy(), arr[:, :, 3].copy()
+
+    # 先に縮小してから処理し、最後に最近傍で戻すと本物のドット絵になる
+    sw, sh = max(1, w // pixel), max(1, h // pixel)
+    if pixel > 1:
+        rgb = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
+        alpha = cv2.resize(alpha, (sw, sh), interpolation=cv2.INTER_AREA)
+
+    pal_arr = None
+    if palette:
+        pal_arr = np.array([[c.red(), c.green(), c.blue()] for c in palette],
+                           dtype=np.float32)
+
+    if method == "diffusion":
+        # Floyd-Steinberg。行ごとに誤差を配るので Python ループが要る。
+        # ドット粗さで縮小済みなので、実用的なサイズに収まる。
+        buf = rgb.copy()
+        step = 255.0 / (levels - 1)
+        for y in range(sh):
+            for x in range(sw):
+                old = buf[y, x].copy()
+                if pal_arr is not None:
+                    d = np.sum((pal_arr - old) ** 2, axis=1)
+                    new = pal_arr[int(np.argmin(d))]
+                else:
+                    new = np.round(old / step) * step
+                buf[y, x] = new
+                err = old - new
+                if x + 1 < sw:
+                    buf[y, x + 1] += err * (7 / 16)
+                if y + 1 < sh:
+                    if x > 0:
+                        buf[y + 1, x - 1] += err * (3 / 16)
+                    buf[y + 1, x] += err * (5 / 16)
+                    if x + 1 < sw:
+                        buf[y + 1, x + 1] += err * (1 / 16)
+        quant = np.clip(buf, 0, 255)
+    else:
+        # Bayer: しきい値マップを足してから量子化する
+        tile = np.tile(_BAYER4, (sh // 4 + 1, sw // 4 + 1))[:sh, :sw]
+        step = 255.0 / (levels - 1)
+        biased = rgb + (tile[:, :, None] - 0.5) * step
+        if pal_arr is not None:
+            quant = _quantize_to_palette(np.clip(biased, 0, 255), pal_arr)
+        else:
+            quant = np.clip(np.round(biased / step) * step, 0, 255)
+
+    # アルファもディザして、半透明の縁がドット絵らしく硬いエッジになるようにする
+    tile_a = np.tile(_BAYER4, (sh // 4 + 1, sw // 4 + 1))[:sh, :sw]
+    alpha_q = np.where(alpha > tile_a * 255.0, 255.0, 0.0)
+
+    out = np.dstack([quant, alpha_q]).astype(np.uint8)
+    if pixel > 1:
+        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    result = Layer(f"{source_layer.name} - ディザ", w, h)
+    result.image = _array_to_qimage(out)
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18. クロスハッチング（ペン画風陰影）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CrosshatchDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("クロスハッチング")
+        self.setMinimumWidth(320)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._spacing = QSpinBox()
+        self._spacing.setRange(3, 40)
+        self._spacing.setValue(8)
+        self._spacing.setSuffix(" px")
+        self._spacing.setToolTip("斜線の間隔。小さいほど密なペン画になる")
+        form.addRow("線の間隔", self._spacing)
+
+        self._thickness = QSpinBox()
+        self._thickness.setRange(1, 6)
+        self._thickness.setValue(1)
+        self._thickness.setSuffix(" px")
+        form.addRow("線の太さ", self._thickness)
+
+        self._layers_n = QSpinBox()
+        self._layers_n.setRange(1, 4)
+        self._layers_n.setValue(3)
+        self._layers_n.setToolTip("暗い部分に何段まで線を重ねるか")
+        form.addRow("重ねる段数", self._layers_n)
+
+        self._color_btn = _color_button(QColor(20, 20, 30), self)
+        form.addRow("線の色", self._color_btn)
+
+        layout.addLayout(form)
+
+        desc = QLabel("明るさに応じて斜線の密度を変え、ペン画や銅版画の\n"
+                      "ような手描きの陰影に置き換えます。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "spacing": self._spacing.value(),
+            "thickness": self._thickness.value(),
+            "layers": self._layers_n.value(),
+            "color": self._color_btn._color,
+        }
+
+
+def execute_crosshatch(layer_stack: LayerStack, source_layer: Layer,
+                       params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    spacing = max(3, int(params.get("spacing", 8)))
+    thickness = max(1, int(params.get("thickness", 1)))
+    n_layers = max(1, min(4, int(params.get("layers", 3))))
+    color: QColor = params.get("color") or QColor(20, 20, 30)
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    cover = (alpha / 255.0)[:, :, None]
+    on_white = rgb * cover + 255.0 * (1.0 - cover)
+    darkness = (255.0 - _luma(on_white)) / 255.0     # 0(明) 〜 1(暗)
+
+    # 段ごとに角度を変え、暗いところほど多くの段が乗るようにする。
+    # これで「暗い部分ほど線が密」というハッチング本来の効果になる。
+    angles = (45.0, -45.0, 0.0, 90.0)
+    ink = np.zeros((h, w), dtype=np.float32)
+    for i in range(n_layers):
+        # i 段目は darkness がこのしきい値を超えた領域にだけ乗る。
+        # しきい値を 0〜1 いっぱいに散らさないと、中間調で全段が一斉に乗って
+        # 濃淡が潰れ、どこも同じ密度の網に見えてしまう。
+        lo = i / n_layers
+        lines = _hatch_lines((h, w), angles[i], spacing, thickness).astype(np.float32) / 255.0
+        # しきい値付近でいきなり現れないよう、その段の幅ぶんで滑らかに立ち上げる
+        weight = np.clip((darkness - lo) * n_layers, 0.0, 1.0)
+        ink = np.maximum(ink, lines * weight)
+
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    out[:, :, 0], out[:, :, 1], out[:, :, 2] = _bgr(color)
+    # 元が透明だったところには描かない
+    out[:, :, 3] = ink * 255.0 * (alpha / 255.0)
+
+    result = Layer(f"{source_layer.name} - ハッチング", w, h)
+    result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19. VHS / 走査線ノイズ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VhsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("VHS / 走査線ノイズ")
+        self.setMinimumWidth(320)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._jitter = QSpinBox()
+        self._jitter.setRange(0, 60)
+        self._jitter.setValue(12)
+        self._jitter.setSuffix(" px")
+        self._jitter.setToolTip("行ごとの横ずれの最大量")
+        form.addRow("行ずれ", self._jitter)
+
+        self._bands = QSpinBox()
+        self._bands.setRange(0, 12)
+        self._bands.setValue(4)
+        self._bands.setToolTip("大きく乱れる帯の本数（テープの傷）")
+        form.addRow("ノイズ帯", self._bands)
+
+        self._scanline = QSpinBox()
+        self._scanline.setRange(0, 100)
+        self._scanline.setValue(35)
+        self._scanline.setSuffix(" %")
+        form.addRow("走査線の濃さ", self._scanline)
+
+        self._scan_pitch = QSpinBox()
+        self._scan_pitch.setRange(2, 16)
+        self._scan_pitch.setValue(3)
+        self._scan_pitch.setSuffix(" px")
+        self._scan_pitch.setToolTip("走査線の間隔。大きいほど粗い画面になる")
+        form.addRow("走査線の間隔", self._scan_pitch)
+
+        self._noise = QSpinBox()
+        self._noise.setRange(0, 100)
+        self._noise.setValue(20)
+        self._noise.setSuffix(" %")
+        form.addRow("ざらつき", self._noise)
+
+        layout.addLayout(form)
+
+        desc = QLabel("行ずれ・ノイズ帯・走査線を重ねて、古いビデオテープを\n"
+                      "再生したような映像の乱れを作ります。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "jitter": self._jitter.value(),
+            "bands": self._bands.value(),
+            "scanline": self._scanline.value() / 100.0,
+            "scan_pitch": self._scan_pitch.value(),
+            "noise": self._noise.value() / 100.0,
+        }
+
+
+def execute_vhs(layer_stack: LayerStack, source_layer: Layer,
+                params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    jitter = max(0, int(params.get("jitter", 12)))
+    bands = max(0, int(params.get("bands", 4)))
+    scan_amt = float(params.get("scanline", 0.35))
+    scan_pitch = max(2, int(params.get("scan_pitch", 3)))
+    noise_amt = float(params.get("noise", 0.2))
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+
+    # 行ごとの横ずれ量。ゆるやかな波＋乱数で、テープの揺れらしくする。
+    rows = np.arange(h, dtype=np.float32)
+    wave = np.sin(rows / max(3.0, h / 40.0)) * (jitter * 0.4)
+    shift = wave + np.random.uniform(-jitter * 0.6, jitter * 0.6, size=h)
+
+    # ノイズ帯: 数行まとめて大きくずらす（テープの傷）
+    for _ in range(bands):
+        by = random.randint(0, max(0, h - 1))
+        bh = random.randint(2, max(3, h // 60))
+        amp = random.uniform(jitter * 1.5, jitter * 3.0 + 4.0)
+        shift[by:by + bh] += amp * random.choice([-1.0, 1.0])
+
+    shifted = arr.copy()
+    for y in range(h):
+        s = int(round(shift[y]))
+        if s:
+            shifted[y] = np.roll(arr[y], s, axis=0)
+
+    # 走査線: 一定間隔の行を暗くする
+    if scan_amt > 0:
+        line = np.ones(h, dtype=np.float32)
+        line[::scan_pitch] = 1.0 - scan_amt
+        shifted[:, :, :3] *= line[:, None, None]
+
+    # ざらつき
+    if noise_amt > 0:
+        n = np.random.normal(0.0, 32.0 * noise_amt, (h, w, 1)).astype(np.float32)
+        shifted[:, :, :3] += n
+
+    out = np.clip(shifted, 0, 255).astype(np.uint8)
+    result = Layer(f"{source_layer.name} - VHS", w, h)
+    result.image = _array_to_qimage(out)
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20. CRT / LED 画面
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CrtDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CRT / LED 画面")
+        self.setMinimumWidth(320)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._kind = QComboBox()
+        self._kind.addItem("CRT（縦ストライプ＋走査線）", "crt")
+        self._kind.addItem("LED（格子状のドット）", "led")
+        form.addRow("種類", self._kind)
+
+        self._cell = QSpinBox()
+        self._cell.setRange(2, 16)
+        self._cell.setValue(6)
+        self._cell.setSuffix(" px")
+        self._cell.setToolTip("1画素のセルサイズ。小さすぎると縮小表示で\n"
+                              "ただ暗くなっただけに見えるので 4px 以上を推奨")
+        form.addRow("セルサイズ", self._cell)
+
+        self._bloom = QSpinBox()
+        self._bloom.setRange(0, 100)
+        self._bloom.setValue(45)
+        self._bloom.setSuffix(" %")
+        self._bloom.setToolTip("明るい部分のにじみ光。画面が光っている感じになる")
+        form.addRow("ブルーム", self._bloom)
+
+        self._boost = QSpinBox()
+        self._boost.setRange(100, 300)
+        self._boost.setValue(160)
+        self._boost.setSuffix(" %")
+        self._boost.setToolTip("マスクを掛けると必ず暗くなるので、その補正")
+        form.addRow("明るさ補正", self._boost)
+
+        self._sat = QSpinBox()
+        self._sat.setRange(50, 250)
+        self._sat.setValue(120)
+        self._sat.setSuffix(" %")
+        form.addRow("彩度補正", self._sat)
+
+        layout.addLayout(form)
+
+        desc = QLabel("RGB のサブピクセルと走査線を重ねて、ブラウン管や\n"
+                      "LED パネルに映した画面のように見せます。\n"
+                      "セルサイズが小さいと効果が見えにくいので注意。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "kind": self._kind.currentData(),
+            "cell": self._cell.value(),
+            "bloom": self._bloom.value() / 100.0,
+            "boost": self._boost.value() / 100.0,
+            "saturation": self._sat.value() / 100.0,
+        }
+
+
+def execute_crt(layer_stack: LayerStack, source_layer: Layer,
+                params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    kind = params.get("kind", "crt")
+    cell = max(2, int(params.get("cell", 6)))
+    bloom_amt = float(params.get("bloom", 0.45))
+    boost = float(params.get("boost", 1.6))
+    sat = float(params.get("saturation", 1.2))
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3].copy(), arr[:, :, 3].copy()
+
+    # セル単位に量子化して「画素」を作る。
+    # w//cell で割り切れないと縮小→拡大でセル格子がずれるので、
+    # 一度セルの整数倍サイズに合わせてから戻す。
+    sw, sh = max(1, w // cell), max(1, h // cell)
+    pw, ph = sw * cell, sh * cell
+    orig_alpha = alpha.copy()
+
+    def _cellify(a: np.ndarray) -> np.ndarray:
+        cropped = a[:ph, :pw]
+        small = cv2.resize(cropped, (sw, sh), interpolation=cv2.INTER_AREA)
+        big = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_NEAREST)
+        if (pw, ph) != (w, h):
+            # 端数はセル化せず元のまま残す（絵が欠けるより自然）
+            out = a.copy()
+            out[:ph, :pw] = big
+            return out
+        return big
+
+    rgb = _cellify(rgb)
+    alpha = _cellify(alpha)
+    # セル化で alpha が元の絵の外へにじむと、何もなかった場所に
+    # 四角い画素が浮いてしまう。元が完全に透明だった所は透明に戻す。
+    alpha = np.where(orig_alpha > 0, alpha, 0.0)
+
+    # 彩度・明るさの補正（マスクで暗くなるぶんを先に持ち上げる）
+    if abs(sat - 1.0) > 0.01:
+        gray = _luma(rgb)[:, :, None]
+        rgb = gray + (rgb - gray) * sat
+    rgb = rgb * boost
+
+    # ブルーム: 明るい部分だけを取り出してぼかし、加算で戻す
+    if bloom_amt > 0:
+        bright = np.clip(rgb - 140.0, 0, None)
+        k = max(3, (cell * 2) | 1)
+        glow = cv2.GaussianBlur(bright, (k, k), 0)
+        rgb = rgb + glow * bloom_amt
+
+    # サブピクセルマスク
+    xs = np.arange(w)
+    ys = np.arange(h)
+    mask = np.ones((h, w, 3), dtype=np.float32)
+    third = max(1, cell // 3)
+    # 横方向を3等分し、R/G/B のストライプにする（アパーチャグリル）
+    band = (xs % cell) // third
+    band = np.clip(band, 0, 2)
+    for ch in range(3):
+        mask[:, :, ch] = np.where(band == ch, 1.0, 0.25)[None, :]
+
+    if kind == "led":
+        # LED はセルの外周を暗くして、粒が独立して見えるようにする
+        gap_x = ((xs % cell) >= cell - max(1, cell // 4))[None, :, None]
+        gap_y = ((ys % cell) >= cell - max(1, cell // 4))[:, None, None]
+        mask = mask * np.where(gap_x | gap_y, 0.15, 1.0)
+    else:
+        # CRT は走査線（横方向の暗い線）
+        scan = np.where((ys % cell) >= cell - max(1, cell // 3), 0.45, 1.0)
+        mask = mask * scan[:, None, None]
+
+    rgb = rgb * mask
+
+    out = np.dstack([np.clip(rgb, 0, 255), np.clip(alpha, 0, 255)]).astype(np.uint8)
+    result = Layer(f"{source_layer.name} - {'LED' if kind == 'led' else 'CRT'}", w, h)
+    result.image = _array_to_qimage(out)
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 21. アクションガチャ
 # ═══════════════════════════════════════════════════════════════════════════════
 
 GACHA_PALETTES: list[tuple[str, list[str]]] = [
@@ -2251,8 +2951,12 @@ _GACHA_POOL: list[tuple[str, str]] = [
     ("collage", "切り絵"),
     ("wobble", "線の揺らぎ"),
     ("stamp", "スタンプ劣化"),
-    ("kaleido", "万華鏡"),
     ("contour", "等高線"),
+    ("halftone", "網点"),
+    ("dither", "ディザ"),
+    ("crosshatch", "ハッチング"),
+    ("vhs", "VHS"),
+    ("crt", "CRT/LED"),
 ]
 
 
@@ -2332,12 +3036,34 @@ def _gacha_random_params(key: str, colors: list[QColor]) -> dict:
         return {"strength": ri(3, 18), "wavelength": ri(30, 180),
                 "gap": ri(0, 40)}
     if key == "stamp":
-        return {"strength": ri(20, 60), "grain": ri(1, 5), "blots": rb(0.6)}
-    if key == "kaleido":
-        return {"segments": random.choice([3, 4, 5, 6, 8]), "mirror": rb(0.6)}
+        lo = ri(1, 5)
+        return {"strength": ri(20, 60), "grain": ri(1, 5), "blots": rb(0.6),
+                "blot_min": lo, "blot_max": lo + ri(1, 8),
+                # 7割は線の色になじませ、たまにパレットの色を差す
+                "blot_color": None if rb(0.7) else pick()}
     if key == "contour":
         return {"count": ri(2, 6), "spacing": ri(8, 30),
                 "color": pick(), "thickness": ri(1, 4), "fade": rb(0.7)}
+    if key == "halftone":
+        return {"pitch": ri(6, 20), "mode": "rgb" if rb(0.75) else "mono",
+                "background": "white" if rb(0.6) else "transparent",
+                "smooth": True}
+    if key == "dither":
+        # パレットを渡すとガチャの配色でそのまま減色される
+        return {"method": random.choice(["bayer", "diffusion"]),
+                "levels": ri(2, 6), "pixel": ri(2, 8),
+                "palette": colors if rb(0.6) else None}
+    if key == "crosshatch":
+        return {"spacing": ri(5, 16), "thickness": ri(1, 3),
+                "layers": ri(2, 4), "color": dark if rb(0.7) else pick()}
+    if key == "vhs":
+        return {"jitter": ri(4, 30), "bands": ri(1, 8),
+                "scanline": ru(0.15, 0.55), "scan_pitch": ri(2, 6),
+                "noise": ru(0.05, 0.4)}
+    if key == "crt":
+        return {"kind": "crt" if rb(0.6) else "led", "cell": ri(4, 12),
+                "bloom": ru(0.2, 0.8), "boost": ru(1.3, 2.2),
+                "saturation": ru(1.0, 1.8)}
     return {}
 
 
@@ -2354,8 +3080,12 @@ _GACHA_EXEC = {
     "collage": execute_collage,
     "wobble": execute_wobble,
     "stamp": execute_stamp,
-    "kaleido": execute_kaleidoscope,
     "contour": execute_contour,
+    "halftone": execute_halftone,
+    "dither": execute_dither,
+    "crosshatch": execute_crosshatch,
+    "vhs": execute_vhs,
+    "crt": execute_crt,
 }
 
 
@@ -2546,8 +3276,12 @@ class ActionPanel(QWidget):
             ("✂️ 切り絵コラージュ", "閉じた領域を色紙でランダムに塗る", self._on_collage),
             ("〽️ 線の揺らぎ", "線を波打たせて別テイクを作る", self._on_wobble),
             ("🪧 スタンプ劣化", "はんこ風にかすれさせる", self._on_stamp),
-            ("❄️ 万華鏡", "回転コピーで万華鏡模様", self._on_kaleidoscope),
             ("🗺️ 等高線", "外側に輪郭線を何重にも生成", self._on_contour),
+            ("🔴 カラーハーフトーン", "印刷物のような網点ドットに変換", self._on_halftone),
+            ("👾 ディザ / レトロ減色", "色数を落としてレトロゲーム画面風に", self._on_dither),
+            ("✒️ クロスハッチング", "明暗を斜線の密度に置き換えてペン画風に", self._on_crosshatch),
+            ("📼 VHS / 走査線ノイズ", "行ずれ・ノイズ帯・走査線で古い映像風に", self._on_vhs),
+            ("🖥️ CRT / LED 画面", "RGBサブピクセルと走査線で画面越しの絵に", self._on_crt),
         ]
         for text, tip, slot in actions:
             btn = QPushButton(text)
@@ -2624,11 +3358,23 @@ class ActionPanel(QWidget):
     def _on_stamp(self):
         self._run("スタンプ劣化", StampDialog, execute_stamp)
 
-    def _on_kaleidoscope(self):
-        self._run("万華鏡", KaleidoDialog, execute_kaleidoscope)
-
     def _on_contour(self):
         self._run("等高線", ContourDialog, execute_contour)
+
+    def _on_halftone(self):
+        self._run("カラーハーフトーン", HalftoneDialog, execute_halftone)
+
+    def _on_dither(self):
+        self._run("ディザ / レトロ減色", DitherDialog, execute_dither)
+
+    def _on_crosshatch(self):
+        self._run("クロスハッチング", CrosshatchDialog, execute_crosshatch)
+
+    def _on_vhs(self):
+        self._run("VHS / 走査線ノイズ", VhsDialog, execute_vhs)
+
+    def _on_crt(self):
+        self._run("CRT / LED 画面", CrtDialog, execute_crt)
 
     def _on_gacha(self):
         self._run("アクションガチャ", GachaDialog, execute_gacha)

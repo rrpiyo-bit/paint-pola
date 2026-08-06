@@ -413,7 +413,9 @@ class TestPopout:
 
 from actions import (
     execute_offset_border, execute_silkscreen, execute_collage,
-    execute_wobble, execute_stamp, execute_kaleidoscope, execute_contour,
+    execute_wobble, execute_stamp, execute_contour,
+    execute_halftone, execute_dither, execute_crosshatch,
+    execute_vhs, execute_crt,
     execute_gacha, execute_path_repeat,
     _gacha_random_params, _gacha_random_path,
     _GACHA_POOL, _GACHA_EXEC, GACHA_PALETTES,
@@ -525,24 +527,113 @@ class TestStamp:
         after = _alpha_count(result.image)
         assert 0 < after < before
 
+    def test_blot_color_is_applied_exactly(self):
+        """指定した色がそのままインク溜まりに出る。
 
-class TestKaleidoscope:
-    def test_multiplies(self):
-        ls, layer = _make_stack_with_lineart()
-        # 非対称な図形にする
-        layer.image.fill(Qt.GlobalColor.transparent)
-        p = QPainter(layer.image)
-        p.fillRect(10, 10, 20, 10, QColor(0, 0, 0)); p.end()
-        before = _alpha_count(layer.image)
-        result = execute_kaleidoscope(ls, layer, {"segments": 4, "mirror": True})
-        assert result is not None
-        assert result.image.width() == ls.width
-        assert _alpha_count(result.image) > before
-
-    def test_offset_source(self):
+        赤成分と青成分が明確に違う色を使うこと。配列は BGRA 順なので、
+        (255,0,128) のような紛らわしい色だと入れ替わっていても気付けない。
+        判定も生配列ではなく QColor 経由で行う。
+        """
+        import numpy as np
         ls, layer = _make_stack_with_closed_shape()
-        layer.offset_x = 10; layer.offset_y = -5
-        assert execute_kaleidoscope(ls, layer, {"segments": 3, "mirror": False}) is not None
+        target = QColor(200, 30, 40)
+        result = execute_stamp(ls, layer, {
+            "strength": 40, "grain": 3, "blots": True,
+            "blot_min": 8, "blot_max": 12, "blot_color": target})
+        arr = _qimage_to_array_test(result.image)
+        ys, xs = np.nonzero(arr[:, :, 3] == 255)
+        found = set()
+        for y, x in zip(ys, xs):
+            c = result.image.pixelColor(int(x), int(y))
+            found.add((c.red(), c.green(), c.blue()))
+        assert (200, 30, 40) in found
+
+    def test_blot_size_range_changes_area(self):
+        """半径を大きくするとインク溜まりの面積が増える。"""
+        import numpy as np
+
+        def blot_area(r_min, r_max):
+            total = 0
+            for _ in range(6):
+                ls, layer = _make_stack_with_closed_shape()
+                result = execute_stamp(ls, layer, {
+                    "strength": 5, "grain": 3, "blots": True,
+                    "blot_min": r_min, "blot_max": r_max,
+                    "blot_color": QColor(255, 0, 0)})
+                a = _qimage_to_array_test(result.image)
+                # 純赤なので、チャンネル順に関係なく「255 と 0 の組」で数えられる
+                total += int(((a[:, :, :3].max(axis=2) == 255) &
+                              (a[:, :, :3].min(axis=2) == 0) &
+                              (a[:, :, 3] == 255)).sum())
+            return total / 6
+
+        assert blot_area(12, 16) > blot_area(1, 2) * 3
+
+    def test_reversed_min_max_is_tolerated(self):
+        """最小 > 最大 で渡っても落ちない（入れ替えて処理する）。"""
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_stamp(ls, layer, {
+            "strength": 40, "grain": 3, "blots": True,
+            "blot_min": 12, "blot_max": 3, "blot_color": None})
+        assert result is not None
+
+    def test_auto_color_uses_line_color(self):
+        """色指定なしなら線の色になじむ（従来の挙動を維持）。"""
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_stamp(ls, layer, {
+            "strength": 40, "grain": 3, "blots": True,
+            "blot_min": 4, "blot_max": 8, "blot_color": None})
+        assert result is not None
+        assert _has_nonzero_pixels(result.image)
+
+    def test_works_without_new_params(self):
+        """新パラメータを渡さない古い呼び出しでも動く。"""
+        ls, layer = _make_stack_with_closed_shape()
+        result = execute_stamp(ls, layer, {
+            "strength": 40, "grain": 3, "blots": True})
+        assert result is not None
+
+    def test_gacha_params_have_valid_range(self):
+        """ガチャが作る半径は必ず 最小 <= 最大。"""
+        colors = [QColor(c) for c in GACHA_PALETTES[0][1]]
+        for _ in range(30):
+            params = _gacha_random_params("stamp", colors)
+            assert 1 <= params["blot_min"] <= params["blot_max"]
+
+
+class TestStampDialogUI:
+    """スタンプ劣化ダイアログの入力制御。"""
+
+    def test_min_max_interlock(self):
+        from actions import StampDialog
+        dlg = StampDialog()
+        dlg._blot_min.setValue(20)
+        assert dlg._blot_max.value() >= 20
+        dlg._blot_max.setValue(3)
+        assert dlg._blot_min.value() <= 3
+
+    def test_color_button_follows_auto_checkbox(self):
+        from actions import StampDialog
+        dlg = StampDialog()
+        assert dlg._auto_color.isChecked()
+        assert not dlg._blot_color.isEnabled()
+        dlg._auto_color.setChecked(False)
+        assert dlg._blot_color.isEnabled()
+        assert dlg.params()["blot_color"] is not None
+
+    def test_disabling_blots_disables_sub_controls(self):
+        from actions import StampDialog
+        dlg = StampDialog()
+        dlg._blots.setChecked(False)
+        assert not dlg._blot_min.isEnabled()
+        assert not dlg._blot_max.isEnabled()
+        assert not dlg._blot_color.isEnabled()
+
+    def test_default_params_keep_previous_behaviour(self):
+        from actions import StampDialog
+        params = StampDialog().params()
+        assert params["blot_min"] == 2 and params["blot_max"] == 6
+        assert params["blot_color"] is None
 
 
 class TestContour:
@@ -581,6 +672,21 @@ class TestGacha:
         assert ls.layers[0] is result
         assert not layer.visible
 
+    def test_gacha_never_produces_empty_result(self):
+        """どの組み合わせを引いても絵が消えない。
+
+        1回だけ引くテストでは、絵が消える効果の組み合わせを
+        数%の確率でしか踏まず、失敗が再現しにくい。
+        シードを固定して多数回引き、確実に検出する。
+        """
+        import random
+        for seed in range(60):
+            random.seed(seed)
+            ls, layer = _make_stack_with_closed_shape()
+            result = execute_gacha(ls, layer, {"count": 0, "palette": "auto"})
+            assert result is not None, seed
+            assert _has_nonzero_pixels(result.image), (seed, result.name)
+
     def test_gacha_palette_choice(self):
         ls, layer = _make_stack_with_closed_shape()
         result = execute_gacha(ls, layer, {"count": 2, "palette": "レトロ印刷"})
@@ -597,48 +703,6 @@ class TestGacha:
         ls = LayerStack(W, H)
         group = ls.add_group("g")
         assert execute_gacha(ls, group, {"count": 0, "palette": "auto"}) is None
-
-
-class TestKaleidoscopeWedge:
-    """扇形クリップ方式（コピー同士が重ならない）の検証。"""
-
-    def _asym_stack(self):
-        ls = LayerStack(W, H)
-        layer = ls.add("非対称")
-        p = QPainter(layer.image)
-        p.fillRect(60, 20, 25, 12, QColor(0, 0, 0))
-        p.end()
-        return ls, layer
-
-    def test_rotational_symmetry(self):
-        # 各扇形は扇形0の回転コピーなので、90°回転で自己一致するはず
-        import numpy as np
-        ls, layer = self._asym_stack()
-        result = execute_kaleidoscope(ls, layer, {"segments": 4, "mirror": False})
-        assert result is not None
-        m = (_qimage_alpha(result.image) > 40).astype(np.uint8)
-        rot = np.rot90(m, 1)
-        total = int(m.sum())
-        assert total > 0
-        assert int((m != rot).sum()) <= total * 0.2
-
-    def test_mirror_symmetry(self):
-        # segments=2 + mirror: 上下扇形が境界(y=中心)で鏡映
-        import numpy as np
-        ls, layer = self._asym_stack()
-        result = execute_kaleidoscope(ls, layer, {"segments": 2, "mirror": True})
-        assert result is not None
-        m = (_qimage_alpha(result.image) > 40).astype(np.uint8)
-        total = int(m.sum())
-        assert total > 0
-        assert int((m != np.flipud(m)).sum()) <= total * 0.2
-
-    def test_corner_content_not_lost(self):
-        # 絵柄が隅にあっても前回転で扇形0に入り、結果が空にならない
-        ls, layer = self._asym_stack()
-        result = execute_kaleidoscope(ls, layer, {"segments": 6, "mirror": True})
-        assert result is not None
-        assert _alpha_count(result.image) > 100
 
 
 def _qimage_alpha(img: QImage):
@@ -696,3 +760,373 @@ def _qimage_to_array_test(img: QImage):
     ptr.setsize(img32.height() * img32.width() * 4)
     return np.frombuffer(ptr, dtype=np.uint8).reshape(
         img32.height(), img32.width(), 4).copy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 網点 / ディザ / ハッチング / VHS / CRT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_colorful_stack(size=120) -> tuple[LayerStack, Layer]:
+    """明暗・色味に差のある図形を持つレイヤー。階調が絡む効果の検証用。"""
+    ls = LayerStack(size, size)
+    layer = ls.add("カラー")
+    p = QPainter(layer.image)
+    p.fillRect(10, 10, 60, 60, QColor(220, 60, 90, 255))
+    p.fillRect(50, 50, 60, 60, QColor(60, 120, 220, 255))
+    p.fillRect(20, 80, 30, 25, QColor(30, 30, 30, 255))
+    p.end()
+    return ls, layer
+
+
+# 各効果の (実行関数, 既定パラメータ, 結果レイヤー名の一部)
+_NEW_EFFECTS = [
+    (execute_halftone,
+     {"pitch": 8, "mode": "rgb", "background": "white", "smooth": True},
+     "網点"),
+    (execute_dither,
+     {"method": "bayer", "levels": 4, "pixel": 3},
+     "ディザ"),
+    (execute_crosshatch,
+     {"spacing": 6, "thickness": 1, "layers": 3, "color": QColor(20, 20, 30)},
+     "ハッチング"),
+    (execute_vhs,
+     {"jitter": 8, "bands": 2, "scanline": 0.35, "scan_pitch": 3, "noise": 0.2},
+     "VHS"),
+    (execute_crt,
+     {"kind": "crt", "cell": 6, "bloom": 0.4, "boost": 1.6, "saturation": 1.2},
+     "CRT"),
+]
+
+
+class TestNewEffectsCommon:
+    """5効果に共通する契約（グループ拒否・offset維持・非空出力）。"""
+
+    @pytest.mark.parametrize("fn,params,name", _NEW_EFFECTS)
+    def test_produces_visible_result(self, fn, params, name):
+        ls, layer = _make_colorful_stack()
+        result = fn(ls, layer, params)
+        assert result is not None
+        assert name in result.name
+        assert _has_nonzero_pixels(result.image)
+
+    @pytest.mark.parametrize("fn,params,name", _NEW_EFFECTS)
+    def test_rejects_group_layer(self, fn, params, name):
+        ls, _ = _make_colorful_stack()
+        group = GroupLayer("グループ", W, H)
+        assert fn(ls, group, params) is None
+
+    @pytest.mark.parametrize("fn,params,name", _NEW_EFFECTS)
+    def test_keeps_offset_and_hides_source(self, fn, params, name):
+        ls, layer = _make_colorful_stack()
+        layer.offset_x, layer.offset_y = 23, 41
+        result = fn(ls, layer, params)
+        assert (result.offset_x, result.offset_y) == (23, 41)
+        # 元レイヤーは残るが非表示になる（他の効果と同じ振る舞い）
+        assert layer.visible is False
+        assert layer in ls.layers
+
+    @pytest.mark.parametrize("fn,params,name", _NEW_EFFECTS)
+    def test_result_size_matches_source(self, fn, params, name):
+        ls, layer = _make_colorful_stack()
+        result = fn(ls, layer, params)
+        assert result.image.width() == layer.image.width()
+        assert result.image.height() == layer.image.height()
+
+
+class TestHalftone:
+    def test_mono_mode_is_monochrome(self):
+        """モノクロ版は黒インクだけで描かれる。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        result = execute_halftone(ls, layer, {
+            "pitch": 8, "mode": "mono", "background": "transparent",
+            "smooth": True})
+        arr = _qimage_to_array_test(result.image)
+        op = arr[arr[:, :, 3] > 0]
+        assert len(op) > 0
+        assert op[:, :3].max() == 0   # RGB は全て 0（黒）
+
+    def test_white_background_is_opaque(self):
+        """白地に印刷を選ぶと全面が不透明になる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_halftone(ls, layer, {
+            "pitch": 8, "mode": "rgb", "background": "white", "smooth": True})
+        arr = _qimage_to_array_test(result.image)
+        assert (arr[:, :, 3] == 255).all()
+
+    def test_transparent_background_leaves_holes(self):
+        """透明のままを選ぶと点の隙間が透ける。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_halftone(ls, layer, {
+            "pitch": 8, "mode": "rgb", "background": "transparent",
+            "smooth": True})
+        arr = _qimage_to_array_test(result.image)
+        assert (arr[:, :, 3] == 0).any()
+
+    def test_finer_pitch_makes_more_dots(self):
+        """網点を細かくするほど点の数が増える。
+
+        濃い面では点どうしがくっついて数えられなくなるので、
+        点が確実に離れて並ぶ淡いグレー一色の絵で数える。
+        """
+        import cv2
+        import numpy as np
+        base = {"mode": "mono", "background": "transparent", "smooth": False}
+
+        def dot_count(pitch):
+            ls = LayerStack(120, 120)
+            layer = ls.add("淡いグレー")
+            p = QPainter(layer.image)
+            p.fillRect(0, 0, 120, 120, QColor(200, 200, 200, 255))
+            p.end()
+            r = execute_halftone(ls, layer, {**base, "pitch": pitch})
+            # くっきりした点だけを数える（アンチエイリアスの裾を拾わない）
+            mask = (_qimage_to_array_test(r.image)[:, :, 3] > 128).astype(np.uint8)
+            # 連結成分数 - 1（背景ぶん）＝ 点の個数
+            return cv2.connectedComponents(mask)[0] - 1
+
+        assert dot_count(6) > dot_count(20)
+
+    def test_thin_lineart_still_gets_dots(self):
+        """細い線画でも網点が消えない。
+
+        セル中心の1ピクセルだけを読むと、線がセル中心を外れた瞬間に
+        濃度0とみなされ、結果が真っ白（＝完全に透明）になっていた。
+        ガチャで網点を引くと約2%の確率で絵が消える原因だった。
+        """
+        for mode in ("mono", "rgb"):
+            for background in ("transparent", "white"):
+                ls, layer = _make_stack_with_closed_shape()  # 細い線の円
+                result = execute_halftone(ls, layer, {
+                    "pitch": 7, "mode": mode, "background": background,
+                    "smooth": True})
+                assert result is not None
+                arr = _qimage_to_array_test(result.image)
+                if background == "transparent":
+                    ink = int((arr[:, :, 3] > 0).sum())
+                else:
+                    # 白地なので「白より暗いピクセル」がインク
+                    ink = int((arr[:, :, :3].min(axis=2) < 200).sum())
+                assert ink > 0, (mode, background)
+
+    def test_tone_is_preserved(self):
+        """網点の面積が元の濃度に比例する（中間調が黒く潰れない）。
+
+        点の半径をセルの対角まで伸ばすと中間調で隣の点とつながり、
+        灰色が真っ黒になってしまう。その退行を防ぐための検証。
+        """
+        import numpy as np
+        for tone in (200, 128, 60):
+            ls = LayerStack(160, 160)
+            layer = ls.add("べた")
+            p = QPainter(layer.image)
+            p.fillRect(0, 0, 160, 160, QColor(tone, tone, tone, 255))
+            p.end()
+            result = execute_halftone(ls, layer, {
+                "pitch": 10, "mode": "mono", "background": "white",
+                "smooth": True})
+            arr = _qimage_to_array_test(result.image).astype(float)
+            # 白地に黒インクなので、平均の明るさが元の濃度に近いはず
+            got = arr[:, :, :3].mean()
+            assert abs(got - tone) < 45, (tone, got)
+
+
+class TestDither:
+    def test_reduces_color_count(self):
+        """減色後の色数は階調数から決まる上限に収まる。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        result = execute_dither(ls, layer, {
+            "method": "bayer", "levels": 2, "pixel": 1})
+        arr = _qimage_to_array_test(result.image)
+        op = arr[arr[:, :, 3] > 0]
+        # levels=2 なら各チャンネル 0 か 255 の 2 値 → 最大 8 色
+        assert len(np.unique(op[:, :3], axis=0)) <= 8
+
+    def test_palette_restricts_colors(self):
+        """パレットを渡すとその色だけで構成される（ガチャ経路）。"""
+        import numpy as np
+        palette = [QColor(255, 0, 0), QColor(0, 0, 255)]
+        ls, layer = _make_colorful_stack()
+        result = execute_dither(ls, layer, {
+            "method": "bayer", "levels": 4, "pixel": 1, "palette": palette})
+        arr = _qimage_to_array_test(result.image)
+        op = arr[arr[:, :, 3] > 0]
+        used = {tuple(int(v) for v in c) for c in np.unique(op[:, :3], axis=0)}
+        assert used <= {(255, 0, 0), (0, 0, 255)}
+
+    def test_diffusion_method_runs(self):
+        ls, layer = _make_colorful_stack()
+        result = execute_dither(ls, layer, {
+            "method": "diffusion", "levels": 3, "pixel": 4})
+        assert result is not None
+        assert _has_nonzero_pixels(result.image)
+
+    def test_alpha_is_binarized(self):
+        """ドット絵らしく半透明の縁が残らない。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        result = execute_dither(ls, layer, {
+            "method": "bayer", "levels": 4, "pixel": 2})
+        arr = _qimage_to_array_test(result.image)
+        assert set(np.unique(arr[:, :, 3]).tolist()) <= {0, 255}
+
+
+class TestCrosshatch:
+    def test_uses_specified_color(self):
+        """指定色がそのまま出る。
+
+        赤と青が明確に違う色を QColor 経由で確認する（BGRA 入れ替わり検出）。
+        """
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        result = execute_crosshatch(ls, layer, {
+            "spacing": 6, "thickness": 2, "layers": 3,
+            "color": QColor(200, 30, 40)})
+        arr = _qimage_to_array_test(result.image)
+        ys, xs = np.nonzero(arr[:, :, 3] > 200)
+        assert len(xs) > 0
+        c = result.image.pixelColor(int(xs[0]), int(ys[0]))
+        assert (c.red(), c.green(), c.blue()) == (200, 30, 40)
+
+    def test_darker_areas_get_more_ink(self):
+        """暗い領域ほどハッチングが密になる。"""
+        size = 120
+        ls = LayerStack(size, size)
+        layer = ls.add("明暗")
+        p = QPainter(layer.image)
+        p.fillRect(0, 0, size // 2, size, QColor(230, 230, 230, 255))  # 明
+        p.fillRect(size // 2, 0, size // 2, size, QColor(15, 15, 15, 255))  # 暗
+        p.end()
+        result = execute_crosshatch(ls, layer, {
+            "spacing": 6, "thickness": 1, "layers": 3,
+            "color": QColor(0, 0, 0)})
+        a = _qimage_to_array_test(result.image)[:, :, 3]
+        light_ink = int((a[:, :size // 2] > 0).sum())
+        dark_ink = int((a[:, size // 2:] > 0).sum())
+        assert dark_ink > light_ink
+
+    def test_no_ink_outside_original_shape(self):
+        """元が透明だった場所には線を引かない。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_crosshatch(ls, layer, {
+            "spacing": 5, "thickness": 1, "layers": 3,
+            "color": QColor(0, 0, 0)})
+        src = _qimage_to_array_test(layer.image)
+        out = _qimage_to_array_test(result.image)
+        assert not ((out[:, :, 3] > 0) & (src[:, :, 3] == 0)).any()
+
+
+class TestVhs:
+    def test_changes_pixels(self):
+        """行ずれ・ノイズで元と異なる絵になる。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        before = _qimage_to_array_test(layer.image)
+        result = execute_vhs(ls, layer, {
+            "jitter": 10, "bands": 3, "scanline": 0.4,
+            "scan_pitch": 3, "noise": 0.25})
+        after = _qimage_to_array_test(result.image)
+        assert not np.array_equal(before, after)
+
+    def test_zero_settings_keep_image_intact(self):
+        """全て 0 なら元の絵をほぼそのまま返す（副作用がないことの確認）。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        before = _qimage_to_array_test(layer.image)
+        result = execute_vhs(ls, layer, {
+            "jitter": 0, "bands": 0, "scanline": 0.0,
+            "scan_pitch": 3, "noise": 0.0})
+        after = _qimage_to_array_test(result.image)
+        assert np.array_equal(before, after)
+
+    def test_scanlines_darken_periodically(self):
+        """走査線だけを効かせると一定間隔の行が暗くなる。"""
+        size = 60
+        ls = LayerStack(size, size)
+        layer = ls.add("べた")
+        p = QPainter(layer.image)
+        p.fillRect(0, 0, size, size, QColor(200, 200, 200, 255))
+        p.end()
+        result = execute_vhs(ls, layer, {
+            "jitter": 0, "bands": 0, "scanline": 0.5,
+            "scan_pitch": 3, "noise": 0.0})
+        arr = _qimage_to_array_test(result.image).astype(float)
+        rows = arr[:, :, :3].mean(axis=(1, 2))
+        assert rows[0] < rows[1]   # 0行目が走査線
+
+
+class TestCrt:
+    def test_crt_and_led_differ(self):
+        """CRT と LED はマスク形状が違うので結果も異なる。"""
+        import numpy as np
+        base = {"cell": 6, "bloom": 0.4, "boost": 1.6, "saturation": 1.2}
+        ls1, l1 = _make_colorful_stack()
+        ls2, l2 = _make_colorful_stack()
+        crt = _qimage_to_array_test(
+            execute_crt(ls1, l1, {**base, "kind": "crt"}).image)
+        led = _qimage_to_array_test(
+            execute_crt(ls2, l2, {**base, "kind": "led"}).image)
+        assert not np.array_equal(crt, led)
+
+    def test_subpixel_mask_creates_variation(self):
+        """べた塗りでもサブピクセルの縞で横方向に濃淡が生まれる。"""
+        size = 60
+        ls = LayerStack(size, size)
+        layer = ls.add("べた")
+        p = QPainter(layer.image)
+        p.fillRect(0, 0, size, size, QColor(180, 180, 180, 255))
+        p.end()
+        result = execute_crt(ls, layer, {
+            "kind": "crt", "cell": 6, "bloom": 0.0,
+            "boost": 1.0, "saturation": 1.0})
+        arr = _qimage_to_array_test(result.image).astype(float)
+        # RGB を平均すると縞が打ち消し合って見えなくなるので、
+        # チャンネルごとに列方向のばらつきを見る。R が強い列・G が強い列…
+        # と並ぶのがサブピクセルなので、各チャンネルで濃淡が出るはず。
+        for ch in range(3):
+            assert arr[:, :, ch].std(axis=1).mean() > 5.0
+
+    def test_alpha_preserved_outside_shape(self):
+        """図形の外は透明のまま。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_crt(ls, layer, {
+            "kind": "crt", "cell": 6, "bloom": 0.4,
+            "boost": 1.6, "saturation": 1.2})
+        src = _qimage_to_array_test(layer.image)
+        out = _qimage_to_array_test(result.image)
+        # 元が完全に透明な広い領域は透明のまま残る
+        assert out[:, :, 3][src[:, :, 3] == 0].max() == 0
+
+
+class TestNewEffectsInGacha:
+    """5効果がランダムアクションのプールに入っていること。"""
+
+    NEW_KEYS = ["halftone", "dither", "crosshatch", "vhs", "crt"]
+
+    def test_registered_in_pool(self):
+        keys = [k for k, _ in _GACHA_POOL]
+        for k in self.NEW_KEYS:
+            assert k in keys
+
+    def test_registered_in_exec(self):
+        for k in self.NEW_KEYS:
+            assert k in _GACHA_EXEC
+
+    @pytest.mark.parametrize("key", NEW_KEYS)
+    def test_random_params_are_generated(self, key):
+        colors = [QColor(c) for c in GACHA_PALETTES[0][1]]
+        for _ in range(20):
+            params = _gacha_random_params(key, colors)
+            assert params, key
+
+    @pytest.mark.parametrize("key", NEW_KEYS)
+    def test_random_params_actually_execute(self, key):
+        """生成されたランダム値でどれも実行でき、空にならない。"""
+        colors = [QColor(c) for c in GACHA_PALETTES[1][1]]
+        for _ in range(5):
+            ls, layer = _make_colorful_stack()
+            params = _gacha_random_params(key, colors)
+            result = _GACHA_EXEC[key](ls, layer, params)
+            assert result is not None, (key, params)
+            assert _has_nonzero_pixels(result.image), (key, params)
