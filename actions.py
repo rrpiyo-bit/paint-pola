@@ -2190,9 +2190,14 @@ def execute_contour(layer_stack: LayerStack, source_layer: Layer,
 # 新効果 共通ユーティリティ（網点・ディザ・ハッチング）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _luma(rgb: np.ndarray) -> np.ndarray:
-    """RGB(float32) から知覚的な明度(0-255)を求める。"""
-    return (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2])
+def _luma(bgr: np.ndarray) -> np.ndarray:
+    """知覚的な明度(0-255)を求める。
+
+    渡ってくるのは _qimage_to_array の配列（ARGB32 のバイト列そのまま）なので
+    チャンネル順は B,G,R。係数を RGB の順で掛けると赤と青の重みが逆になり、
+    赤い面と青い面の明暗が入れ替わってしまうので注意。
+    """
+    return (0.114 * bgr[:, :, 0] + 0.587 * bgr[:, :, 1] + 0.299 * bgr[:, :, 2])
 
 
 def _halftone_plane(value: np.ndarray, pitch: int, angle_deg: float,
@@ -2925,7 +2930,1169 @@ def execute_crt(layer_stack: LayerStack, source_layer: Layer,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 21. アクションガチャ
+# 21. 「○○風」加工 共通ユーティリティ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _posterize_regions(luma: np.ndarray, levels: int) -> np.ndarray:
+    """明度を levels 段に量子化し、各画素の段番号(0..levels-1)を返す。
+
+    ウォーホル風・浮世絵風のように「明るさで版を分ける」効果の土台。
+    段番号のまま返すのは、呼び出し側で段ごとに好きな色を割り当てるため。
+    """
+    lv = max(2, int(levels))
+    idx = np.floor(luma / 256.0 * lv).astype(np.int32)
+    return np.clip(idx, 0, lv - 1)
+
+
+def _edge_mask(rgb: np.ndarray, alpha: np.ndarray, thickness: int) -> np.ndarray:
+    """絵の輪郭(0/255)を取り出す。
+
+    アメコミ風・ステンドグラス風・設計図風で「黒い線」を引くのに使う。
+    暗い画素そのものではなく色の変わり目を拾うので、ベタ塗りの絵でも
+    領域の境目に線が入る。
+    """
+    gray = np.clip(_luma(rgb), 0, 255).astype(np.uint8)
+    # 透明部は白(=何もない)扱いにしないと、絵の外周が全部エッジになる
+    gray = np.where(alpha > 10, gray, 255).astype(np.uint8)
+    edge = cv2.Laplacian(cv2.GaussianBlur(gray, (3, 3), 0), cv2.CV_16S, ksize=3)
+    edge = np.absolute(edge).astype(np.uint8)
+    edge = np.where(edge > 12, 255, 0).astype(np.uint8)
+    # 元から暗い線（線画）もエッジに含める
+    edge = np.maximum(edge, np.where((gray < 90) & (alpha > 10), 255, 0)
+                      .astype(np.uint8))
+    t = max(1, int(thickness))
+    if t > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (t, t))
+        edge = cv2.dilate(edge, k)
+    return edge
+
+
+def _paper_texture(shape: tuple[int, int], strength: float,
+                   scale: int = 3) -> np.ndarray:
+    """紙・和紙の風合い用のざらつき(-1..1)を作る。"""
+    h, w = shape
+    if strength <= 0:
+        return np.zeros((h, w), dtype=np.float32)
+    small = np.random.rand(max(1, h // max(1, scale)),
+                           max(1, w // max(1, scale))).astype(np.float32)
+    tex = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    tex = cv2.GaussianBlur(tex, (0, 0), 0.8)
+    return (tex - 0.5) * 2.0 * strength
+
+
+def _to_qcolors(colors) -> list[QColor]:
+    """パレット指定を QColor のリストに揃える。hex 文字列も受け付ける。"""
+    out = []
+    for c in colors or []:
+        out.append(c if isinstance(c, QColor) else QColor(c))
+    return [c for c in out if c.isValid()]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 22. アンディ・ウォーホル風（ポップアート4分割）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 各コマの配色は「背景・肌・髪・線」の4役に割り当てる。ウォーホルの
+# マリリンのように、コマごとに全く違う配色にするのが狙い。
+_WARHOL_SETS: list[list[str]] = [
+    ["#f03c78", "#f7d94c", "#3ec1c9", "#1a1a1a"],
+    ["#2fbfa0", "#f2f2f2", "#f0d43a", "#1a1a1a"],
+    ["#f5851f", "#f2b8c6", "#f7e04b", "#1a1a1a"],
+    ["#2f6fd0", "#f7e04b", "#e8462f", "#1a1a1a"],
+    ["#8e44ad", "#ffe9d6", "#f03c78", "#1a1a1a"],
+    ["#111111", "#f7e04b", "#e8462f", "#f2f2f2"],
+]
+
+
+class WarholDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("アンディ・ウォーホル風")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._grid = QComboBox()
+        self._grid.addItem("2 × 2（4枚）", (2, 2))
+        self._grid.addItem("3 × 3（9枚）", (3, 3))
+        self._grid.addItem("1 × 3（横3枚）", (3, 1))
+        self._grid.addItem("3 × 1（縦3枚）", (1, 3))
+        form.addRow("分割", self._grid)
+
+        self._levels = QSpinBox()
+        self._levels.setRange(2, 6)
+        self._levels.setValue(4)
+        self._levels.setToolTip("明るさを何段に分けるか。少ないほどベタ塗りに近づく")
+        form.addRow("階調数", self._levels)
+
+        self._gap = QSpinBox()
+        self._gap.setRange(0, 40)
+        self._gap.setValue(0)
+        self._gap.setSuffix(" px")
+        self._gap.setToolTip("コマとコマの間の余白")
+        form.addRow("コマの間隔", self._gap)
+
+        self._outline = QSpinBox()
+        self._outline.setRange(0, 8)
+        self._outline.setValue(2)
+        self._outline.setSuffix(" px")
+        self._outline.setToolTip("0 にすると線を描かず、色面だけになる")
+        form.addRow("輪郭線の太さ", self._outline)
+
+        self._random = QCheckBox("配色をランダムに選ぶ")
+        self._random.setChecked(True)
+        self._random.setToolTip("オフにすると毎回同じ順番の配色になる")
+        form.addRow("", self._random)
+
+        layout.addLayout(form)
+
+        desc = QLabel("元の絵を縮小してタイル状に並べ、コマごとに違う配色で\n"
+                      "ベタ塗りします。キャンバスの大きさは変わりません。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        cols, rows = self._grid.currentData()
+        return {
+            "cols": cols,
+            "rows": rows,
+            "levels": self._levels.value(),
+            "gap": self._gap.value(),
+            "outline": self._outline.value(),
+            "random_sets": self._random.isChecked(),
+        }
+
+
+def _warhol_cell(rgb: np.ndarray, alpha: np.ndarray, levels: int,
+                 palette: list[QColor], outline: int) -> np.ndarray:
+    """1コマぶんをポスタライズして配色する。戻り値は BGRA。"""
+    h, w = alpha.shape
+    lum = np.clip(_luma(rgb), 0, 255)
+    idx = _posterize_regions(lum, levels)
+
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    # 明るさの段だけで色を決めると、髪と肌のように「明るさは近いが色が違う」
+    # ものが同じ色に潰れてしまう。色相でも区別してから割り当てる。
+    hsv = cv2.cvtColor(np.clip(rgb, 0, 255).astype(np.uint8), cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1].astype(np.float32)
+    # 色相を機械的に等分すると、肌と金髪のように近い色が同じ帯に入って
+    # 分離できない。絵の中に実際に出てくる色相を k-means で拾って分ける。
+    valid = (alpha > 10) & (sat > 50)
+    hue_band = np.full(alpha.shape, -1, dtype=np.int32)
+    if int(np.count_nonzero(valid)) >= 8:
+        hv = hsv[:, :, 0][valid].astype(np.float32)
+        # 色相は環状なので、単位円に写してから分類する
+        ang = hv / 180.0 * 2.0 * np.pi
+        feat = np.stack([np.cos(ang), np.sin(ang)], axis=1).astype(np.float32)
+        k = min(3, len(np.unique(hv)))
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _compact, lab, _centers = cv2.kmeans(
+            feat, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+        hue_band[valid] = lab.reshape(-1)
+
+    # 最後の色は輪郭線用に取っておくので、面の塗りには使わない
+    fill_n = max(1, len(palette) - 1)
+    for lv in range(levels):
+        for hb in (-1, 0, 1, 2):
+            m = (idx == lv) & (hue_band == hb)
+            if not m.any():
+                continue
+            # 明るさで大まかな位置を決め、色相の違いでその隣にずらす。
+            # 塗り用の色数の中で必ず循環させ、輪郭線の色には食い込ませない。
+            base = int(round(lv / max(1, levels - 1) * (fill_n - 1)))
+            pi = (base + (0 if hb < 0 else hb + 1)) % fill_n
+            b, g, r = _bgr(palette[pi])
+            out[m, 0], out[m, 1], out[m, 2] = b, g, r
+
+    # 背景（元が透明な所）はパレットの1色目で塗りつぶす。ウォーホルの
+    # シルクスクリーンは必ず地の色があるので、透明のままだと締まらない。
+    bg_b, bg_g, bg_r = _bgr(palette[0])
+    empty = alpha <= 10
+    out[empty, 0], out[empty, 1], out[empty, 2] = bg_b, bg_g, bg_r
+    out[:, :, 3] = 255.0
+
+    if outline > 0:
+        edge = _edge_mask(rgb, alpha, outline)
+        ob, og, orr = _bgr(palette[-1])
+        m = edge > 0
+        out[m, 0], out[m, 1], out[m, 2] = ob, og, orr
+
+    return out
+
+
+def execute_warhol(layer_stack: LayerStack, source_layer: Layer,
+                   params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    cols = max(1, int(params.get("cols", 2)))
+    rows = max(1, int(params.get("rows", 2)))
+    levels = max(2, int(params.get("levels", 4)))
+    gap = max(0, int(params.get("gap", 0)))
+    outline = max(0, int(params.get("outline", 2)))
+    sets = params.get("palettes")
+    if sets:
+        # ガチャなどから明示的に配色を渡された場合
+        cell_palettes = [_to_qcolors(s) for s in sets]
+        cell_palettes = [p for p in cell_palettes if p]
+    else:
+        chosen = list(_WARHOL_SETS)
+        if params.get("random_sets", True):
+            random.shuffle(chosen)
+        cell_palettes = [_to_qcolors(s) for s in chosen]
+    if not cell_palettes:
+        return None
+
+    # 1コマの大きさ。間隔ぶんを差し引いてから割る
+    cw = max(1, (w - gap * (cols + 1)) // cols)
+    ch = max(1, (h - gap * (rows + 1)) // rows)
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    # 縮小してからポスタライズすると、細部が潰れてベタ塗りらしくなる
+    small = cv2.resize(arr, (cw, ch), interpolation=cv2.INTER_AREA)
+    s_rgb, s_alpha = small[:, :, :3], small[:, :, 3]
+
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    for r in range(rows):
+        for c in range(cols):
+            i = r * cols + c
+            pal = cell_palettes[i % len(cell_palettes)]
+            cell = _warhol_cell(s_rgb, s_alpha, levels, pal, outline)
+            x0 = gap + c * (cw + gap)
+            y0 = gap + r * (ch + gap)
+            # 端数でキャンバスからはみ出す場合は切り詰める
+            x1, y1 = min(w, x0 + cw), min(h, y0 + ch)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            out[y0:y1, x0:x1] = cell[:y1 - y0, :x1 - x0].astype(np.uint8)
+
+    result = Layer(f"{source_layer.name} - ウォーホル風", w, h)
+    result.image = _array_to_qimage(out)
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 23. リキテンスタイン風（アメコミ）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LichtensteinDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("リキテンスタイン風（アメコミ）")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._pitch = QSpinBox()
+        self._pitch.setRange(3, 24)
+        self._pitch.setValue(7)
+        self._pitch.setSuffix(" px")
+        self._pitch.setToolTip("網点の間隔。細かいほど写真寄り、粗いほど印刷物らしい")
+        form.addRow("網点の間隔", self._pitch)
+
+        self._outline = QSpinBox()
+        self._outline.setRange(1, 10)
+        self._outline.setValue(3)
+        self._outline.setSuffix(" px")
+        form.addRow("輪郭線の太さ", self._outline)
+
+        self._levels = QSpinBox()
+        self._levels.setRange(2, 5)
+        self._levels.setValue(3)
+        self._levels.setToolTip("ベタ塗りの色数。アメコミは少ない色数で刷られる")
+        form.addRow("ベタの色数", self._levels)
+
+        self._dot_color = _color_button(QColor(220, 50, 60), self)
+        self._dot_color.setToolTip("網点そのものの色。赤系にすると原作らしい")
+        form.addRow("網点の色", self._dot_color)
+
+        self._line_color = _color_button(QColor(20, 20, 20), self)
+        form.addRow("輪郭線の色", self._line_color)
+
+        self._bg = QCheckBox("背景を白で埋める")
+        self._bg.setChecked(True)
+        form.addRow("", self._bg)
+
+        layout.addLayout(form)
+
+        desc = QLabel("太い黒の輪郭線・少ない色数のベタ塗り・網点の3つを重ねて、\n"
+                      "アメコミの1コマのように仕上げます。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "pitch": self._pitch.value(),
+            "outline": self._outline.value(),
+            "levels": self._levels.value(),
+            "dot_color": self._dot_color._color,
+            "line_color": self._line_color._color,
+            "white_bg": self._bg.isChecked(),
+        }
+
+
+def execute_lichtenstein(layer_stack: LayerStack, source_layer: Layer,
+                         params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    pitch = max(3, int(params.get("pitch", 7)))
+    outline = max(1, int(params.get("outline", 3)))
+    levels = max(2, int(params.get("levels", 3)))
+    dot_color = params.get("dot_color") or QColor(220, 50, 60)
+    line_color = params.get("line_color") or QColor(20, 20, 20)
+    white_bg = params.get("white_bg", True)
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    if not (alpha > 10).any():
+        return None
+
+    # 平滑化してからポスタライズすると、階調がベタ面としてまとまる
+    smooth = cv2.bilateralFilter(rgb.astype(np.uint8), 9, 75, 75).astype(np.float32)
+    lum = np.clip(_luma(smooth), 0, 255)
+    idx = _posterize_regions(lum, levels)
+    step = 255.0 / max(1, levels - 1)
+    flat = (idx.astype(np.float32) * step)
+
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    if white_bg:
+        out[:, :, :3] = 255.0
+        out[:, :, 3] = 255.0
+    else:
+        out[:, :, 3] = np.where(alpha > 10, 255.0, 0.0)
+
+    # ベタ塗り: 段ごとの明るさをそのままグレーとして敷く
+    inside = alpha > 10
+    for ch in range(3):
+        out[:, :, ch] = np.where(inside, flat, out[:, :, ch])
+
+    # ベタ塗りは「白・網点・黒」の3役に割り切る。アメコミの製版では
+    # 中間調そのものを刷らず、網点の粗密で表現する。
+    top = levels - 1
+    is_dark = inside & (idx == 0)              # 最暗部＝ベタ
+    is_light = inside & (idx == top)           # 最明部＝紙の白
+    is_mid = inside & ~is_dark & ~is_light     # 中間＝網点で表現
+
+    for ch in range(3):
+        out[:, :, ch] = np.where(is_light, 255.0, out[:, :, ch])
+        out[:, :, ch] = np.where(is_dark, 30.0, out[:, :, ch])
+    if not white_bg:
+        out[:, :, 3] = np.where(inside, 255.0, out[:, :, 3])
+
+    # 網点。中間調の中での相対的な暗さを濃度にすると、面の中で粗密が出る。
+    # 濃度を上限 70% に抑えないと点が繋がってベタに潰れる。
+    if is_mid.any():
+        mid_lum = lum[is_mid]
+        lo, hi = float(mid_lum.min()), float(mid_lum.max())
+        rng = max(1.0, hi - lo)
+        density = np.zeros((h, w), dtype=np.float32)
+        density[is_mid] = (hi - mid_lum) / rng * 0.7 * 255.0
+        dots = _halftone_plane(density, pitch, 45.0, 2).astype(np.float32) / 255.0
+        db, dg, dr = _bgr(dot_color)
+        # 中間調の地は白のままにして、点だけを色で打つ
+        for ch in range(3):
+            out[:, :, ch] = np.where(is_mid, 255.0, out[:, :, ch])
+        m = is_mid & (dots > 0.4)
+        out[m, 0], out[m, 1], out[m, 2] = db, dg, dr
+        out[m, 3] = 255.0
+
+    # 輪郭線は最後に乗せて、網点の上からでも必ず見えるようにする
+    edge = _edge_mask(rgb, alpha, outline)
+    lb, lg, lr = _bgr(line_color)
+    m = edge > 0
+    out[m, 0], out[m, 1], out[m, 2] = lb, lg, lr
+    out[m, 3] = 255.0
+
+    result = Layer(f"{source_layer.name} - アメコミ風", w, h)
+    result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 24. 浮世絵 / 木版画風
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class UkiyoeDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("浮世絵 / 木版画風")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._levels = QSpinBox()
+        self._levels.setRange(2, 8)
+        self._levels.setValue(4)
+        self._levels.setToolTip("摺る版の数。少ないほど版画らしい平坦な絵になる")
+        form.addRow("版の数（色数）", self._levels)
+
+        self._misalign = QSpinBox()
+        self._misalign.setRange(0, 20)
+        self._misalign.setValue(4)
+        self._misalign.setSuffix(" px")
+        self._misalign.setToolTip("版ごとの摺りズレ。手摺りらしい味が出る")
+        form.addRow("版ズレ", self._misalign)
+
+        self._sumi = QSpinBox()
+        self._sumi.setRange(0, 8)
+        self._sumi.setValue(2)
+        self._sumi.setSuffix(" px")
+        self._sumi.setToolTip("輪郭の墨線（主版）の太さ")
+        form.addRow("墨線の太さ", self._sumi)
+
+        self._paper = QSpinBox()
+        self._paper.setRange(0, 100)
+        self._paper.setValue(35)
+        self._paper.setSuffix(" %")
+        self._paper.setToolTip("和紙の繊維のざらつき")
+        form.addRow("和紙の質感", self._paper)
+
+        self._paper_color = _color_button(QColor(240, 230, 205), self)
+        self._paper_color.setToolTip("地の紙の色。生成りにすると古い摺物らしい")
+        form.addRow("紙の色", self._paper_color)
+
+        layout.addLayout(form)
+
+        desc = QLabel("色数を絞って版画のように平坦化し、版ズレ・墨線・和紙の\n"
+                      "質感を重ねます。元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "levels": self._levels.value(),
+            "misalign": self._misalign.value(),
+            "sumi": self._sumi.value(),
+            "paper": self._paper.value() / 100.0,
+            "paper_color": self._paper_color._color,
+        }
+
+
+def execute_ukiyoe(layer_stack: LayerStack, source_layer: Layer,
+                   params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    levels = max(2, int(params.get("levels", 4)))
+    misalign = max(0, int(params.get("misalign", 4)))
+    sumi = max(0, int(params.get("sumi", 2)))
+    paper = float(params.get("paper", 0.35))
+    paper_color = params.get("paper_color") or QColor(240, 230, 205)
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    if not (alpha > 10).any():
+        return None
+
+    # 紙を敷く
+    pb, pg, pr = _bgr(paper_color)
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    out[:, :, 0], out[:, :, 1], out[:, :, 2] = pb, pg, pr
+    out[:, :, 3] = 255.0
+
+    # 平滑化して面をまとめる。ここでチャンネルごとに量子化してしまうと、
+    # 肌色のように3チャンネルが同じ段に丸まる色が無彩色の灰色になって
+    # しまうので、色は元のまま残し「どの版に属するか」だけを段で決める。
+    smooth = cv2.bilateralFilter(rgb.astype(np.uint8), 9, 60, 60).astype(np.float32)
+
+    # 段ごとに1版とみなし、版ごとに違う方向へずらして摺る。
+    # 全部まとめてずらすと単に絵が動くだけで、版ズレには見えない。
+    lum = np.clip(_luma(smooth), 0, 255)
+    idx = _posterize_regions(lum, levels)
+    inside = alpha > 10
+
+    # 明るさだけで版を分けると、髪と肌のように明るさの近いものが1版に
+    # まとまって、彫り分けたように見えない。色相でも版を分ける。
+    # 色相を等分すると、肌と金髪のように近い色が同じ帯に入ってしまう。
+    # 絵に実際に出てくる色相を k-means で拾って分ける。
+    hsv = cv2.cvtColor(np.clip(smooth, 0, 255).astype(np.uint8),
+                       cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1].astype(np.float32)
+    valid = inside & (sat > 50)
+    hue_band = np.full(alpha.shape, -1, dtype=np.int32)
+    n_hue = 0
+    if int(np.count_nonzero(valid)) >= 8:
+        hv = hsv[:, :, 0][valid].astype(np.float32)
+        ang = hv / 180.0 * 2.0 * np.pi
+        feat = np.stack([np.cos(ang), np.sin(ang)], axis=1).astype(np.float32)
+        n_hue = min(4, len(np.unique(hv)))
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _c, lab, _ctr = cv2.kmeans(feat, n_hue, None, crit, 3,
+                                   cv2.KMEANS_PP_CENTERS)
+        hue_band[valid] = lab.reshape(-1)
+
+    plates = []
+    for lv in range(levels):
+        for hb in range(-1, max(1, n_hue)):
+            plates.append(inside & (idx == lv) & (hue_band == hb))
+
+    for region in plates:
+        if int(np.count_nonzero(region)) < 20:
+            continue
+        # この版の代表色。平均を取ると、明暗差のある面では左右の色が
+        # 混ざって濁った灰色になってしまうので、中央値を使う。
+        # 墨線（暗い縁）を含めると色が沈むため、彩度のある画素を優先する。
+        sat_here = sat[region]
+        cand = smooth[region]
+        vivid = cand[sat_here > 50]
+        plate_color = np.median(vivid if len(vivid) >= 10 else cand, axis=0)
+        plate = region.astype(np.uint8) * 255
+        if misalign > 0:
+            dx = random.randint(-misalign, misalign)
+            dy = random.randint(-misalign, misalign)
+            plate = _shift_mask(plate, dx, dy)
+        m = plate > 0
+        for ch in range(3):
+            out[m, ch] = plate_color[ch]
+
+    # 墨線（主版）は版ズレさせず最後に乗せる。輪郭がぶれると絵が読めなくなる
+    if sumi > 0:
+        edge = _edge_mask(rgb, alpha, sumi)
+        m = edge > 0
+        out[m, 0], out[m, 1], out[m, 2] = 30.0, 28.0, 25.0
+
+    # 和紙の繊維
+    if paper > 0:
+        tex = _paper_texture((h, w), paper * 40.0)
+        out[:, :, :3] = np.clip(out[:, :, :3] + tex[:, :, None], 0, 255)
+
+    result = Layer(f"{source_layer.name} - 浮世絵風", w, h)
+    result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 25. 印象派 / 油彩タッチ風
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ImpressionistDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("印象派 / 油彩タッチ風")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._length = QSpinBox()
+        self._length.setRange(3, 40)
+        self._length.setValue(12)
+        self._length.setSuffix(" px")
+        self._length.setToolTip("1本の筆跡の長さ")
+        form.addRow("筆跡の長さ", self._length)
+
+        self._width = QSpinBox()
+        self._width.setRange(1, 12)
+        self._width.setValue(3)
+        self._width.setSuffix(" px")
+        form.addRow("筆跡の太さ", self._width)
+
+        self._density = QSpinBox()
+        self._density.setRange(50, 600)
+        self._density.setValue(220)
+        self._density.setSuffix(" %")
+        self._density.setToolTip("画面を何回ぶん塗り重ねるか。多いほど密になるが遅くなる")
+        form.addRow("筆の密度", self._density)
+
+        self._jitter = QSpinBox()
+        self._jitter.setRange(0, 60)
+        self._jitter.setValue(20)
+        self._jitter.setToolTip("1本ごとの色のばらつき。大きいと絵の具らしくなる")
+        form.addRow("色のゆらぎ", self._jitter)
+
+        self._follow = QCheckBox("明暗の流れに沿って筆を向ける")
+        self._follow.setChecked(True)
+        self._follow.setToolTip("オフにするとすべて同じ角度の筆跡になる")
+        form.addRow("", self._follow)
+
+        layout.addLayout(form)
+
+        desc = QLabel("短い筆跡を無数に置いて、油絵のタッチに置き換えます。\n"
+                      "密度を上げると時間がかかります。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "length": self._length.value(),
+            "width": self._width.value(),
+            "density": self._density.value() / 100.0,
+            "jitter": self._jitter.value(),
+            "follow": self._follow.isChecked(),
+        }
+
+
+def execute_impressionist(layer_stack: LayerStack, source_layer: Layer,
+                          params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    length = max(3, int(params.get("length", 12)))
+    width = max(1, int(params.get("width", 3)))
+    density = max(0.1, float(params.get("density", 2.2)))
+    jitter = max(0, int(params.get("jitter", 20)))
+    follow = params.get("follow", True)
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    if not (alpha > 10).any():
+        return None
+
+    # 筆を置ける場所（絵のある所）だけを候補にする
+    ys, xs = np.nonzero(alpha > 10)
+    if len(xs) == 0:
+        return None
+
+    # 筆の向き: 明度の勾配に直交する方向へ引くと、輪郭をなぞる流れになる
+    gray = np.clip(_luma(rgb), 0, 255).astype(np.uint8)
+    blur = cv2.GaussianBlur(gray, (0, 0), 2.0)
+    gx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=5)
+    gy = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=5)
+
+    # 先に下塗りを敷く。筆跡だけだと隙間が白く抜けて点々が残る。
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    base = cv2.GaussianBlur(rgb, (0, 0), max(1.0, length / 3.0))
+    out[:, :, :3] = np.clip(base, 0, 255).astype(np.uint8)
+    out[:, :, 3] = np.where(alpha > 10, 255, 0).astype(np.uint8)
+
+    # 1本の筆が覆う面積からストローク数を決める
+    per_stroke = max(1.0, float(length * width))
+    n_strokes = int(len(xs) / per_stroke * density)
+    n_strokes = max(20, min(n_strokes, 120000))
+
+    order = np.random.randint(0, len(xs), size=n_strokes)
+    base_angle = random.uniform(0, math.pi)
+    for i in order:
+        cx, cy = int(xs[i]), int(ys[i])
+        if follow:
+            # 勾配ベクトルに直交＝等明度線に沿う向き
+            ang = math.atan2(-gx[cy, cx], gy[cy, cx] + 1e-6)
+        else:
+            ang = base_angle
+        ang += random.uniform(-0.25, 0.25)
+        half = length * random.uniform(0.6, 1.2) * 0.5
+        dx, dy = math.cos(ang) * half, math.sin(ang) * half
+        b, g, r = rgb[cy, cx]
+        if jitter:
+            j = random.randint(-jitter, jitter)
+            b, g, r = b + j, g + j, r + j
+        color = (int(np.clip(b, 0, 255)), int(np.clip(g, 0, 255)),
+                 int(np.clip(r, 0, 255)), 255)
+        cv2.line(out, (int(cx - dx), int(cy - dy)), (int(cx + dx), int(cy + dy)),
+                 color, max(1, width), lineType=cv2.LINE_AA)
+
+    # 筆がはみ出した先で下地が透けないよう、元が透明だった所は消す。
+    # ただし筆1本ぶんは意図的にはみ出させたいので、alpha を少し広げてから切る。
+    keep = cv2.dilate((alpha > 10).astype(np.uint8) * 255,
+                      cv2.getStructuringElement(
+                          cv2.MORPH_ELLIPSE, (length | 1, length | 1)))
+    out[:, :, 3] = np.where(keep > 0, out[:, :, 3], 0)
+
+    result = Layer(f"{source_layer.name} - 印象派風", w, h)
+    result.image = _array_to_qimage(out)
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 26. ステンドグラス風
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StainedGlassDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ステンドグラス風")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._cell = QSpinBox()
+        self._cell.setRange(10, 120)
+        self._cell.setValue(34)
+        self._cell.setSuffix(" px")
+        self._cell.setToolTip("ガラス片のおおよその大きさ")
+        form.addRow("ガラス片の大きさ", self._cell)
+
+        self._lead = QSpinBox()
+        self._lead.setRange(1, 12)
+        self._lead.setValue(3)
+        self._lead.setSuffix(" px")
+        self._lead.setToolTip("ガラスを繋ぐ鉛線の太さ")
+        form.addRow("鉛線の太さ", self._lead)
+
+        self._lead_color = _color_button(QColor(25, 22, 20), self)
+        form.addRow("鉛線の色", self._lead_color)
+
+        self._vivid = QSpinBox()
+        self._vivid.setRange(100, 300)
+        self._vivid.setValue(170)
+        self._vivid.setSuffix(" %")
+        self._vivid.setToolTip("光が透ける感じを出すための彩度・明度の強調")
+        form.addRow("透過光の強さ", self._vivid)
+
+        self._bg = QCheckBox("背景もガラスにする")
+        self._bg.setChecked(True)
+        self._bg.setToolTip("オフにすると絵のある部分だけがガラスになる")
+        form.addRow("", self._bg)
+
+        layout.addLayout(form)
+
+        desc = QLabel("画面をガラス片に分割し、各片を1色で塗って鉛線で囲みます。\n"
+                      "元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "cell": self._cell.value(),
+            "lead": self._lead.value(),
+            "lead_color": self._lead_color._color,
+            "vivid": self._vivid.value() / 100.0,
+            "glass_bg": self._bg.isChecked(),
+        }
+
+
+def execute_stained_glass(layer_stack: LayerStack, source_layer: Layer,
+                          params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    cell = max(10, int(params.get("cell", 34)))
+    lead = max(1, int(params.get("lead", 3)))
+    lead_color = params.get("lead_color") or QColor(25, 22, 20)
+    vivid = float(params.get("vivid", 1.7))
+    glass_bg = params.get("glass_bg", True)
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    if not (alpha > 10).any():
+        return None
+
+    # ガラス片の種: 格子を基準にランダムに散らす（ボロノイ風の不定形にする）
+    step = cell
+    seeds = []
+    for gy in range(-1, h // step + 2):
+        for gx in range(-1, w // step + 2):
+            sx = gx * step + random.uniform(-step * 0.35, step * 0.35)
+            sy = gy * step + random.uniform(-step * 0.35, step * 0.35)
+            seeds.append((sx, sy))
+    if not seeds:
+        return None
+    seed_arr = np.array(seeds, dtype=np.float32)
+
+    # 各画素を最も近い種に割り当てる。全画素×全種の距離は重いので、
+    # 種を格子状に置いてある性質を使い、近傍9マスだけを調べる。
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    n_gx = w // step + 3
+    labels = np.zeros((h, w), dtype=np.int32)
+    best = np.full((h, w), np.inf, dtype=np.float32)
+    for k, (sx, sy) in enumerate(seeds):
+        # この種が影響しうる範囲だけを更新する
+        x0, x1 = max(0, int(sx - step * 2)), min(w, int(sx + step * 2))
+        y0, y1 = max(0, int(sy - step * 2)), min(h, int(sy + step * 2))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        d = (xx[y0:y1, x0:x1] - sx) ** 2 + (yy[y0:y1, x0:x1] - sy) ** 2
+        sub_best = best[y0:y1, x0:x1]
+        m = d < sub_best
+        sub_best[m] = d[m]
+        labels[y0:y1, x0:x1][m] = k
+
+    # 片ごとに平均色で塗る
+    n_seeds = len(seeds)
+    flat_lab = labels.reshape(-1)
+    inside = (alpha > 10).reshape(-1)
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    sums = np.zeros((n_seeds, 3), dtype=np.float64)
+    counts = np.zeros(n_seeds, dtype=np.int64)
+    flat_rgb = rgb.reshape(-1, 3).astype(np.float64)
+    np.add.at(counts, flat_lab[inside], 1)
+    for ch in range(3):
+        np.add.at(sums[:, ch], flat_lab[inside], flat_rgb[inside, ch])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = sums / np.maximum(counts, 1)[:, None]
+
+    # 透過光らしく彩度と明度を持ち上げる
+    mean = np.clip((mean - 128.0) * vivid + 128.0, 0, 255)
+    # 片の面積のうちどれだけが絵に覆われていたか。1画素でもかすっただけの
+    # 片まで塗ると、絵の外へガラスが大きくはみ出してしまうので、
+    # 半分以上が絵だった片だけを「絵のある片」とみなす。
+    total = np.zeros(n_seeds, dtype=np.int64)
+    np.add.at(total, flat_lab, 1)
+    filled = counts > np.maximum(1, total // 2)
+    colored = mean[flat_lab].reshape(h, w, 3)
+    has_color = filled[flat_lab].reshape(h, w)
+
+    out[:, :, :3] = colored
+    if glass_bg:
+        # 絵の無い片は暗いガラスにして、画面全体を埋める
+        out[~has_color, 0] = 40.0
+        out[~has_color, 1] = 35.0
+        out[~has_color, 2] = 30.0
+        out[:, :, 3] = 255.0
+    else:
+        out[:, :, 3] = np.where(has_color, 255.0, 0.0)
+
+    # 鉛線: 隣り合う片のラベルが違う所が境界
+    dx = np.zeros((h, w), dtype=np.uint8)
+    dx[:, 1:] = (labels[:, 1:] != labels[:, :-1]).astype(np.uint8) * 255
+    dy = np.zeros((h, w), dtype=np.uint8)
+    dy[1:, :] = (labels[1:, :] != labels[:-1, :]).astype(np.uint8) * 255
+    border = np.maximum(dx, dy)
+    if lead > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (lead, lead))
+        border = cv2.dilate(border, k)
+    lb, lg, lr = _bgr(lead_color)
+    m = border > 0
+    if not glass_bg:
+        # 背景をガラスにしない場合、絵の外にまで鉛線を引かない
+        m = m & has_color
+    out[m, 0], out[m, 1], out[m, 2] = lb, lg, lr
+    out[m, 3] = 255.0
+
+    result = Layer(f"{source_layer.name} - ステンドグラス風", w, h)
+    result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 27. ブループリント / 設計図風
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BlueprintDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ブループリント / 設計図風")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._paper_color = _color_button(QColor(20, 60, 130), self)
+        self._paper_color.setToolTip("図面の地の色")
+        form.addRow("地の色", self._paper_color)
+
+        self._ink_color = _color_button(QColor(235, 243, 255), self)
+        form.addRow("線の色", self._ink_color)
+
+        self._thickness = QSpinBox()
+        self._thickness.setRange(1, 8)
+        self._thickness.setValue(2)
+        self._thickness.setSuffix(" px")
+        form.addRow("線の太さ", self._thickness)
+
+        self._grid = QSpinBox()
+        self._grid.setRange(0, 200)
+        self._grid.setValue(32)
+        self._grid.setSuffix(" px")
+        self._grid.setToolTip("0 にすると方眼を描きません")
+        form.addRow("方眼の間隔", self._grid)
+
+        self._major = QSpinBox()
+        self._major.setRange(2, 20)
+        self._major.setValue(5)
+        self._major.setToolTip("何マスごとに濃い線を引くか")
+        form.addRow("太線の間隔", self._major)
+
+        self._fade = QSpinBox()
+        self._fade.setRange(0, 100)
+        self._fade.setValue(25)
+        self._fade.setSuffix(" %")
+        self._fade.setToolTip("青焼きらしいムラ・かすれ")
+        form.addRow("かすれ", self._fade)
+
+        layout.addLayout(form)
+
+        desc = QLabel("輪郭だけを抜き出して青地に白線で描き、方眼を敷いて\n"
+                      "設計図のように見せます。元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "paper_color": self._paper_color._color,
+            "ink_color": self._ink_color._color,
+            "thickness": self._thickness.value(),
+            "grid": self._grid.value(),
+            "major": self._major.value(),
+            "fade": self._fade.value() / 100.0,
+        }
+
+
+def execute_blueprint(layer_stack: LayerStack, source_layer: Layer,
+                      params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    paper_color = params.get("paper_color") or QColor(20, 60, 130)
+    ink_color = params.get("ink_color") or QColor(235, 243, 255)
+    thickness = max(1, int(params.get("thickness", 2)))
+    grid = max(0, int(params.get("grid", 32)))
+    major = max(2, int(params.get("major", 5)))
+    fade = float(params.get("fade", 0.25))
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    if not (alpha > 10).any():
+        return None
+
+    pb, pg, pr = _bgr(paper_color)
+    ib, ig, ir = _bgr(ink_color)
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    out[:, :, 0], out[:, :, 1], out[:, :, 2] = pb, pg, pr
+    out[:, :, 3] = 255.0
+
+    ink = np.zeros((h, w), dtype=np.float32)
+
+    # 方眼。太線を先に敷き、その上から細線を引く
+    if grid > 0:
+        thin = np.zeros((h, w), dtype=np.float32)
+        thick = np.zeros((h, w), dtype=np.float32)
+        for x in range(0, w, grid):
+            col = thick if (x // grid) % major == 0 else thin
+            col[:, x:x + 1] = 1.0
+        for y in range(0, h, grid):
+            row = thick if (y // grid) % major == 0 else thin
+            row[y:y + 1, :] = 1.0
+        ink = np.maximum(ink, thin * 0.18)
+        ink = np.maximum(ink, thick * 0.35)
+
+    # 図の輪郭
+    edge = _edge_mask(rgb, alpha, thickness).astype(np.float32) / 255.0
+    ink = np.maximum(ink, edge)
+
+    # 青焼きのムラ
+    if fade > 0:
+        tex = _paper_texture((h, w), fade, scale=6)
+        ink = np.clip(ink * (1.0 + tex), 0.0, 1.0)
+        out[:, :, :3] = np.clip(out[:, :, :3] + tex[:, :, None] * 18.0, 0, 255)
+
+    for ch, v in enumerate((ib, ig, ir)):
+        out[:, :, ch] = out[:, :, ch] * (1.0 - ink) + v * ink
+
+    result = Layer(f"{source_layer.name} - 設計図風", w, h)
+    result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 28. 銅版画 / エッチング風
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class EtchingDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("銅版画 / エッチング風")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._spacing = QSpinBox()
+        self._spacing.setRange(2, 20)
+        self._spacing.setValue(4)
+        self._spacing.setSuffix(" px")
+        self._spacing.setToolTip("彫り線の間隔。細かいほど緻密な版画になる")
+        form.addRow("線の間隔", self._spacing)
+
+        self._layers = QSpinBox()
+        self._layers.setRange(2, 6)
+        self._layers.setValue(4)
+        self._layers.setToolTip("重ねる彫りの方向数")
+        form.addRow("彫りの段数", self._layers)
+
+        self._wobble = QSpinBox()
+        self._wobble.setRange(0, 100)
+        self._wobble.setValue(45)
+        self._wobble.setSuffix(" %")
+        self._wobble.setToolTip("線の不規則さ。手彫りらしい揺らぎが出る")
+        form.addRow("線の揺らぎ", self._wobble)
+
+        self._ink_color = _color_button(QColor(35, 28, 22), self)
+        form.addRow("インクの色", self._ink_color)
+
+        self._paper_color = _color_button(QColor(238, 230, 214), self)
+        form.addRow("紙の色", self._paper_color)
+
+        self._grain = QSpinBox()
+        self._grain.setRange(0, 100)
+        self._grain.setValue(30)
+        self._grain.setSuffix(" %")
+        form.addRow("紙の質感", self._grain)
+
+        layout.addLayout(form)
+
+        desc = QLabel("明暗を細かい彫り線の密度に置き換えて、銅版画のように\n"
+                      "仕上げます。元のレイヤーはそのまま残ります。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {
+            "spacing": self._spacing.value(),
+            "layers": self._layers.value(),
+            "wobble": self._wobble.value() / 100.0,
+            "ink_color": self._ink_color._color,
+            "paper_color": self._paper_color._color,
+            "grain": self._grain.value() / 100.0,
+        }
+
+
+def execute_etching(layer_stack: LayerStack, source_layer: Layer,
+                    params: dict) -> Layer | None:
+    if source_layer.is_group:
+        return None
+    src_img: QImage = source_layer.image
+    w, h = src_img.width(), src_img.height()
+    if w == 0 or h == 0:
+        return None
+
+    spacing = max(2, int(params.get("spacing", 4)))
+    n_layers = max(2, int(params.get("layers", 4)))
+    wobble = float(params.get("wobble", 0.45))
+    ink_color = params.get("ink_color") or QColor(35, 28, 22)
+    paper_color = params.get("paper_color") or QColor(238, 230, 214)
+    grain = float(params.get("grain", 0.3))
+
+    arr = _qimage_to_array(src_img).astype(np.float32)
+    rgb, alpha = arr[:, :, :3], arr[:, :, 3]
+    if not (alpha > 10).any():
+        return None
+
+    lum = np.clip(_luma(rgb), 0, 255)
+    # 透明部は紙のまま残したいので、明るさ最大（＝彫らない）とみなす
+    lum = np.where(alpha > 10, lum, 255.0)
+    darkness = 1.0 - lum / 255.0
+    # 絵の明暗の幅が狭いと全面が同じ密度の網になって濃淡が読めなくなる。
+    # 絵のある範囲の実際の明暗を 0〜1 いっぱいに引き伸ばす。
+    if (alpha > 10).any():
+        inside_d = darkness[alpha > 10]
+        lo, hi = float(inside_d.min()), float(inside_d.max())
+        if hi - lo > 0.01:
+            darkness = np.clip((darkness - lo) / (hi - lo), 0.0, 1.0)
+        # そのままだと中間調に固まりがちなので、ガンマで明部側を開いて
+        # 「白く残る所」と「彫り込む所」の差をはっきりさせる
+        darkness = np.power(darkness, 1.6)
+        darkness = np.where(alpha > 10, darkness, 0.0)
+
+    angles = [15.0, 105.0, 60.0, 150.0, 35.0, 125.0][:n_layers]
+    ink = np.zeros((h, w), dtype=np.float32)
+    for i, ang in enumerate(angles):
+        lo = i / n_layers
+        lines = _hatch_lines((h, w), ang, spacing, 1).astype(np.float32) / 255.0
+        if wobble > 0:
+            # 線を波打たせて手彫りらしくする。まっすぐだと機械的に見える
+            amp = spacing * wobble
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            phase = random.uniform(0, math.pi * 2)
+            off = np.sin(yy / max(2.0, spacing * 3.0) + phase) * amp
+            map_x = np.clip(xx + off, 0, w - 1).astype(np.float32)
+            map_y = yy.astype(np.float32)
+            lines = cv2.remap(lines, map_x, map_y, cv2.INTER_LINEAR)
+        weight = np.clip((darkness - lo) * n_layers, 0.0, 1.0)
+        ink = np.maximum(ink, lines * weight)
+
+    # 真っ黒に近い所はベタで潰す。版画でも最暗部は面で潰れる
+    ink = np.maximum(ink, np.clip((darkness - 0.88) * 8.0, 0.0, 1.0))
+
+    pb, pg, pr = _bgr(paper_color)
+    ib, ig, ir = _bgr(ink_color)
+    out = np.zeros((h, w, 4), dtype=np.float32)
+    out[:, :, 0], out[:, :, 1], out[:, :, 2] = pb, pg, pr
+    out[:, :, 3] = 255.0
+    for ch, v in enumerate((ib, ig, ir)):
+        out[:, :, ch] = out[:, :, ch] * (1.0 - ink) + v * ink
+
+    if grain > 0:
+        tex = _paper_texture((h, w), grain * 35.0)
+        out[:, :, :3] = np.clip(out[:, :, :3] + tex[:, :, None], 0, 255)
+
+    result = Layer(f"{source_layer.name} - 銅版画風", w, h)
+    result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
+    _copy_offset(source_layer, result)
+    _insert_result_layer(layer_stack, source_layer, result)
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 29. アクションガチャ
 # ═══════════════════════════════════════════════════════════════════════════════
 
 GACHA_PALETTES: list[tuple[str, list[str]]] = [
@@ -2957,6 +4124,13 @@ _GACHA_POOL: list[tuple[str, str]] = [
     ("crosshatch", "ハッチング"),
     ("vhs", "VHS"),
     ("crt", "CRT/LED"),
+    ("warhol", "ウォーホル風"),
+    ("lichtenstein", "アメコミ風"),
+    ("ukiyoe", "浮世絵風"),
+    ("impressionist", "印象派風"),
+    ("stained_glass", "ステンドグラス風"),
+    ("blueprint", "設計図風"),
+    ("etching", "銅版画風"),
 ]
 
 
@@ -3064,6 +4238,41 @@ def _gacha_random_params(key: str, colors: list[QColor]) -> dict:
         return {"kind": "crt" if rb(0.6) else "led", "cell": ri(4, 12),
                 "bloom": ru(0.2, 0.8), "boost": ru(1.3, 2.2),
                 "saturation": ru(1.0, 1.8)}
+    if key == "warhol":
+        cols, rows = random.choice([(2, 2), (2, 2), (3, 3), (3, 1), (1, 3)])
+        # ガチャの配色をコマ数ぶん回して使う。1コマごとに並びを変えないと
+        # 全コマ同じ色になってしまうので、シャッフルした版を作る
+        n_cells = cols * rows
+        sets = []
+        for _ in range(n_cells):
+            shuffled = list(colors)
+            random.shuffle(shuffled)
+            sets.append(shuffled)
+        return {"cols": cols, "rows": rows, "levels": ri(3, 5),
+                "gap": ri(0, 12), "outline": ri(0, 4), "palettes": sets}
+    if key == "lichtenstein":
+        return {"pitch": ri(4, 12), "outline": ri(2, 5), "levels": ri(2, 4),
+                "dot_color": pick(), "line_color": dark,
+                "white_bg": rb(0.7)}
+    if key == "ukiyoe":
+        return {"levels": ri(3, 6), "misalign": ri(0, 10), "sumi": ri(1, 4),
+                "paper": ru(0.15, 0.5),
+                "paper_color": light if rb(0.5) else QColor(240, 230, 205)}
+    if key == "impressionist":
+        return {"length": ri(6, 20), "width": ri(2, 5),
+                "density": ru(1.5, 3.0), "jitter": ri(5, 35),
+                "follow": rb(0.75)}
+    if key == "stained_glass":
+        return {"cell": ri(18, 60), "lead": ri(2, 6), "lead_color": dark,
+                "vivid": ru(1.2, 2.2), "glass_bg": rb(0.6)}
+    if key == "blueprint":
+        return {"paper_color": dark, "ink_color": light,
+                "thickness": ri(1, 4), "grid": random.choice([0, 16, 24, 32, 48]),
+                "major": ri(3, 8), "fade": ru(0.1, 0.4)}
+    if key == "etching":
+        return {"spacing": ri(3, 8), "layers": ri(3, 5), "wobble": ru(0.2, 0.7),
+                "ink_color": dark, "paper_color": light,
+                "grain": ru(0.15, 0.45)}
     return {}
 
 
@@ -3086,6 +4295,13 @@ _GACHA_EXEC = {
     "crosshatch": execute_crosshatch,
     "vhs": execute_vhs,
     "crt": execute_crt,
+    "warhol": execute_warhol,
+    "lichtenstein": execute_lichtenstein,
+    "ukiyoe": execute_ukiyoe,
+    "impressionist": execute_impressionist,
+    "stained_glass": execute_stained_glass,
+    "blueprint": execute_blueprint,
+    "etching": execute_etching,
 }
 
 
@@ -3282,6 +4498,13 @@ class ActionPanel(QWidget):
             ("✒️ クロスハッチング", "明暗を斜線の密度に置き換えてペン画風に", self._on_crosshatch),
             ("📼 VHS / 走査線ノイズ", "行ずれ・ノイズ帯・走査線で古い映像風に", self._on_vhs),
             ("🖥️ CRT / LED 画面", "RGBサブピクセルと走査線で画面越しの絵に", self._on_crt),
+            ("💋 アンディ・ウォーホル風", "縮小してタイル状に並べ、コマごとに違う配色で", self._on_warhol),
+            ("💥 リキテンスタイン風", "太い輪郭＋ベタ塗り＋網点でアメコミの1コマに", self._on_lichtenstein),
+            ("🌊 浮世絵 / 木版画風", "色数を絞って版ズレ・墨線・和紙の質感を重ねる", self._on_ukiyoe),
+            ("🎨 印象派 / 油彩タッチ風", "短い筆跡を無数に置いて油絵のタッチに", self._on_impressionist),
+            ("🪟 ステンドグラス風", "ガラス片に分割してベタ塗り＋鉛線で囲む", self._on_stained_glass),
+            ("📐 ブループリント / 設計図風", "青地に白線と方眼で図面のように", self._on_blueprint),
+            ("🖨️ 銅版画 / エッチング風", "明暗を細かい彫り線の密度に置き換える", self._on_etching),
         ]
         for text, tip, slot in actions:
             btn = QPushButton(text)
@@ -3375,6 +4598,27 @@ class ActionPanel(QWidget):
 
     def _on_crt(self):
         self._run("CRT / LED 画面", CrtDialog, execute_crt)
+
+    def _on_warhol(self):
+        self._run("アンディ・ウォーホル風", WarholDialog, execute_warhol)
+
+    def _on_lichtenstein(self):
+        self._run("リキテンスタイン風", LichtensteinDialog, execute_lichtenstein)
+
+    def _on_ukiyoe(self):
+        self._run("浮世絵 / 木版画風", UkiyoeDialog, execute_ukiyoe)
+
+    def _on_impressionist(self):
+        self._run("印象派 / 油彩タッチ風", ImpressionistDialog, execute_impressionist)
+
+    def _on_stained_glass(self):
+        self._run("ステンドグラス風", StainedGlassDialog, execute_stained_glass)
+
+    def _on_blueprint(self):
+        self._run("ブループリント / 設計図風", BlueprintDialog, execute_blueprint)
+
+    def _on_etching(self):
+        self._run("銅版画 / エッチング風", EtchingDialog, execute_etching)
 
     def _on_gacha(self):
         self._run("アクションガチャ", GachaDialog, execute_gacha)

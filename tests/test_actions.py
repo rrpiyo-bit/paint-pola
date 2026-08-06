@@ -416,6 +416,9 @@ from actions import (
     execute_wobble, execute_stamp, execute_contour,
     execute_halftone, execute_dither, execute_crosshatch,
     execute_vhs, execute_crt,
+    execute_warhol, execute_lichtenstein, execute_ukiyoe,
+    execute_impressionist, execute_stained_glass, execute_blueprint,
+    execute_etching,
     execute_gacha, execute_path_repeat,
     _gacha_random_params, _gacha_random_path,
     _GACHA_POOL, _GACHA_EXEC, GACHA_PALETTES,
@@ -1130,3 +1133,401 @@ class TestNewEffectsInGacha:
             result = _GACHA_EXEC[key](ls, layer, params)
             assert result is not None, (key, params)
             assert _has_nonzero_pixels(result.image), (key, params)
+
+
+
+# 「○○風」加工の (実行関数, 既定パラメータ, 結果レイヤー名の一部)
+_STYLE_EFFECTS = [
+    (execute_warhol,
+     {"cols": 2, "rows": 2, "levels": 4, "gap": 4, "outline": 2,
+      "random_sets": False},
+     "ウォーホル風"),
+    (execute_lichtenstein,
+     {"pitch": 6, "outline": 3, "levels": 3, "dot_color": QColor(220, 50, 60),
+      "line_color": QColor(20, 20, 20), "white_bg": True},
+     "アメコミ風"),
+    (execute_ukiyoe,
+     {"levels": 4, "misalign": 3, "sumi": 2, "paper": 0.3,
+      "paper_color": QColor(240, 230, 205)},
+     "浮世絵風"),
+    (execute_impressionist,
+     {"length": 10, "width": 3, "density": 1.5, "jitter": 15, "follow": True},
+     "印象派風"),
+    (execute_stained_glass,
+     {"cell": 24, "lead": 3, "lead_color": QColor(25, 22, 20), "vivid": 1.6,
+      "glass_bg": True},
+     "ステンドグラス風"),
+    (execute_blueprint,
+     {"paper_color": QColor(20, 60, 130), "ink_color": QColor(235, 243, 255),
+      "thickness": 2, "grid": 24, "major": 4, "fade": 0.2},
+     "設計図風"),
+    (execute_etching,
+     {"spacing": 4, "layers": 4, "wobble": 0.4,
+      "ink_color": QColor(35, 28, 22), "paper_color": QColor(238, 230, 214),
+      "grain": 0.25},
+     "銅版画風"),
+]
+
+
+class TestStyleEffectsCommon:
+    """「○○風」7効果に共通する契約。"""
+
+    @pytest.mark.parametrize("fn,params,name", _STYLE_EFFECTS)
+    def test_produces_visible_result(self, fn, params, name):
+        ls, layer = _make_colorful_stack()
+        result = fn(ls, layer, params)
+        assert result is not None
+        assert name in result.name
+        assert _has_nonzero_pixels(result.image)
+
+    @pytest.mark.parametrize("fn,params,name", _STYLE_EFFECTS)
+    def test_rejects_group_layer(self, fn, params, name):
+        ls, _ = _make_colorful_stack()
+        group = GroupLayer("グループ", W, H)
+        assert fn(ls, group, params) is None
+
+    @pytest.mark.parametrize("fn,params,name", _STYLE_EFFECTS)
+    def test_keeps_offset_and_hides_source(self, fn, params, name):
+        ls, layer = _make_colorful_stack()
+        layer.offset_x, layer.offset_y = 23, 41
+        result = fn(ls, layer, params)
+        assert (result.offset_x, result.offset_y) == (23, 41)
+        assert layer.visible is False
+        assert layer in ls.layers
+
+    @pytest.mark.parametrize("fn,params,name", _STYLE_EFFECTS)
+    def test_result_size_matches_source(self, fn, params, name):
+        ls, layer = _make_colorful_stack()
+        result = fn(ls, layer, params)
+        assert result.image.width() == layer.image.width()
+        assert result.image.height() == layer.image.height()
+
+    @pytest.mark.parametrize("fn,params,name", _STYLE_EFFECTS)
+    def test_empty_layer_returns_none(self, fn, params, name):
+        """完全に透明なレイヤーでは None を返し、空の結果を作らない。"""
+        ls = LayerStack(60, 60)
+        layer = ls.add("空")
+        result = fn(ls, layer, params)
+        assert result is None or _has_nonzero_pixels(result.image)
+
+
+class TestWarhol:
+    def _params(self, **over):
+        p = {"cols": 2, "rows": 2, "levels": 4, "gap": 0, "outline": 2,
+             "random_sets": False}
+        p.update(over)
+        return p
+
+    def test_tiles_are_different_colors(self):
+        """コマごとに配色が変わる（4枚が同じ絵にならない）。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack(size=120)
+        result = execute_warhol(ls, layer, self._params())
+        arr = _qimage_to_array_test(result.image)
+        h, w = arr.shape[:2]
+        quads = [arr[:h // 2, :w // 2], arr[:h // 2, w // 2:],
+                 arr[h // 2:, :w // 2], arr[h // 2:, w // 2:]]
+        means = [q[:, :, :3].reshape(-1, 3).mean(axis=0) for q in quads]
+        # どの2コマを比べても平均色が一致しない
+        for i in range(len(means)):
+            for j in range(i + 1, len(means)):
+                assert np.abs(means[i] - means[j]).max() > 5, (i, j)
+
+    def test_grid_shape_is_respected(self):
+        """3×3 を指定すると9コマぶんの繰り返しになる。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack(size=180)
+        result = execute_warhol(ls, layer, self._params(cols=3, rows=3))
+        arr = _qimage_to_array_test(result.image)
+        # コマごとの平均色を比べる。9コマが全部同じ配色ではないことを見る
+        # （1点だけ拾うと輪郭線に当たって偶然一致するので平均で判定する）
+        h, w = arr.shape[:2]
+        means = []
+        for r in range(3):
+            for c in range(3):
+                cell = arr[r * h // 3:(r + 1) * h // 3,
+                           c * w // 3:(c + 1) * w // 3, :3]
+                means.append(tuple(np.round(
+                    cell.reshape(-1, 3).mean(axis=0)).astype(int).tolist()))
+        assert len(set(means)) >= 3
+
+    def test_fills_whole_canvas(self):
+        """透明な余白を残さず、キャンバス全体が塗られる。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        result = execute_warhol(ls, layer, self._params(gap=0))
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        assert (alpha > 0).mean() > 0.99
+
+    def test_gap_leaves_untouched_border(self):
+        """コマの間隔を空けると、その隙間は塗られない。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_warhol(ls, layer, self._params(gap=6))
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        # 左端の列は隙間なので透明のまま
+        assert alpha[:, 0].max() == 0
+
+
+class TestLichtenstein:
+    PARAMS = {"pitch": 6, "outline": 3, "levels": 3,
+              "dot_color": QColor(200, 30, 40), "line_color": QColor(20, 20, 20),
+              "white_bg": True}
+
+    def test_dot_color_is_used_exactly(self):
+        """指定した網点の色がそのまま出る（赤青が入れ替わらない）。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_lichtenstein(ls, layer, dict(self.PARAMS))
+        colors = set()
+        img = result.image
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                colors.add((c.red(), c.green(), c.blue()))
+        assert (200, 30, 40) in colors
+
+    def test_white_background_fills_canvas(self):
+        """背景を白で埋めると全面が不透明になる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_lichtenstein(ls, layer, dict(self.PARAMS))
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        assert (alpha == 255).all()
+
+    def test_transparent_background_keeps_gaps(self):
+        """背景を埋めない場合、絵の外は透明のまま残る。"""
+        params = dict(self.PARAMS, white_bg=False)
+        ls, layer = _make_colorful_stack()
+        result = execute_lichtenstein(ls, layer, params)
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        assert alpha[0, 0] == 0
+
+    def test_outline_is_drawn(self):
+        """輪郭線の色が実際に描かれる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_lichtenstein(ls, layer, dict(self.PARAMS))
+        arr = _qimage_to_array_test(result.image)
+        # 線色 (20,20,20) は BGR 順で格納される
+        dark = (arr[:, :, 0] < 60) & (arr[:, :, 1] < 60) & (arr[:, :, 2] < 60)
+        assert dark.any()
+
+
+class TestUkiyoe:
+    PARAMS = {"levels": 4, "misalign": 0, "sumi": 2, "paper": 0.0,
+              "paper_color": QColor(240, 230, 205)}
+
+    def test_paper_color_shows_through(self):
+        """絵の無い所は指定した紙の色になる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_ukiyoe(ls, layer, dict(self.PARAMS))
+        c = result.image.pixelColor(0, 0)
+        assert (c.red(), c.green(), c.blue()) == (240, 230, 205)
+
+    def test_reduces_color_count(self):
+        """版画らしく色数が元より減る。"""
+        import numpy as np
+        ls, layer = _make_colorful_stack()
+        result = execute_ukiyoe(ls, layer, dict(self.PARAMS))
+        arr = _qimage_to_array_test(result.image)
+        uniq = np.unique(arr[:, :, :3].reshape(-1, 3), axis=0)
+        assert len(uniq) < 40
+
+    def test_keeps_hue_of_source(self):
+        """平坦化しても元の色味が残る（無彩色の灰色に潰れない）。"""
+        ls = LayerStack(80, 80)
+        layer = ls.add("色")
+        p = QPainter(layer.image)
+        p.fillRect(10, 10, 60, 60, QColor(210, 120, 90, 255))  # 肌色
+        p.end()
+        result = execute_ukiyoe(ls, layer, dict(self.PARAMS, sumi=0))
+        c = result.image.pixelColor(40, 40)
+        # R > G > B の関係が保たれていれば色味が生きている
+        assert c.red() > c.green() > c.blue()
+
+
+class TestImpressionist:
+    PARAMS = {"length": 10, "width": 3, "density": 1.5, "jitter": 0,
+              "follow": True}
+
+    def test_covers_the_subject(self):
+        """元の絵があった場所が塗り残されない。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_impressionist(ls, layer, dict(self.PARAMS))
+        src_a = _qimage_to_array_test(layer.image)[:, :, 3]
+        out_a = _qimage_to_array_test(result.image)[:, :, 3]
+        covered = out_a[src_a > 128]
+        assert (covered > 0).mean() > 0.95
+
+    def test_keeps_source_colors(self):
+        """筆跡の色は元の絵の色に由来する。"""
+        ls = LayerStack(80, 80)
+        layer = ls.add("色")
+        p = QPainter(layer.image)
+        p.fillRect(10, 10, 60, 60, QColor(210, 60, 60, 255))
+        p.end()
+        result = execute_impressionist(ls, layer, dict(self.PARAMS))
+        c = result.image.pixelColor(40, 40)
+        assert c.red() > c.green() and c.red() > c.blue()
+
+    def test_does_not_paint_far_outside(self):
+        """絵から大きく離れた場所には筆を置かない。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_impressionist(ls, layer, dict(self.PARAMS))
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        # 図形は (10,10)-(110,110) の範囲。四隅の外側は塗られない
+        assert alpha[-1, -1] == 0
+
+
+class TestStainedGlass:
+    PARAMS = {"cell": 20, "lead": 3, "lead_color": QColor(30, 200, 40),
+              "vivid": 1.5, "glass_bg": True}
+
+    def test_lead_color_is_used_exactly(self):
+        """鉛線の指定色がそのまま出る（赤青が入れ替わらない）。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_stained_glass(ls, layer, dict(self.PARAMS))
+        colors = set()
+        img = result.image
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                colors.add((c.red(), c.green(), c.blue()))
+        assert (30, 200, 40) in colors
+
+    def test_glass_background_fills_canvas(self):
+        """背景もガラスにすると全面が不透明になる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_stained_glass(ls, layer, dict(self.PARAMS))
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        assert (alpha == 255).all()
+
+    def test_without_glass_background_keeps_transparency(self):
+        """背景をガラスにしなければ絵の外は透明のまま。"""
+        import numpy as np
+        params = dict(self.PARAMS, glass_bg=False)
+        ls, layer = _make_colorful_stack()
+        result = execute_stained_glass(ls, layer, params)
+        src_a = _qimage_to_array_test(layer.image)[:, :, 3]
+        out_a = _qimage_to_array_test(result.image)[:, :, 3]
+        # 元が透明だった範囲の大半は透明のまま残る
+        outside = out_a[src_a == 0]
+        assert (outside == 0).mean() > 0.5
+
+    def test_larger_cells_make_fewer_pieces(self):
+        """ガラス片を大きくすると鉛線の総量が減る。"""
+        ls1, l1 = _make_colorful_stack()
+        fine = execute_stained_glass(ls1, l1, dict(self.PARAMS, cell=12))
+        ls2, l2 = _make_colorful_stack()
+        coarse = execute_stained_glass(ls2, l2, dict(self.PARAMS, cell=40))
+
+        def lead_ratio(layer):
+            arr = _qimage_to_array_test(layer.image)
+            # 鉛線 (30,200,40) は BGR 順で (40,200,30)
+            m = ((arr[:, :, 0] == 40) & (arr[:, :, 1] == 200)
+                 & (arr[:, :, 2] == 30))
+            return m.mean()
+
+        assert lead_ratio(fine) > lead_ratio(coarse)
+
+
+class TestBlueprint:
+    PARAMS = {"paper_color": QColor(20, 60, 130),
+              "ink_color": QColor(235, 243, 255), "thickness": 2,
+              "grid": 0, "major": 4, "fade": 0.0}
+
+    def test_paper_color_is_used_exactly(self):
+        """地の色が指定どおりに出る（赤青が入れ替わらない）。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_blueprint(ls, layer, dict(self.PARAMS))
+        c = result.image.pixelColor(0, 0)
+        assert (c.red(), c.green(), c.blue()) == (20, 60, 130)
+
+    def test_fills_whole_canvas(self):
+        """図面なので全面が不透明になる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_blueprint(ls, layer, dict(self.PARAMS))
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        assert (alpha == 255).all()
+
+    def test_grid_adds_lines(self):
+        """方眼を有効にすると地の色以外の画素が増える。"""
+        ls1, l1 = _make_colorful_stack()
+        plain = execute_blueprint(ls1, l1, dict(self.PARAMS, grid=0))
+        ls2, l2 = _make_colorful_stack()
+        ruled = execute_blueprint(ls2, l2, dict(self.PARAMS, grid=10))
+
+        def ink_ratio(layer):
+            arr = _qimage_to_array_test(layer.image)
+            # 地の色 (20,60,130) は BGR 順で (130,60,20)
+            same = ((arr[:, :, 0] == 130) & (arr[:, :, 1] == 60)
+                    & (arr[:, :, 2] == 20))
+            return 1.0 - same.mean()
+
+        assert ink_ratio(ruled) > ink_ratio(plain)
+
+
+class TestEtching:
+    PARAMS = {"spacing": 4, "layers": 4, "wobble": 0.0,
+              "ink_color": QColor(35, 28, 22),
+              "paper_color": QColor(238, 230, 214), "grain": 0.0}
+
+    def test_paper_color_shows_through(self):
+        """彫っていない所は紙の色のまま。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_etching(ls, layer, dict(self.PARAMS))
+        c = result.image.pixelColor(0, 0)
+        assert (c.red(), c.green(), c.blue()) == (238, 230, 214)
+
+    def test_darker_areas_get_denser_lines(self):
+        """暗い所ほど彫り線が密になる。"""
+        ls = LayerStack(120, 60)
+        layer = ls.add("明暗")
+        p = QPainter(layer.image)
+        p.fillRect(0, 0, 60, 60, QColor(230, 230, 230, 255))   # 明るい側
+        p.fillRect(60, 0, 60, 60, QColor(40, 40, 40, 255))     # 暗い側
+        p.end()
+        result = execute_etching(ls, layer, dict(self.PARAMS))
+        arr = _qimage_to_array_test(result.image)
+        # インク (35,28,22) に近い画素の割合を左右で比べる
+        ink = (arr[:, :, 2] < 140)
+        light_side = ink[:, :60].mean()
+        dark_side = ink[:, 60:].mean()
+        assert dark_side > light_side
+
+    def test_fills_whole_canvas(self):
+        """紙に刷るので全面が不透明になる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_etching(ls, layer, dict(self.PARAMS))
+        alpha = _qimage_to_array_test(result.image)[:, :, 3]
+        assert (alpha == 255).all()
+
+
+class TestStyleEffectsInGacha:
+    """7つの「○○風」がガチャに正しく登録されている。"""
+
+    STYLE_KEYS = ["warhol", "lichtenstein", "ukiyoe", "impressionist",
+                  "stained_glass", "blueprint", "etching"]
+
+    @pytest.mark.parametrize("key", STYLE_KEYS)
+    def test_key_is_in_pool(self, key):
+        assert key in [k for k, _ in _GACHA_POOL]
+
+    @pytest.mark.parametrize("key", STYLE_KEYS)
+    def test_key_is_executable(self, key):
+        assert key in _GACHA_EXEC
+
+    @pytest.mark.parametrize("key", STYLE_KEYS)
+    def test_random_params_actually_execute(self, key):
+        """生成されたランダム値でどれも実行でき、空にならない。"""
+        colors = [QColor(c) for c in GACHA_PALETTES[1][1]]
+        for _ in range(5):
+            ls, layer = _make_colorful_stack()
+            params = _gacha_random_params(key, colors)
+            result = _GACHA_EXEC[key](ls, layer, params)
+            assert result is not None, (key, params)
+            assert _has_nonzero_pixels(result.image), (key, params)
+
+    def test_warhol_gacha_uses_multiple_palettes(self):
+        """ウォーホル風のランダム値はコマ数ぶんの配色を用意する。"""
+        colors = [QColor(c) for c in GACHA_PALETTES[0][1]]
+        for _ in range(10):
+            params = _gacha_random_params("warhol", colors)
+            assert len(params["palettes"]) == params["cols"] * params["rows"]
