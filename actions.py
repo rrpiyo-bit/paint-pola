@@ -1718,11 +1718,26 @@ class CollageDialog(QDialog):
         self._shift.setSuffix(" px")
         form.addRow("ずらし量（最大）", self._shift)
 
+        self._close_gap = QSpinBox()
+        self._close_gap.setRange(0, 20)
+        self._close_gap.setValue(0)
+        self._close_gap.setSuffix(" px")
+        self._close_gap.setToolTip("線画が途切れていても、この px までなら閉じた領域とみなす")
+        form.addRow("隙間を閉じる", self._close_gap)
+
+        self._line_sensitivity = QSpinBox()
+        self._line_sensitivity.setRange(0, 100)
+        self._line_sensitivity.setValue(0)
+        self._line_sensitivity.setSuffix(" %")
+        self._line_sensitivity.setToolTip("上げるほど薄い線も境界として拾う")
+        form.addRow("薄い線を拾う", self._line_sensitivity)
+
         layout.addLayout(form)
 
         desc = QLabel("線画の閉じた領域をランダムに拾って色紙で塗り、\n"
                       "少しはみ出し・ずらして貼った切り絵風にします。\n"
-                      "広い領域は自動で複数の紙片に分けて塗り分けます。")
+                      "広い領域は自動で複数の紙片に分けて塗り分けます。\n"
+                      "線に隙間がある場合は「隙間を閉じる」を上げてください。")
         desc.setStyleSheet("color: #666; font-size: 11px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -1738,6 +1753,8 @@ class CollageDialog(QDialog):
             "coverage": self._coverage.value(),
             "expand": self._expand.value(),
             "shift": self._shift.value(),
+            "close_gap": self._close_gap.value(),
+            "line_sensitivity": self._line_sensitivity.value(),
         }
 
 
@@ -1754,17 +1771,30 @@ def execute_collage(layer_stack: LayerStack, source_layer: Layer,
     if not alpha.any():
         return None
 
-    # 線（不透明部）で区切られた透明領域のうち、画像の外周に接していない
-    # 「閉じた領域」だけを塗り対象にする
-    free = (alpha <= 10).astype(np.uint8)
-    n_labels, labels = cv2.connectedComponents(free, connectivity=4)
-    edge_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) \
-        | set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
-
     coverage = params.get("coverage", 70) / 100.0
     expand = params.get("expand", 0)
     shift = params.get("shift", 0)
     colors = params["colors"]
+    close_gap = max(0, int(params.get("close_gap", 0)))
+    # バケツツールと同じ換算。感度を上げるほどしきい値が下がり、
+    # アンチエイリアスで薄くなった線も「線」として拾う。
+    line_threshold = round(10 * (100 - max(0, min(100, int(params.get("line_sensitivity", 0))))) / 100)
+
+    # 線（不透明部）で区切られた透明領域のうち、画像の外周に接していない
+    # 「閉じた領域」だけを塗り対象にする
+    free = (alpha <= line_threshold).astype(np.uint8)
+    if close_gap > 0:
+        # 線を太らせる＝空き領域を削る。数 px の途切れが塞がり、
+        # 開いた領域も「閉じた領域」として検出できるようになる。
+        ksize = close_gap * 2 + 1
+        gap_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        search = cv2.erode(free, gap_kernel)
+    else:
+        gap_kernel = None
+        search = free
+    n_labels, labels = cv2.connectedComponents(search, connectivity=4)
+    edge_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) \
+        | set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
     expand_kernel = None
     if expand > 0:
         expand_kernel = cv2.getStructuringElement(
@@ -1775,6 +1805,10 @@ def execute_collage(layer_stack: LayerStack, source_layer: Layer,
         if lab in edge_labels:
             continue
         mask = (labels == lab).astype(np.uint8) * 255
+        if gap_kernel is not None:
+            # 隙間閉じで削った分を戻し、本来の線の手前まで塗る。
+            # 元の空き領域でクリップするので線を越えることはない。
+            mask = cv2.dilate(mask, gap_kernel) * free
         if int(np.count_nonzero(mask)) < 30:  # ノイズ領域は無視
             continue
         candidates.append(mask)
@@ -2315,8 +2349,10 @@ class HalftoneDialog(QDialog):
         form.addRow("種類", self._mode)
 
         self._bg = QComboBox()
+        # 既定は透過。イラストに掛けたときに背景が白く埋まると、
+        # 下のレイヤーが隠れて使いにくいため。
+        self._bg.addItem("背景は透明のまま（イラストだけに効果）", "transparent")
         self._bg.addItem("白地に印刷", "white")
-        self._bg.addItem("背景は透明のまま", "transparent")
         form.addRow("背景", self._bg)
 
         self._smooth = QCheckBox("アンチエイリアスをかける")
@@ -2403,6 +2439,10 @@ def execute_halftone(layer_stack: LayerStack, source_layer: Layer,
             out[:, :, 2] = planes[2] * 255.0
             # どれか1版でも点が乗っていれば不透明にする
             ink = np.maximum.reduce(planes)
+            # 各版の濃度は「その色の光の強さ」なので、絵の無い所（＝白紙）は
+            # 全版が最大になり、背景が真っ白なベタで埋まってしまう。
+            # 元が透明だった場所には点を打たず、透過を保つ。
+            ink = ink * np.clip(alpha / 255.0, 0.0, 1.0)
             out[:, :, 3] = ink * 255.0
 
     if background == "white" and mode == "mono":
@@ -4205,7 +4245,8 @@ def _gacha_random_params(key: str, colors: list[QColor]) -> dict:
                 "shift": ri(10, 50), "opacity": ri(60, 100)}
     if key == "collage":
         return {"colors": colors, "coverage": ri(40, 90),
-                "expand": ri(0, 10), "shift": ri(0, 12)}
+                "expand": ri(0, 10), "shift": ri(0, 12),
+                "close_gap": ri(0, 4), "line_sensitivity": ri(0, 100)}
     if key == "wobble":
         return {"strength": ri(3, 18), "wavelength": ri(30, 180),
                 "gap": ri(0, 40)}

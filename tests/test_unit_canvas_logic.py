@@ -651,3 +651,46 @@ class TestCanvasFillOptionDefaults:
         assert c.fill_line_sensitivity == 0
         # 感度0% は従来の alpha>10 判定と等価
         assert canvas_mod._sensitivity_to_threshold(c.fill_line_sensitivity) == 10
+
+
+class TestFillOnOpaqueBackground:
+    """白背景で描かれた線画レイヤーを参照にしても塗れること（不透明＝全部線 の誤判定対策）。"""
+
+    def _white_bg_ref(self, w=100, h=100):
+        ref = QImage(w, h, QImage.Format.Format_ARGB32)
+        ref.fill(QColor(255, 255, 255, 255))
+        p = QPainter(ref)
+        p.setPen(QPen(QColor(0, 0, 0, 255), 3))
+        p.drawRect(20, 20, 59, 59)
+        p.end()
+        return ref
+
+    def _fill(self, ref, seed):
+        img = QImage(ref.width(), ref.height(), QImage.Format.Format_ARGB32)
+        img.fill(QColor(0, 0, 0, 0))
+        _flood_fill(img, seed[0], seed[1], QColor(255, 0, 0, 255), ref)
+        return img
+
+    def test_inside_fills_on_white_background(self):
+        img = self._fill(self._white_bg_ref(), (50, 50))
+        assert img.pixelColor(50, 50).alpha() > 0
+
+    def test_line_still_blocks_leak_to_outside(self):
+        img = self._fill(self._white_bg_ref(), (50, 50))
+        assert img.pixelColor(2, 2).alpha() == 0
+
+    def test_outside_fills_without_touching_inside(self):
+        img = self._fill(self._white_bg_ref(), (2, 2))
+        assert img.pixelColor(2, 2).alpha() > 0
+        assert img.pixelColor(50, 50).alpha() == 0
+
+    def test_transparent_background_unchanged(self):
+        """透明背景の通常ケースは従来どおり（地色判定が誤発動しない）。"""
+        assert _fill_and_count(_boxed_ref()) == INSIDE
+
+    def test_dark_opaque_background_still_treated_as_line(self):
+        """暗いベタ塗り面は地色ではないので、従来どおり境界のまま。"""
+        ref = QImage(100, 100, QImage.Format.Format_ARGB32)
+        ref.fill(QColor(20, 20, 20, 255))
+        img = self._fill(ref, (50, 50))
+        assert img.pixelColor(50, 50).alpha() == 0

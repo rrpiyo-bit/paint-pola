@@ -756,6 +756,84 @@ class TestCollageSplit:
         assert len(np.unique(op[:, :3], axis=0)) == 1
 
 
+class TestCollageGapOptions:
+    """隙間のある線画向けの「隙間を閉じる」「薄い線を拾う」オプション。"""
+
+    def _gappy_box_stack(self, gap_px, size=200):
+        from PyQt6.QtGui import QPen
+        ls = LayerStack(size, size)
+        layer = ls.add("隙間線画")
+        p = QPainter(layer.image)
+        pen = QPen(QColor(0, 0, 0, 255)); pen.setWidth(3)
+        p.setPen(pen)
+        # 上辺に gap_px の隙間を空けた四角形
+        p.drawLine(30, 30, 100 - gap_px // 2, 30)
+        p.drawLine(100 + gap_px // 2, 30, 170, 30)
+        p.drawLine(170, 30, 170, 170)
+        p.drawLine(170, 170, 30, 170)
+        p.drawLine(30, 170, 30, 30)
+        p.end()
+        return ls, layer
+
+    def _painted_count(self, result):
+        import numpy as np
+        arr = _qimage_to_array_test(result.children[-1].image)
+        return int(np.count_nonzero(arr[:, :, 3]))
+
+    def _run(self, ls, layer, **extra):
+        params = {"colors": [QColor(255, 0, 0)] * 4, "coverage": 100,
+                  "expand": 0, "shift": 0}
+        params.update(extra)
+        return execute_collage(ls, layer, params)
+
+    def test_gap_breaks_region_without_option(self):
+        ls, layer = self._gappy_box_stack(6)
+        assert self._run(ls, layer, close_gap=0) is None
+
+    def test_close_gap_recovers_region(self):
+        ls, layer = self._gappy_box_stack(6)
+        result = self._run(ls, layer, close_gap=5)
+        assert result is not None
+        assert self._painted_count(result) > 10000
+
+    def test_close_gap_fill_matches_intact_shape(self):
+        """隙間を閉じても塗り面積が痩せないこと（線の手前まで戻している）。"""
+        ls_gap, layer_gap = self._gappy_box_stack(6)
+        gapped = self._painted_count(self._run(ls_gap, layer_gap, close_gap=5))
+        ls_ok, layer_ok = self._gappy_box_stack(0)
+        intact = self._painted_count(self._run(ls_ok, layer_ok, close_gap=0))
+        assert gapped > intact * 0.9
+
+    def test_defaults_preserve_previous_behaviour(self):
+        ls, layer = _make_stack_with_closed_shape()
+        result = self._run(ls, layer)
+        assert result is not None
+        assert self._painted_count(result) > 0
+
+    def test_line_sensitivity_picks_up_faint_lines(self):
+        """薄い線で描いた輪郭も、感度を上げれば境界として機能する。"""
+        from PyQt6.QtGui import QPen
+        ls = LayerStack(120, 120)
+        layer = ls.add("薄線")
+        p = QPainter(layer.image)
+        pen = QPen(QColor(0, 0, 0, 6)); pen.setWidth(3)  # 既定しきい値10以下
+        p.setPen(pen)
+        p.drawRect(20, 20, 80, 80)
+        p.end()
+        # 感度0では線とみなされず、閉領域が成立しない
+        assert self._run(ls, layer, line_sensitivity=0) is None
+        ls2 = LayerStack(120, 120)
+        ls2.layers = [layer]; ls2.active_path = [0]
+        result = self._run(ls2, layer, line_sensitivity=100)
+        assert result is not None
+
+    def test_dialog_exposes_new_params(self):
+        from actions import CollageDialog
+        params = CollageDialog().params()
+        assert params["close_gap"] == 0
+        assert params["line_sensitivity"] == 0
+
+
 def _qimage_to_array_test(img: QImage):
     import numpy as np
     img32 = img.convertToFormat(QImage.Format.Format_ARGB32)

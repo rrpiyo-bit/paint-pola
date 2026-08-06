@@ -120,6 +120,43 @@ def _is_line_pixel(pixel: int, threshold: int = LINE_ALPHA_THRESHOLD) -> bool:
     return _alpha(pixel) > threshold
 
 
+def _line_free_mask(judge_arr: np.ndarray, threshold: int = LINE_ALPHA_THRESHOLD) -> np.ndarray:
+    """参照配列(BGRA)のうち「線ではない＝塗ってよい」ピクセルの真偽マスクを返す。
+
+    基本は「透明＝塗れる／不透明＝線」。ただし線画を白背景で描いた（あるいは
+    背景を白で塗り潰した）レイヤーを参照にすると、全面が不透明になって
+    どこも塗れなくなってしまう。そこで、不透明部分の大半が単一の明るい色
+    （＝紙の地）で占められている場合に限り、その色を背景とみなして
+    塗れる側に含める。線そのものは地色と違う色なので境界として残る。
+    """
+    alpha = judge_arr[:, :, 3]
+    free = alpha <= threshold
+    opaque = ~free
+    n_opaque = int(np.count_nonzero(opaque))
+    if n_opaque == 0 or n_opaque < alpha.size * 0.5:
+        # 透明背景の普通の線画。従来どおり alpha だけで判定する。
+        return free
+
+    # 不透明部分の最頻色を求める（各チャンネル32段に丸めて集計）
+    bgr = judge_arr[:, :, :3][opaque]
+    keys = ((bgr[:, 0] >> 3).astype(np.int32) << 10) \
+        | ((bgr[:, 1] >> 3).astype(np.int32) << 5) \
+        | (bgr[:, 2] >> 3).astype(np.int32)
+    vals, counts = np.unique(keys, return_counts=True)
+    top = int(vals[int(np.argmax(counts))])
+    share = int(counts.max()) / n_opaque
+    b = ((top >> 10) & 0x1F) << 3
+    g = ((top >> 5) & 0x1F) << 3
+    r = (top & 0x1F) << 3
+    # 地色とみなす条件: 不透明部分の過半を占めていて、かつ明るい色であること。
+    if share < 0.5 or (0.114 * b + 0.587 * g + 0.299 * r) < 160:
+        return free
+
+    diff = np.abs(judge_arr[:, :, :3].astype(np.int16)
+                  - np.array([b, g, r], dtype=np.int16)).max(axis=2)
+    return free | (opaque & (diff <= 24))
+
+
 def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
                 ref_image: QImage | None = None,
                 close_gap: int = 0, line_threshold: int = LINE_ALPHA_THRESHOLD):
@@ -147,9 +184,10 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
     # 参照モード: judge の不透明ピクセルが境界、image の未塗りピクセルが対象
     # 通常モード: image の同色ピクセルが対象
     if ref_image is not None:
-        if _is_line_pixel(judge.pixel(x, y), line_threshold):
+        candidate = _line_free_mask(judge_arr, line_threshold)
+        if not candidate[y, x]:
             return
-        candidate = (judge_arr[:, :, 3] <= line_threshold).astype(np.uint8)
+        candidate = candidate.astype(np.uint8)
         if close_gap > 0:
             # 線を太らせる = 候補領域を削る。これで数px の途切れが塞がり、
             # 隣の領域へ塗りが漏れ出さなくなる。
@@ -185,7 +223,7 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
         ksize = close_gap * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         grown = cv2.dilate(fill_mask.astype(np.uint8), kernel)
-        original_candidate = (judge_arr[:, :, 3] <= line_threshold)
+        original_candidate = _line_free_mask(judge_arr, line_threshold)
         fill_mask = (grown > 0) & original_candidate
 
     if ref_image is not None:
@@ -261,7 +299,8 @@ def _fill_closed_regions_in_area(image: QImage, area_mask: np.ndarray,
     nbytes = h * w * 4
     ptr = judge.bits(); ptr.setsize(nbytes)
     judge_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
-    line_mask = (judge_arr[:, :, 3] > 10).astype(np.uint8)  # 不透明=線(境界)
+    # 不透明=線(境界)。ただし白背景の線画は地色を塗れる側に含める。
+    line_mask = (~_line_free_mask(judge_arr)).astype(np.uint8)
 
     # 選択範囲内かつ線でない領域を対象候補としてラベリング
     candidate = ((area_mask > 0) & (line_mask == 0)).astype(np.uint8)
