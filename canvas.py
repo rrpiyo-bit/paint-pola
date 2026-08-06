@@ -97,17 +97,42 @@ def _alpha(pixel: int) -> int:
     return (pixel >> 24) & 0xFF
 
 
-def _is_line_pixel(pixel: int, threshold: int = 10) -> bool:
+LINE_ALPHA_THRESHOLD = 10
+# 「線」と判定する alpha の下限。既定の 10 だと薄いアンチエイリアス部分まで
+# 線扱いになり、逆に上げすぎると薄い線が無視されて塗りが漏れる。
+
+
+def _sensitivity_to_threshold(sensitivity: int) -> int:
+    """「薄い線を拾う感度」(0-100%) を alpha しきい値(0-10) に換算する。
+
+    感度を上げるほどしきい値が下がり、薄いピクセルまで線とみなすので、
+    アンチエイリアスで色が薄くなった部分が「途切れ」と判定されにくくなる。
+    0% は従来どおり alpha>10、100% は alpha が 1 でもあれば線。
+    しきい値を上げる方向（薄い線を無視する）は塗り漏れを増やすだけなので用意しない。
+    """
+    s = max(0, min(100, sensitivity))
+    return round(LINE_ALPHA_THRESHOLD * (100 - s) / 100)
+
+
+def _is_line_pixel(pixel: int, threshold: int = LINE_ALPHA_THRESHOLD) -> bool:
     """参照レイヤーのピクセルが「線」（塗りつぶしを堰き止める境界）かどうか判定する。
     不透明なピクセルはすべて境界（白い線も含む）。"""
     return _alpha(pixel) > threshold
 
 
 def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
-                ref_image: QImage | None = None):
+                ref_image: QImage | None = None,
+                close_gap: int = 0, line_threshold: int = LINE_ALPHA_THRESHOLD):
     """連結領域を numpy/cv2 のラベリングで検出し、一括書き込みする塗りつぶし。
     QImage.pixel()/setPixel() を1ピクセルずつ呼ぶ旧scanline実装は、大キャンバスで
-    UIスレッドが長時間ブロックされフリーズ/クラッシュする原因になっていたため廃止。"""
+    UIスレッドが長時間ブロックされフリーズ/クラッシュする原因になっていたため廃止。
+
+    close_gap: 線画が途切れていても塗りが漏れないよう、判定用の線マスクだけを
+        この px だけ太らせる。実際に塗る範囲は元の線位置まで戻すので、
+        塗りが痩せることはない。
+    line_threshold: この alpha 以下のピクセルは「線ではない」とみなす。
+        値を上げると薄いアンチエイリアス部分を線扱いしなくなり、
+        「色が薄いせいで途切れ扱いされる」のを防げる（参照モードのみ有効）。"""
     w, h = image.width(), image.height()
     if not (0 <= x < w and 0 <= y < h):
         return
@@ -122,9 +147,21 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
     # 参照モード: judge の不透明ピクセルが境界、image の未塗りピクセルが対象
     # 通常モード: image の同色ピクセルが対象
     if ref_image is not None:
-        if _is_line_pixel(judge.pixel(x, y)):
+        if _is_line_pixel(judge.pixel(x, y), line_threshold):
             return
-        candidate = (judge_arr[:, :, 3] <= 10).astype(np.uint8)
+        candidate = (judge_arr[:, :, 3] <= line_threshold).astype(np.uint8)
+        if close_gap > 0:
+            # 線を太らせる = 候補領域を削る。これで数px の途切れが塞がり、
+            # 隣の領域へ塗りが漏れ出さなくなる。
+            ksize = close_gap * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            closed = cv2.erode(candidate, kernel)
+            # 削った結果シード自体が候補から外れると何も塗れなくなるので、
+            # その場合は隙間閉じを諦めて元の候補で処理する。
+            if closed[y, x]:
+                candidate = closed
+            else:
+                close_gap = 0
     else:
         target = judge.pixel(x, y)
         if target == fill:
@@ -141,6 +178,15 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
     if seed_label == 0:
         return
     fill_mask = labels == seed_label
+
+    if ref_image is not None and close_gap > 0:
+        # 隙間閉じで削った分だけ塗りを太らせ直し、元の線の手前まで塗る。
+        # 太らせ過ぎて線を越えないよう、本来の候補領域でクリップする。
+        ksize = close_gap * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        grown = cv2.dilate(fill_mask.astype(np.uint8), kernel)
+        original_candidate = (judge_arr[:, :, 3] <= line_threshold)
+        fill_mask = (grown > 0) & original_candidate
 
     if ref_image is not None:
         img_ptr = image.bits(); img_ptr.setsize(nbytes)
@@ -159,15 +205,16 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
 
 def _flood_fill_expanded(image: QImage, x: int, y: int,
                           fill_color: QColor, ref_image: QImage | None,
-                          expand: int):
+                          expand: int, close_gap: int = 0,
+                          line_threshold: int = LINE_ALPHA_THRESHOLD):
     """flood fill 後に expand px だけ塗り範囲を膨張(正)/収縮(負)させる。"""
     if expand == 0:
-        _flood_fill(image, x, y, fill_color, ref_image)
+        _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold)
         return
 
     # fill 前のスナップショット
     before = image.copy()
-    _flood_fill(image, x, y, fill_color, ref_image)
+    _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold)
 
     # 「新たに塗られたピクセル」のマスクを numpy で取り出す
     w, h = image.width(), image.height()
@@ -335,6 +382,11 @@ class Canvas(QWidget):
         # 図形塗りモード: "none"=枠線のみ / "fill"=塗りのみ / "both"=枠線＋塗り
         self.shape_fill: str = "none"
         self.fill_expand: int = 0   # バケツ塗り拡張(正)/縮小(負) px
+        self.fill_close_gap: int = 0  # 線画の途切れを塞ぐ px（0=無効）
+        # 薄い線をどれだけ拾うか(%)。値が大きいほど薄いピクセルまで「線」とみなし、
+        # 「色が薄いせいで途切れ扱いされる」のを防ぐ。
+        # 0% = 従来どおり alpha>10 のみ線、100% = alpha が少しでもあれば線。
+        self.fill_line_sensitivity: int = 0
         self.select_mode: str = "select"  # "select" | "transform"
 
         # ぼかしツール
@@ -1470,7 +1522,9 @@ class Canvas(QWidget):
                     # ローカル座標系（offset_x/offset_y 分ずれている）に合わせて切り出す
                     # （_apply_lasso_fill と同じ考え方）。
                     ref_img = ref_img.copy(lox, loy, lw, lh)
-            _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img, self.fill_expand)  # type: ignore
+            thr = _sensitivity_to_threshold(self.fill_line_sensitivity)
+            _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img,  # type: ignore
+                                 self.fill_expand, self.fill_close_gap, thr)
             self.update()
 
         elif self.tool == Tool.BLUR:

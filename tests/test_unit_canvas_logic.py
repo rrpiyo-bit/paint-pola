@@ -533,3 +533,121 @@ class TestPerspectiveCornerDragViaSelectRect:
         assert after[1] == before[1]          # tr は固定
         assert after[2] == before[2]          # br は固定
         assert after[3] == before[3]          # bl は固定
+
+
+# ── バケツ塗り: 隙間閉じ / 薄い線を拾う感度 ────────────────────────────────
+
+def _boxed_ref(gap: int = 0, line_alpha: int = 255, w: int = 100, h: int = 100):
+    """(20,20)-(79,79) の枠線1pxの矩形。上辺中央に gap px の切れ目を空ける。"""
+    ref = QImage(w, h, QImage.Format.Format_ARGB32)
+    ref.fill(QColor(0, 0, 0, 0))
+    p = QPainter(ref)
+    p.setPen(QPen(QColor(0, 0, 0, 255), 1))
+    p.drawRect(20, 20, 59, 59)
+    p.end()
+    for x in range(45, 45 + gap):
+        ref.setPixelColor(x, 20, QColor(0, 0, 0, 0))
+    if line_alpha != 255:
+        # 上辺の一部だけを「薄いが確かに描かれている」線に置き換える
+        for x in range(45, 56):
+            ref.setPixelColor(x, 20, QColor(0, 0, 0, line_alpha))
+    return ref
+
+
+def _fill_and_count(ref, close_gap=0, threshold=10, seed=(50, 50)):
+    img = QImage(ref.width(), ref.height(), QImage.Format.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    _flood_fill(img, seed[0], seed[1], QColor(255, 0, 0, 255),
+                ref, close_gap, threshold)
+    return sum(1 for y in range(ref.height()) for x in range(ref.width())
+               if img.pixelColor(x, y).alpha() > 0)
+
+
+# 閉じた矩形の内側 58x58
+INSIDE = 3364
+
+
+class TestFillCloseGap:
+    """線画が途切れていても塗ってくれる機能。"""
+
+    def test_gap_leaks_without_close(self):
+        """隙間があると、閉じない限り外へ漏れる（この機能が必要な理由）。"""
+        assert _fill_and_count(_boxed_ref(gap=3), close_gap=0) > INSIDE * 2
+
+    @pytest.mark.parametrize("gap,close", [(1, 1), (3, 2), (3, 3), (5, 3), (5, 5)])
+    def test_gap_closed_stops_leak(self, gap, close):
+        """隙間幅の半分以上を指定すれば漏れが止まる。"""
+        n = _fill_and_count(_boxed_ref(gap=gap), close_gap=close)
+        assert n < INSIDE * 1.2
+
+    @pytest.mark.parametrize("close", [1, 2, 3, 5])
+    def test_fill_does_not_shrink(self, close):
+        """隙間閉じは判定用マスクだけを太らせるので、塗り範囲は痩せない。
+        （膨張し直さない実装だと close px 分だけ内側に縮んでしまう）"""
+        n = _fill_and_count(_boxed_ref(gap=1), close_gap=close)
+        assert n > INSIDE * 0.95
+
+    def test_close_gap_does_not_cross_line(self):
+        """膨張し直すときに線を越えて外側へはみ出さない。"""
+        assert _fill_and_count(_boxed_ref(gap=1), close_gap=5) <= INSIDE
+
+    def test_huge_close_gap_falls_back(self):
+        """閉じ幅が大きすぎてシードごと潰れる場合は、隙間閉じを諦めて通常塗り。
+        （何も塗れずに無反応になるのを防ぐ）"""
+        assert _fill_and_count(_boxed_ref(gap=0), close_gap=40) == INSIDE
+
+    def test_no_gap_unaffected(self):
+        """隙間がない絵では結果が変わらない。"""
+        assert _fill_and_count(_boxed_ref(), close_gap=3) <= INSIDE
+
+
+class TestFillLineSensitivity:
+    """色が薄い線が「途切れ」と誤判定されるのを防ぐ機能。"""
+
+    def test_sensitivity_to_threshold_range(self):
+        s2t = canvas_mod._sensitivity_to_threshold
+        assert s2t(0) == canvas_mod.LINE_ALPHA_THRESHOLD  # 既定の挙動
+        assert s2t(100) == 0                               # alpha があれば線
+        assert s2t(0) > s2t(50) > s2t(100)                 # 上げるほど拾う
+        assert s2t(-50) == s2t(0) and s2t(500) == s2t(100)  # 範囲外はクランプ
+
+    @pytest.mark.parametrize("alpha", [3, 6, 9])
+    def test_faint_line_leaks_at_default(self, alpha):
+        """既定では alpha 10 以下の線をすり抜けて漏れる（この機能が必要な理由）。"""
+        ref = _boxed_ref(line_alpha=alpha)
+        assert _fill_and_count(ref, threshold=10) > INSIDE * 2
+
+    @pytest.mark.parametrize("alpha", [3, 6, 9])
+    def test_max_sensitivity_stops_faint_line(self, alpha):
+        """感度100%なら alpha が少しでもあれば線として堰き止める。"""
+        ref = _boxed_ref(line_alpha=alpha)
+        thr = canvas_mod._sensitivity_to_threshold(100)
+        assert _fill_and_count(ref, threshold=thr) == INSIDE
+
+    def test_normal_line_unaffected_by_sensitivity(self):
+        """濃い線しかない絵では感度を変えても結果が変わらない。"""
+        ref = _boxed_ref()
+        base = _fill_and_count(ref, threshold=10)
+        for s in (0, 50, 100):
+            thr = canvas_mod._sensitivity_to_threshold(s)
+            assert _fill_and_count(ref, threshold=thr) == base
+
+    def test_seed_on_faint_line_is_blocked_at_high_sensitivity(self):
+        """感度を上げると、薄い線の上をクリックしても塗られない（線扱いになる）。"""
+        ref = _boxed_ref(line_alpha=6)
+        thr = canvas_mod._sensitivity_to_threshold(100)
+        assert _fill_and_count(ref, threshold=thr, seed=(50, 20)) == 0
+
+
+class TestCanvasFillOptionDefaults:
+    """Canvas 側の既定値が従来の挙動を変えないこと。"""
+
+    def test_defaults(self):
+        ls = LayerStack(50, 50)
+        ls.layers = [Layer("L", 50, 50)]
+        ls.active_path = [0]
+        c = Canvas(ls)
+        assert c.fill_close_gap == 0
+        assert c.fill_line_sensitivity == 0
+        # 感度0% は従来の alpha>10 判定と等価
+        assert canvas_mod._sensitivity_to_threshold(c.fill_line_sensitivity) == 10

@@ -85,6 +85,8 @@ class ToolOptionsPanel(QWidget):
     symmetry_toggled      = pyqtSignal(bool)
     shape_fill_changed    = pyqtSignal(str)
     fill_expand_changed   = pyqtSignal(int)   # バケツ塗り拡張px（負=縮小）
+    fill_close_gap_changed = pyqtSignal(int)  # 線画の途切れを塞ぐpx
+    fill_line_sensitivity_changed = pyqtSignal(int)  # 薄い線を拾う感度(%)
     select_mode_changed   = pyqtSignal(str)   # "select" | "transform"
     pivot_changed         = pyqtSignal(int, int)  # (ax, ay) 変形基準点
     pivot_mode_changed    = pyqtSignal(str)        # "preset" | "custom"
@@ -151,6 +153,7 @@ class ToolOptionsPanel(QWidget):
                  pen_size: int = 5, eraser_size: int = 20,
                  brush_key: str = "round", symmetry: bool = False,
                  shape_fill: str = "none", fill_expand: int = 0,
+                 fill_close_gap: int = 0, fill_line_sensitivity: int = 0,
                  select_mode: str = "select",
                  transform_mode: str = "standard",
                  blur_size: int = 30, blur_strength: int = 50,
@@ -191,6 +194,18 @@ class ToolOptionsPanel(QWidget):
             self._add_spinbox("拡張/縮小 (px)", fill_expand, -30, 30,
                               lambda v: self.fill_expand_changed.emit(v),
                               tooltip="正: 塗り範囲を広げる  負: 塗り範囲を縮める")
+            self._add_spinbox("隙間を閉じる (px)", fill_close_gap, 0, 20,
+                              lambda v: self.fill_close_gap_changed.emit(v),
+                              key="fill_close_gap",
+                              tooltip="線画がこの px 以内で途切れていても、\n"
+                                      "つながっているとみなして塗ります。\n"
+                                      "0 で無効。塗り範囲は痩せません。")
+            self._add_spinbox("薄い線を拾う", fill_line_sensitivity, 0, 100,
+                              lambda v: self.fill_line_sensitivity_changed.emit(v),
+                              key="fill_line_sensitivity", suffix=" %",
+                              tooltip="上げるほど薄いピクセルまで線として扱います。\n"
+                                      "色が薄い線やアンチエイリアス部分が\n"
+                                      "「途切れている」と判定されるのを防げます。")
 
         elif tool == Tool.BLUR:
             self._add_spinbox("ブラシサイズ", blur_size, 1, 200,
