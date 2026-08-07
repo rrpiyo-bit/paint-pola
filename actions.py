@@ -3007,6 +3007,103 @@ def _edge_mask(rgb: np.ndarray, alpha: np.ndarray, thickness: int) -> np.ndarray
     return edge
 
 
+# 浮世絵でよく使われた顔料に寄せた色（BGR順）。
+# 藍・べに・丹・草・group黄・薄墨。
+_UKIYOE_PIGMENTS: list[tuple[int, int, int]] = [
+    (150, 95, 45),    # 藍
+    (110, 105, 200),  # べに
+    (85, 140, 205),   # 丹（赤茶）
+    (110, 155, 130),  # 草
+    (110, 195, 220),  # 黄土
+    (170, 175, 180),  # 薄墨
+]
+
+
+def _ukiyoe_line_art_plates(alpha: np.ndarray, close_gap: int,
+                            line_threshold: int) -> list[np.ndarray]:
+    """線で囲まれた領域を版に見立てて取り出す。大きい順に返す。"""
+    free = (alpha <= line_threshold).astype(np.uint8)
+    search = free
+    gap_kernel = None
+    if close_gap > 0:
+        ksize = close_gap * 2 + 1
+        gap_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        line = (alpha > line_threshold).astype(np.uint8)
+        search = (cv2.morphologyEx(line, cv2.MORPH_CLOSE, gap_kernel) == 0
+                  ).astype(np.uint8)
+
+    n_labels, labels = cv2.connectedComponents(search, connectivity=4)
+    edge_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) \
+        | set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
+
+    regions = []
+    for lab in range(1, n_labels):
+        if lab in edge_labels:  # 外周に繋がる領域＝地。紙のまま残す
+            continue
+        mask = (labels == lab).astype(np.uint8)
+        if gap_kernel is not None:
+            mask = cv2.dilate(mask, gap_kernel) * free
+        n = int(np.count_nonzero(mask))
+        if n < 20:
+            continue
+        regions.append((n, mask > 0))
+    regions.sort(key=lambda t: -t[0])
+    return [m for _n, m in regions]
+
+
+def _ukiyoe_pigment(bgr: np.ndarray, strength: float) -> np.ndarray:
+    """版画の絵具らしく、鮮やかすぎる色を落ち着かせる。
+
+    浮世絵は藍・べに・草汁といった鉱物/植物顔料なので、ディスプレイの
+    ネオン色そのままだと版画に見えない。彩度を抑えて明度をわずかに
+    落とし、紙に染みた顔料に寄せる。strength=0 で元の色のまま。
+    """
+    if strength <= 0:
+        return bgr
+    px = np.clip(bgr, 0, 255).astype(np.uint8).reshape(1, 1, 3)
+    hsv = cv2.cvtColor(px, cv2.COLOR_BGR2HSV).astype(np.float32)
+    # 彩度を圧縮する。上限を切るだけだと、ディスプレイの原色（彩度255）が
+    # わずかしか下がらず版画に見えないので、全体を縮めたうえで上限も掛ける。
+    hsv[0, 0, 1] *= (1.0 - 0.55 * strength)
+    hsv[0, 0, 1] = min(hsv[0, 0, 1], 255.0 - 100.0 * strength)
+    # 明度も落とす。彩度だけ下げると原色がパステル調に白けてしまい、
+    # 顔料というより淡い色紙に見えるので、暗く沈める方向に寄せる。
+    hsv[0, 0, 2] *= (1.0 - 0.30 * strength)
+    out = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8),
+                       cv2.COLOR_HSV2BGR)
+    return out.reshape(3).astype(np.float32)
+
+
+def _uniform_background_mask(rgb: np.ndarray, alpha: np.ndarray):
+    """白紙などの「一様な明るい地」を指すマスクを返す。無ければ None。
+
+    白背景の上に描かれた絵は、背景まで絵の一部として扱われてしまう。
+    浮世絵風では巨大な白い版ができて絵を覆い隠す原因になるので、
+    地と判断できる場合だけ切り分けられるようにする。
+    判定は塗りつぶしツールの地色判別と同じ考え方。
+    """
+    opaque = alpha > 10
+    n = int(np.count_nonzero(opaque))
+    if n == 0 or n < alpha.size * 0.5:
+        return None
+    bgr = np.clip(rgb, 0, 255).astype(np.uint8)[opaque]
+    keys = ((bgr[:, 0] >> 3).astype(np.int32) << 10) \
+        | ((bgr[:, 1] >> 3).astype(np.int32) << 5) \
+        | (bgr[:, 2] >> 3).astype(np.int32)
+    vals, counts = np.unique(keys, return_counts=True)
+    top = int(vals[int(np.argmax(counts))])
+    if int(counts.max()) / n < 0.5:
+        return None
+    b = ((top >> 10) & 0x1F) << 3
+    g = ((top >> 5) & 0x1F) << 3
+    r = (top & 0x1F) << 3
+    if (0.114 * b + 0.587 * g + 0.299 * r) < 160:
+        return None
+    diff = np.abs(np.clip(rgb, 0, 255).astype(np.int16)
+                  - np.array([b, g, r], dtype=np.int16)).max(axis=2)
+    return opaque & (diff <= 24)
+
+
 def _paper_texture(shape: tuple[int, int], strength: float,
                    scale: int = 3) -> np.ndarray:
     """紙・和紙の風合い用のざらつき(-1..1)を作る。"""
@@ -3542,10 +3639,34 @@ class UkiyoeDialog(QDialog):
         self._paper_color.setToolTip("地の紙の色。生成りにすると古い摺物らしい")
         form.addRow("紙の色", self._paper_color)
 
+        self._pigment = QSpinBox()
+        self._pigment.setRange(0, 100)
+        self._pigment.setValue(60)
+        self._pigment.setSuffix(" %")
+        self._pigment.setToolTip("鮮やかすぎる色を顔料らしい渋い色に寄せる。0% で元の色のまま")
+        form.addRow("顔料に寄せる", self._pigment)
+
+        self._close_gap = QSpinBox()
+        self._close_gap.setRange(0, 20)
+        self._close_gap.setValue(0)
+        self._close_gap.setSuffix(" px")
+        self._close_gap.setToolTip("線画を版に分けるとき、この px までの途切れは閉じたものとみなす")
+        form.addRow("隙間を閉じる", self._close_gap)
+
+        self._line_sensitivity = QSpinBox()
+        self._line_sensitivity.setRange(0, 100)
+        self._line_sensitivity.setValue(0)
+        self._line_sensitivity.setSuffix(" %")
+        self._line_sensitivity.setToolTip("上げるほど薄い線も境界として拾う")
+        form.addRow("薄い線を拾う", self._line_sensitivity)
+
         layout.addLayout(form)
 
         desc = QLabel("色数を絞って版画のように平坦化し、版ズレ・墨線・和紙の\n"
-                      "質感を重ねます。元のレイヤーはそのまま残ります。")
+                      "質感を重ねます。線画を渡した場合は、線で囲まれた領域に\n"
+                      "藍・べに等の伝統色を差します。白地に描かれた絵は、\n"
+                      "白い部分を紙とみなすので地の色が活きます。\n"
+                      "元のレイヤーはそのまま残ります。")
         desc.setStyleSheet("color: #666; font-size: 11px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -3562,6 +3683,9 @@ class UkiyoeDialog(QDialog):
             "sumi": self._sumi.value(),
             "paper": self._paper.value() / 100.0,
             "paper_color": self._paper_color._color,
+            "pigment": self._pigment.value() / 100.0,
+            "close_gap": self._close_gap.value(),
+            "line_sensitivity": self._line_sensitivity.value(),
         }
 
 
@@ -3579,6 +3703,9 @@ def execute_ukiyoe(layer_stack: LayerStack, source_layer: Layer,
     sumi = max(0, int(params.get("sumi", 2)))
     paper = float(params.get("paper", 0.35))
     paper_color = params.get("paper_color") or QColor(240, 230, 205)
+    pigment = max(0.0, min(1.0, float(params.get("pigment", 0.6))))
+    close_gap = max(0, int(params.get("close_gap", 0)))
+    line_threshold = round(10 * (100 - max(0, min(100, int(params.get("line_sensitivity", 0))))) / 100)
 
     arr = _qimage_to_array(src_img).astype(np.float32)
     rgb, alpha = arr[:, :, :3], arr[:, :, 3]
@@ -3590,6 +3717,13 @@ def execute_ukiyoe(layer_stack: LayerStack, source_layer: Layer,
     out = np.zeros((h, w, 4), dtype=np.float32)
     out[:, :, 0], out[:, :, 1], out[:, :, 2] = pb, pg, pr
     out[:, :, 3] = 255.0
+
+    # 白い紙の上に描かれた絵は、背景まで「明るい版」として拾ってしまう。
+    # そのまま版ズレさせると巨大な白版が絵の上を覆って色が消えるので、
+    # 一様な明るい地は絵ではなく紙とみなして版から除外する。
+    bg_mask = _uniform_background_mask(rgb, alpha)
+    if bg_mask is not None:
+        alpha = np.where(bg_mask, 0.0, alpha)
 
     # 平滑化して面をまとめる。ここでチャンネルごとに量子化してしまうと、
     # 肌色のように3チャンネルが同じ段に丸まる色が無彩色の灰色になって
@@ -3622,21 +3756,34 @@ def execute_ukiyoe(layer_stack: LayerStack, source_layer: Layer,
                                    cv2.KMEANS_PP_CENTERS)
         hue_band[valid] = lab.reshape(-1)
 
-    plates = []
-    for lv in range(levels):
-        for hb in range(-1, max(1, n_hue)):
-            plates.append(inside & (idx == lv) & (hue_band == hb))
+    # 線画は明るさも色相も分かれないので版が作れず、墨線を乗せただけで
+    # 終わってしまう。線で囲まれた領域を版に見立てて伝統色を差す。
+    if _is_line_art(rgb, alpha):
+        plates = _ukiyoe_line_art_plates(alpha, close_gap, line_threshold)
+        plate_colors = [_ukiyoe_pigment(np.array(c, dtype=np.float32), pigment)
+                        for c in _UKIYOE_PIGMENTS]
+    else:
+        plates = []
+        for lv in range(levels):
+            for hb in range(-1, max(1, n_hue)):
+                plates.append(inside & (idx == lv) & (hue_band == hb))
+        plate_colors = None
 
-    for region in plates:
+    for pi, region in enumerate(plates):
         if int(np.count_nonzero(region)) < 20:
             continue
         # この版の代表色。平均を取ると、明暗差のある面では左右の色が
         # 混ざって濁った灰色になってしまうので、中央値を使う。
         # 墨線（暗い縁）を含めると色が沈むため、彩度のある画素を優先する。
-        sat_here = sat[region]
-        cand = smooth[region]
-        vivid = cand[sat_here > 50]
-        plate_color = np.median(vivid if len(vivid) >= 10 else cand, axis=0)
+        if plate_colors is not None:
+            # 線画モード。元の絵に色が無いので伝統色を順に当てる。
+            plate_color = plate_colors[pi % len(plate_colors)]
+        else:
+            sat_here = sat[region]
+            cand = smooth[region]
+            vivid = cand[sat_here > 50]
+            plate_color = _ukiyoe_pigment(
+                np.median(vivid if len(vivid) >= 10 else cand, axis=0), pigment)
         plate = region.astype(np.uint8) * 255
         if misalign > 0:
             dx = random.randint(-misalign, misalign)
@@ -3943,7 +4090,13 @@ def execute_stained_glass(layer_stack: LayerStack, source_layer: Layer,
     # 半分以上が絵だった片だけを「絵のある片」とみなす。
     total = np.zeros(n_seeds, dtype=np.int64)
     np.add.at(total, flat_lab, 1)
-    filled = counts > np.maximum(1, total // 2)
+    # ただし線画のように絵が疎な場合、どの片も半分には届かず全部が
+    # 「絵の無い片」になって結果が空になってしまう。絵の占有率に応じて
+    # 必要な被覆率を下げ、最低でも数画素かすれば拾うようにする。
+    density = float(np.count_nonzero(inside)) / max(1, inside.size)
+    ratio = min(0.5, max(0.05, density))
+    need = np.maximum(2, (total * ratio).astype(np.int64))
+    filled = counts >= need
     colored = mean[flat_lab].reshape(h, w, 3)
     has_color = filled[flat_lab].reshape(h, w)
 

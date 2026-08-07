@@ -935,6 +935,161 @@ class TestWarholLineArt:
         assert execute_warhol(ls, group, self._params()) is None
 
 
+class TestUkiyoeLineArtAndBackground:
+    """浮世絵風: 線画・白背景・顔料の扱い。"""
+
+    def _params(self, **over):
+        p = {"levels": 4, "misalign": 4, "sumi": 2, "paper": 0.35,
+             "pigment": 0.6, "close_gap": 0, "line_sensitivity": 0}
+        p.update(over)
+        return p
+
+    def _line_art_stack(self, size=200):
+        from PyQt6.QtGui import QPen
+        ls = LayerStack(size, size)
+        layer = ls.add("線画")
+        p = QPainter(layer.image)
+        pen = QPen(QColor(0, 0, 0, 255)); pen.setWidth(5)
+        p.setPen(pen)
+        p.drawEllipse(30, 20, 50, 60)
+        p.drawEllipse(110, 20, 50, 60)
+        p.drawEllipse(45, 100, 110, 80)
+        p.end()
+        return ls, layer
+
+    def _colored_stack(self, size=200, white_bg=False):
+        from PyQt6.QtGui import QPen
+        ls = LayerStack(size, size)
+        layer = ls.add("色付き")
+        p = QPainter(layer.image)
+        if white_bg:
+            p.fillRect(0, 0, size, size, QColor(255, 255, 255, 255))
+        for col, y in [((0, 200, 255), 40), ((255, 0, 200), 100),
+                       ((150, 220, 0), 160)]:
+            p.setPen(QPen(QColor(*col), 30))
+            p.drawLine(20, y, size - 20, y)
+        p.end()
+        return ls, layer
+
+    def _saturated(self, img):
+        import numpy as np, cv2
+        arr = _qimage_to_array_test(img)
+        hsv = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_BGR2HSV)
+        return int(np.count_nonzero(hsv[:, :, 1] > 50))
+
+    def test_line_art_gets_colored_plates(self):
+        """線画でも囲まれた領域に色が差される（墨線だけで終わらない）。"""
+        ls, layer = self._line_art_stack()
+        result = execute_ukiyoe(ls, layer, self._params())
+        assert result is not None
+        assert self._saturated(result.image) > 500
+
+    def test_white_background_becomes_paper(self):
+        """白地に描いた絵は、白が巨大な版にならず紙の色が残る。"""
+        import numpy as np
+        ls, layer = self._colored_stack(white_bg=True)
+        result = execute_ukiyoe(ls, layer, self._params(paper=0.0))
+        arr = _qimage_to_array_test(result.image)
+        # 角は紙の色（既定の生成り）であって純白ではない
+        corner = arr[3, 3, :3]
+        assert not (corner[0] > 245 and corner[1] > 245 and corner[2] > 245)
+
+    def test_white_background_keeps_colors(self):
+        """白背景でも彩色が版ズレした白版に覆われて消えない。"""
+        ls_t, layer_t = self._colored_stack(white_bg=False)
+        ls_w, layer_w = self._colored_stack(white_bg=True)
+        on_trans = self._saturated(
+            execute_ukiyoe(ls_t, layer_t, self._params()).image)
+        on_white = self._saturated(
+            execute_ukiyoe(ls_w, layer_w, self._params()).image)
+        assert on_white > on_trans * 0.6
+
+    def test_pigment_reduces_saturation(self):
+        """顔料寄せを強くすると鮮やかさが落ちる。"""
+        import numpy as np, cv2
+        from actions import _ukiyoe_pigment
+        neon = np.array([255.0, 0.0, 255.0], dtype=np.float32)
+        muted = _ukiyoe_pigment(neon, 1.0)
+        def sat(bgr):
+            px = np.clip(bgr, 0, 255).astype(np.uint8).reshape(1, 1, 3)
+            return int(cv2.cvtColor(px, cv2.COLOR_BGR2HSV)[0, 0, 1])
+        assert sat(muted) < sat(neon)
+
+    def test_pigment_zero_keeps_color(self):
+        import numpy as np
+        from actions import _ukiyoe_pigment
+        c = np.array([200.0, 100.0, 50.0], dtype=np.float32)
+        assert np.array_equal(_ukiyoe_pigment(c, 0.0), c)
+
+    def test_close_gap_helps_gappy_line_art(self):
+        """隙間のある線画は、隙間を閉じると色が差される面が増える。"""
+        from PyQt6.QtGui import QPen
+        def stack():
+            ls = LayerStack(200, 200)
+            layer = ls.add("隙間線画")
+            p = QPainter(layer.image)
+            pen = QPen(QColor(0, 0, 0, 255)); pen.setWidth(5)
+            p.setPen(pen)
+            p.drawEllipse(45, 60, 110, 90)
+            p.end()
+            # 輪郭の上辺に切れ目を空ける（線幅5pxぶんだけ削る）
+            for x in range(95, 106):
+                for y in range(58, 64):
+                    layer.image.setPixelColor(x, y, QColor(0, 0, 0, 0))
+            return ls, layer
+        from actions import _ukiyoe_line_art_plates
+        import numpy as np
+        ls1, l1 = stack()
+        alpha = _qimage_to_array_test(l1.image)[:, :, 3].astype(np.float32)
+        # 隙間があると閉領域として検出できない
+        assert len(_ukiyoe_line_art_plates(alpha, 0, 10)) == 0
+        # 隙間を閉じれば版として拾える（幅11px の切れ目には同程度の値が要る）
+        assert len(_ukiyoe_line_art_plates(alpha, 10, 10)) >= 1
+        ls2, l2 = stack()
+        with_close = self._saturated(
+            execute_ukiyoe(ls2, l2, self._params(close_gap=10)).image)
+        assert with_close > 500
+
+    def test_dialog_exposes_new_params(self):
+        from actions import UkiyoeDialog
+        params = UkiyoeDialog().params()
+        assert params["pigment"] == 0.6
+        assert params["close_gap"] == 0
+        assert params["line_sensitivity"] == 0
+
+
+class TestStainedGlassSparseArt:
+    """疎な線画でもガラス片が消えないこと（被覆率50%固定だと全部消えた）。"""
+
+    def test_sparse_line_art_not_empty(self):
+        import numpy as np
+        ls, layer = _make_stack_with_closed_shape()  # 100x100 に細い円
+        result = execute_stained_glass(ls, layer, {
+            "cell": 53, "lead": 4, "vivid": 1.5, "glass_bg": False,
+            "colors": [QColor(255, 0, 0), QColor(0, 0, 255)]})
+        assert result is not None
+        arr = _qimage_to_array_test(result.image)
+        assert int(np.count_nonzero(arr[:, :, 3])) > 0
+
+    def test_still_does_not_overspill(self):
+        """疎な絵向けに緩めても、絵の外へ大きくはみ出さない。"""
+        import numpy as np
+        ls = LayerStack(200, 200)
+        layer = ls.add("円")
+        p = QPainter(layer.image)
+        p.setBrush(QColor(200, 60, 60)); p.setPen(QColor(200, 60, 60))
+        p.drawEllipse(70, 70, 60, 60)
+        p.end()
+        result = execute_stained_glass(ls, layer, {
+            "cell": 20, "lead": 2, "glass_bg": False,
+            "colors": [QColor(255, 0, 0)]})
+        arr = _qimage_to_array_test(result.image)
+        yy, xx = np.mgrid[0:200, 0:200]
+        outside = (xx - 100) ** 2 + (yy - 100) ** 2 > 55 ** 2
+        clear = int(np.count_nonzero(arr[:, :, 3][outside] == 0))
+        assert clear > int(np.count_nonzero(outside)) * 0.8
+
+
 def _qimage_to_array_test(img: QImage):
     import numpy as np
     img32 = img.convertToFormat(QImage.Format.Format_ARGB32)
