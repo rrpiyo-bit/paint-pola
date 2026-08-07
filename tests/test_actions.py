@@ -834,6 +834,107 @@ class TestCollageGapOptions:
         assert params["line_sensitivity"] == 0
 
 
+class TestWarholLineArt:
+    """線画を渡したときは、階調の版分けではなく閉領域の塗り分けに切り替わること。"""
+
+    def _line_art_stack(self, size=240, gap=0):
+        from PyQt6.QtGui import QPen
+        ls = LayerStack(size, size)
+        layer = ls.add("線画")
+        p = QPainter(layer.image)
+        pen = QPen(QColor(0, 0, 0, 255)); pen.setWidth(5)
+        p.setPen(pen)
+        p.drawEllipse(40, 30, 60, 70)     # 耳
+        p.drawEllipse(130, 30, 60, 70)    # 耳
+        p.drawEllipse(50, 110, 130, 100)  # 顔
+        p.end()
+        if gap:
+            for (cx, cy) in [(70, 30), (160, 30), (115, 110)]:
+                for dx in range(-gap // 2, gap // 2 + 1):
+                    for dy in range(-4, 5):
+                        x, y = cx + dx, cy + dy
+                        if 0 <= x < size and 0 <= y < size:
+                            layer.image.setPixelColor(x, y, QColor(0, 0, 0, 0))
+        return ls, layer
+
+    def _params(self, **over):
+        p = {"cols": 2, "rows": 2, "levels": 4, "gap": 0, "outline": 2,
+             "random_sets": False, "close_gap": 0, "line_sensitivity": 0}
+        p.update(over)
+        return p
+
+    def _cell_colors(self, result, quadrant=(0, 0)):
+        import numpy as np
+        arr = _qimage_to_array_test(result.image)
+        h, w = arr.shape[:2]
+        r, c = quadrant
+        cell = arr[r * (h // 2):(r + 1) * (h // 2),
+                   c * (w // 2):(c + 1) * (w // 2), :3]
+        return np.unique(cell.reshape(-1, 3), axis=0)
+
+    def test_line_art_is_detected(self):
+        import numpy as np
+        from actions import _is_line_art
+        ls, layer = self._line_art_stack()
+        arr = _qimage_to_array_test(layer.image).astype(np.float32)
+        assert _is_line_art(arr[:, :, :3], arr[:, :, 3]) is True
+
+    def test_colorful_art_is_not_line_art(self):
+        import numpy as np
+        from actions import _is_line_art
+        ls, layer = _make_colorful_stack(size=120)
+        arr = _qimage_to_array_test(layer.image).astype(np.float32)
+        assert _is_line_art(arr[:, :, :3], arr[:, :, 3]) is False
+
+    def test_enclosed_regions_get_distinct_colors(self):
+        """線画では背景・線だけの2色にならず、囲まれた面にも色が付く。"""
+        ls, layer = self._line_art_stack()
+        result = execute_warhol(ls, layer, self._params())
+        assert result is not None
+        assert len(self._cell_colors(result)) >= 3
+
+    def test_cells_use_different_palettes(self):
+        """線画でもコマごとに配色が変わる（線の色も含む）。"""
+        import numpy as np
+        ls, layer = self._line_art_stack()
+        result = execute_warhol(ls, layer, self._params())
+        arr = _qimage_to_array_test(result.image)
+        h, w = arr.shape[:2]
+        quads = [arr[:h // 2, :w // 2], arr[:h // 2, w // 2:],
+                 arr[h // 2:, :w // 2], arr[h // 2:, w // 2:]]
+        means = [q[:, :, :3].reshape(-1, 3).mean(axis=0) for q in quads]
+        for i in range(len(means)):
+            for j in range(i + 1, len(means)):
+                assert np.abs(means[i] - means[j]).max() > 5, (i, j)
+
+    def test_close_gap_recovers_regions(self):
+        """隙間のある線画は、隙間を閉じると塗られる面が増える。"""
+        ls, layer = self._line_art_stack(gap=10)
+        without = len(self._cell_colors(
+            execute_warhol(ls, layer, self._params(close_gap=0))))
+        ls2, layer2 = self._line_art_stack(gap=10)
+        with_close = len(self._cell_colors(
+            execute_warhol(ls2, layer2, self._params(close_gap=8))))
+        assert with_close > without
+
+    def test_mode_can_force_posterize(self):
+        """mode を明示すれば自動判定を上書きできる。"""
+        ls, layer = self._line_art_stack()
+        result = execute_warhol(ls, layer, self._params(mode="posterize"))
+        assert result is not None
+
+    def test_dialog_exposes_new_params(self):
+        from actions import WarholDialog
+        params = WarholDialog().params()
+        assert params["close_gap"] == 0
+        assert params["line_sensitivity"] == 0
+
+    def test_group_layer_rejected(self):
+        ls, layer = self._line_art_stack()
+        group = ls.add_group("G")
+        assert execute_warhol(ls, group, self._params()) is None
+
+
 def _qimage_to_array_test(img: QImage):
     import numpy as np
     img32 = img.convertToFormat(QImage.Format.Format_ARGB32)

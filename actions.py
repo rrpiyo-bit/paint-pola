@@ -3079,6 +3079,20 @@ class WarholDialog(QDialog):
         self._outline.setToolTip("0 にすると線を描かず、色面だけになる")
         form.addRow("輪郭線の太さ", self._outline)
 
+        self._close_gap = QSpinBox()
+        self._close_gap.setRange(0, 20)
+        self._close_gap.setValue(0)
+        self._close_gap.setSuffix(" px")
+        self._close_gap.setToolTip("線画を塗り分けるとき、この px までの途切れは閉じたものとみなす")
+        form.addRow("隙間を閉じる", self._close_gap)
+
+        self._line_sensitivity = QSpinBox()
+        self._line_sensitivity.setRange(0, 100)
+        self._line_sensitivity.setValue(0)
+        self._line_sensitivity.setSuffix(" %")
+        self._line_sensitivity.setToolTip("上げるほど薄い線も境界として拾う")
+        form.addRow("薄い線を拾う", self._line_sensitivity)
+
         self._random = QCheckBox("配色をランダムに選ぶ")
         self._random.setChecked(True)
         self._random.setToolTip("オフにすると毎回同じ順番の配色になる")
@@ -3088,6 +3102,8 @@ class WarholDialog(QDialog):
 
         desc = QLabel("元の絵を縮小してタイル状に並べ、コマごとに違う配色で\n"
                       "ベタ塗りします。キャンバスの大きさは変わりません。\n"
+                      "線画を渡した場合は、線で囲まれた領域ごとの塗り分けに\n"
+                      "自動で切り替わります（階調数は写真向けの設定です）。\n"
                       "元のレイヤーはそのまま残ります。")
         desc.setStyleSheet("color: #666; font-size: 11px;")
         desc.setWordWrap(True)
@@ -3107,7 +3123,94 @@ class WarholDialog(QDialog):
             "gap": self._gap.value(),
             "outline": self._outline.value(),
             "random_sets": self._random.isChecked(),
+            "close_gap": self._close_gap.value(),
+            "line_sensitivity": self._line_sensitivity.value(),
         }
+
+
+def _is_line_art(rgb: np.ndarray, alpha: np.ndarray) -> bool:
+    """線画（＝彩度も階調もほとんど無い絵）かどうかを判定する。
+
+    ウォーホル風の版分けは写真の連続した階調を前提にしているので、
+    黒い線と透明背景だけの線画に掛けると「線と背景」の2値にしかならず、
+    ただの背景色替えになってしまう。そういう入力は領域塗り分けに回す。
+    """
+    ink = alpha > 10
+    n = int(np.count_nonzero(ink))
+    if n < 16:
+        return False
+    hsv = cv2.cvtColor(np.clip(rgb, 0, 255).astype(np.uint8), cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1][ink]
+    # 彩度のある画素がごく僅かなら色相で分けようがない
+    if float(np.count_nonzero(sat > 50)) / n > 0.05:
+        return False
+    # 描かれている面積そのものが小さければ「線」とみなす
+    return n < alpha.size * 0.35
+
+
+def _warhol_line_art_cell(rgb: np.ndarray, alpha: np.ndarray,
+                          palette: list[QColor], outline: int,
+                          close_gap: int, line_threshold: int) -> np.ndarray:
+    """線画1コマぶんを、線で囲まれた領域ごとに塗り分ける。戻り値は BGRA。
+
+    階調が無い線画では版分けができないので、切り絵コラージュと同じ
+    閉領域検出で「耳・顔・体・背景」を別々の色にする。
+    """
+    h, w = alpha.shape
+    out = np.zeros((h, w, 4), dtype=np.float32)
+
+    free = (alpha <= line_threshold).astype(np.uint8)
+    search = free
+    gap_kernel = None
+    if close_gap > 0:
+        ksize = close_gap * 2 + 1
+        gap_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        # 線側をモルフォロジー・クローズして途切れだけを繋ぐ。
+        # 空き領域を単純に erode すると、隙間が塞がる代わりに領域全体が
+        # 痩せてしまい、塗りが小さくなる。
+        line = (alpha > line_threshold).astype(np.uint8)
+        sealed = cv2.morphologyEx(line, cv2.MORPH_CLOSE, gap_kernel)
+        search = (sealed == 0).astype(np.uint8)
+
+    n_labels, labels = cv2.connectedComponents(search, connectivity=4)
+    # 外周に接する領域＝背景。まとめて地の色にする。
+    edge_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :])) \
+        | set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
+
+    # 地の色はパレット1色目、輪郭線は最後の色。囲まれた領域はその間を巡回する。
+    bg_b, bg_g, bg_r = _bgr(palette[0])
+    out[:, :, 0], out[:, :, 1], out[:, :, 2] = bg_b, bg_g, bg_r
+
+    inner = [lab for lab in range(1, n_labels) if lab not in edge_labels]
+    # 大きい領域から順に色を割り当て、目立つ面ほど確実に色が変わるようにする
+    inner.sort(key=lambda lab: -int(np.count_nonzero(labels == lab)))
+    fill_n = max(1, len(palette) - 1)
+    for i, lab in enumerate(inner):
+        mask = (labels == lab).astype(np.uint8)
+        if gap_kernel is not None:
+            # 隙間閉じで削った分を線の手前まで戻す
+            mask = cv2.dilate(mask, gap_kernel) * free
+        if int(np.count_nonzero(mask)) < 20:
+            continue
+        # 1色目は地の色なので、囲まれた面には2色目以降を使う
+        b, g, r = _bgr(palette[1 + (i % max(1, fill_n - 1))])
+        m = mask > 0
+        out[m, 0], out[m, 1], out[m, 2] = b, g, r
+
+    out[:, :, 3] = 255.0
+
+    if outline > 0:
+        # 線画では元の線そのものが輪郭。太らせて版ずれ感を出す。
+        line = (alpha > line_threshold).astype(np.uint8)
+        if outline > 1:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (outline, outline))
+            line = cv2.dilate(line, k)
+        ob, og, orr = _bgr(palette[-1])
+        m = line > 0
+        out[m, 0], out[m, 1], out[m, 2] = ob, og, orr
+
+    return out
 
 
 def _warhol_cell(rgb: np.ndarray, alpha: np.ndarray, levels: int,
@@ -3198,17 +3301,38 @@ def execute_warhol(layer_stack: LayerStack, source_layer: Layer,
     cw = max(1, (w - gap * (cols + 1)) // cols)
     ch = max(1, (h - gap * (rows + 1)) // rows)
 
+    close_gap = max(0, int(params.get("close_gap", 0)))
+    line_threshold = round(10 * (100 - max(0, min(100, int(params.get("line_sensitivity", 0))))) / 100)
+
     arr = _qimage_to_array(src_img).astype(np.float32)
     # 縮小してからポスタライズすると、細部が潰れてベタ塗りらしくなる
     small = cv2.resize(arr, (cw, ch), interpolation=cv2.INTER_AREA)
     s_rgb, s_alpha = small[:, :, :3], small[:, :, 3]
+
+    # 線画は階調が無く版分けできないので、閉領域の塗り分けに切り替える。
+    # 判定は縮小前の絵で行う（縮小で線が潰れて誤判定するのを避ける）。
+    # 隙間閉じは「元の絵での px」で指定されるが、実際に領域を探すのは
+    # 縮小したコマの上なので、縮小率ぶん小さくしないと効きすぎる／効かない。
+    # 縮小で隙間自体も狭まるぶん、切り上げて最低1px は確保する。
+    scale = min(cw / w, ch / h)
+    cell_close_gap = max(1, int(math.ceil(close_gap * scale))) if close_gap > 0 else 0
+
+    mode = params.get("mode", "auto")
+    if mode == "auto":
+        line_art = _is_line_art(arr[:, :, :3], arr[:, :, 3])
+    else:
+        line_art = (mode == "line_art")
 
     out = np.zeros((h, w, 4), dtype=np.uint8)
     for r in range(rows):
         for c in range(cols):
             i = r * cols + c
             pal = cell_palettes[i % len(cell_palettes)]
-            cell = _warhol_cell(s_rgb, s_alpha, levels, pal, outline)
+            if line_art:
+                cell = _warhol_line_art_cell(s_rgb, s_alpha, pal, outline,
+                                             cell_close_gap, line_threshold)
+            else:
+                cell = _warhol_cell(s_rgb, s_alpha, levels, pal, outline)
             x0 = gap + c * (cw + gap)
             y0 = gap + r * (ch + gap)
             # 端数でキャンバスからはみ出す場合は切り詰める
