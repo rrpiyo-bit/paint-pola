@@ -412,11 +412,18 @@ def _adjust_line_tone(arr: np.ndarray, brightness: int, contrast: int,
         rgb = (rgb - 128.0) * (1.0 + contrast / 100.0) + 128.0
     if brightness != 0:
         rgb += brightness * 1.28
-    if density != 0:
-        # 不透明度を持ち上げる。半端な alpha ほど大きく持ち上がるよう、
-        # 単純な倍率ではなくガンマで曲げる（density=100 でおよそ 2.6 倍相当）。
-        gamma = 1.0 / (1.0 + density / 60.0) if density > 0 else 1.0 - density / 100.0
-        alpha = 255.0 * np.power(np.clip(alpha / 255.0, 0.0, 1.0), gamma)
+    if density > 0:
+        # 「線画を同じ位置にコピーして重ねる」のと同じ計算をする。
+        # 重ねる = アルファ合成なので a' = 1-(1-a)^n。ガンマ曲線では
+        # いくら強くしても 200 台で頭打ちになり、鉛筆書きの薄い線を
+        # 真っ黒にできなかったが、この式なら重ねた回数ぶん 255 に届く。
+        # density=100 で 5 枚重ね（＝上下左右にずらして重ねる1周ぶん）相当、
+        # 300 で 13 枚相当。鉛筆の薄い線でも 255 近くまで持ち上がる。
+        layers = 1.0 + density / 25.0
+        a = np.clip(alpha / 255.0, 0.0, 1.0)
+        alpha = 255.0 * (1.0 - np.power(1.0 - a, layers))
+    elif density < 0:
+        alpha = alpha * (1.0 + density / 100.0)
 
     out[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
     out[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
@@ -468,13 +475,14 @@ class ToneAdjustDialog(QDialog):
         root.addLayout(form)
         self._brightness = self._add_slider(form, "明るさ", -100, 100, 0, "")
         self._contrast = self._add_slider(form, "コントラスト", -100, 100, 0, "")
-        self._density = self._add_slider(form, "濃さ（不透明度）", -100, 100, 0, "")
+        self._density = self._add_slider(form, "濃さ（不透明度）", -100, 300, 0, "")
         self._thicken = self._add_slider(form, "線を太らせる", 0, 10, 0, "px")
 
         hint = QLabel(
-            "薄くなった線を濃くします。線画抽出の直後は線が既に真っ黒なので、"
-            "「濃さ」と「線を太らせる」が効きます。手描きの線が灰色がかっている"
-            "ときは「明るさ」を下げるか「コントラスト」を上げてください。")
+            "薄くなった線を濃くします。「濃さ」は線画を同じ位置に重ね塗りするのと"
+            "同じ計算で、100 でおよそ5枚重ね相当です（位置はずれません）。"
+            "鉛筆書きでキャラごとに濃さが違うときは、投げなわで薄いところだけを"
+            "囲んでから実行すると、そこだけ濃くできます。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#666; font-size:11px;")
         root.addWidget(hint)

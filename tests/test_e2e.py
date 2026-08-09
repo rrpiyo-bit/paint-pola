@@ -3043,3 +3043,99 @@ class TestToneAdjust:
         before = len(win.canvas._history)
         win._filter_tone_adjust()
         assert len(win.canvas._history) == before, "履歴を積んでしまっている"
+
+
+
+class TestToneDensityStacking:
+    """「濃さ」は線画を同じ位置に重ね塗りするのと同じ計算にしてある。
+    以前のガンマ曲線は 200 台で頭打ちになり、鉛筆書きの薄い線を
+    真っ黒にできなかった。"""
+
+    def _flat(self, alpha, size=12):
+        arr = np.zeros((size, size, 4), dtype=np.uint8)
+        arr[:, :, 3] = alpha
+        return arr
+
+    def test_density_matches_alpha_compositing(self):
+        """density=100 は「5枚重ね」= 1-(1-a)^5 と一致する。"""
+        from main import _adjust_line_tone
+        for a0 in (40, 60, 90, 120, 200):
+            got = int(_adjust_line_tone(self._flat(a0), 0, 0, 100, 0)[0, 0, 3])
+            a = a0 / 255.0
+            want = round(255 * (1 - (1 - a) ** 5))
+            assert abs(got - want) <= 1, f"alpha{a0}: {got} != {want}"
+
+    def test_faint_pencil_reaches_near_opaque(self):
+        """薄い鉛筆線（alpha 40〜90）が上限まで上げれば十分濃くなる。
+        ガンマ曲線では届かなかった領域。"""
+        from main import _adjust_line_tone
+        for a0 in (40, 60, 90):
+            out = int(_adjust_line_tone(self._flat(a0), 0, 0, 300, 0)[0, 0, 3])
+            assert out >= 220, f"alpha{a0} が {out} までしか上がらない"
+
+    def test_density_is_monotonic(self):
+        """濃さを上げるほど必ず濃くなる（途中で下がらない）。"""
+        from main import _adjust_line_tone
+        for a0 in (30, 90, 180):
+            prev = -1
+            for d in range(0, 301, 25):
+                now = int(_adjust_line_tone(self._flat(a0), 0, 0, d, 0)[0, 0, 3])
+                assert now >= prev, f"alpha{a0} 濃さ{d} で下がった"
+                prev = now
+
+    def test_density_never_exceeds_opaque(self):
+        """どれだけ上げても 255 を超えて巻き戻らない。"""
+        from main import _adjust_line_tone
+        for a0 in (1, 128, 254, 255):
+            for d in (100, 200, 300):
+                out = int(_adjust_line_tone(self._flat(a0), 0, 0, d, 0)[0, 0, 3])
+                assert 0 <= out <= 255
+
+    def test_transparent_stays_transparent(self):
+        """完全に透明な部分は、いくら濃くしても透明のまま。"""
+        from main import _adjust_line_tone
+        arr = np.zeros((12, 12, 4), dtype=np.uint8)
+        out = _adjust_line_tone(arr, 0, 0, 300, 0)
+        assert (out[:, :, 3] == 0).all()
+
+    def test_negative_density_still_fades(self):
+        """負の側は従来どおり薄くなる。"""
+        from main import _adjust_line_tone
+        assert int(_adjust_line_tone(self._flat(200), 0, 0, -50, 0)[0, 0, 3]) == 100
+        assert int(_adjust_line_tone(self._flat(200), 0, 0, -100, 0)[0, 0, 3]) == 0
+
+    def test_uneven_pencil_fixed_per_character(self, win):
+        """鉛筆で濃さがバラついた絵：薄いキャラだけ選択して濃さを揃える。
+        レイヤー全体にかけると濃い方が潰れてしまうので、選択範囲が要る。"""
+        from main import _adjust_line_tone
+        from PyQt6.QtGui import QImage, QPen
+        img = QImage(300, 160, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(0, 0, 0, 200), 3))      # 濃く描けたキャラ
+        p.drawEllipse(30, 30, 60, 60)
+        p.setPen(QPen(QColor(0, 0, 0, 65), 3))       # 薄くなった2キャラ目
+        p.drawEllipse(200, 30, 60, 60)
+        p.end()
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        scene = np.frombuffer(ptr, dtype=np.uint8).reshape(160, 300, 4).copy()
+
+        lm = scene[:, :150, 3] > 0
+        rm = scene[:, 150:, 3] > 0
+        dark_before = float(np.median(scene[:, :150][lm][:, 3]))
+        faint_before = float(np.median(scene[:, 150:][rm][:, 3]))
+        assert faint_before < dark_before / 2
+
+        mask = np.zeros((160, 300), dtype=bool)
+        mask[:, 150:] = True
+        out = _adjust_line_tone(scene, 0, 0, 130, 0, mask)
+
+        # 濃いキャラは一切変わらない
+        assert np.array_equal(out[:, :150], scene[:, :150])
+        # 薄いキャラは濃いキャラに近づく
+        faint_after = float(np.median(out[:, 150:][rm][:, 3]))
+        assert faint_after > faint_before * 2
+        assert faint_after >= dark_before * 0.8, \
+            f"揃っていない (濃い={dark_before} 補正後={faint_after})"
