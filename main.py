@@ -54,6 +54,25 @@ def _apply_color_correction(bgr: np.ndarray, contrast: int, brightness: int,
     return np.clip(gray, 0, 255).astype(np.uint8)
 
 
+def _flatten_paper(gray: np.ndarray, radius: int) -> np.ndarray:
+    """紙の明るさムラ（照明の勾配・影）を取り除く。
+
+    大きくぼかした画像は「その場所の紙そのものの明るさ」に相当する。
+    元画像をそれで割ると、紙は場所によらず 255 に揃い、線だけが暗く残る。
+    影のある写真でも全体共通のしきい値が使えるようになる。
+
+    副作用として、方眼紙の罫線のように「紙とほとんど同じ明るさの薄い線」は
+    白へ飛ぶ。方眼が線画に写り込むときはこれが効く。半径を大きくするほど
+    ムラの補正はゆるやかになり、小さくするほど太い線まで削れていく。
+    """
+    if radius <= 0:
+        return gray
+    k = max(3, int(radius) | 1)
+    bg = cv2.GaussianBlur(gray, (k, k), 0)
+    norm = gray.astype(np.float32) / np.maximum(bg.astype(np.float32), 1.0) * 255.0
+    return np.clip(norm, 0, 255).astype(np.uint8)
+
+
 def _extract_line_mask(gray: np.ndarray, adaptive: bool, threshold: int,
                        sensitivity: int, block: int, denoise: int) -> np.ndarray:
     """グレースケールから線のマスク（線=255）を作る。
@@ -138,6 +157,7 @@ class LineExtractionDialog(QDialog):
         self._desat = self._add_slider(corr_form, "彩度を落とす", 0, 100, 0, "%")
         self._contrast = self._add_slider(corr_form, "コントラスト", -100, 100, 0, "")
         self._brightness = self._add_slider(corr_form, "明るさ", -100, 100, 0, "")
+        self._flatten = self._add_slider(corr_form, "紙のムラを除去", 0, 300, 0, "px")
         root.addWidget(corr_box)
 
         # --- 抽出設定 ---
@@ -210,12 +230,15 @@ class LineExtractionDialog(QDialog):
             self._hint.setText(
                 "周囲の明るさと比べて暗いところを線として抽出します。影や照明ムラが"
                 "あっても線だけを拾えます。感度を上げると濃い線だけ、下げると薄い線も"
-                "拾います。ざらつく場合はノイズ除去を上げてください。")
+                "拾います。ざらつく場合はノイズ除去を上げてください。方眼紙の罫線まで"
+                "拾ってしまうときは、「紙のムラを除去」を上げて"
+                "「しきい値」方式に切り替えるときれいに消せます。")
         else:
             self._hint.setText(
                 "しきい値より暗いピクセルを線として抽出します。下げると薄い線も"
                 "抽出され、上げると濃い線だけになります。写真で影の部分が真っ黒に"
-                "なる場合は「自動」に切り替えてください。")
+                "なる場合は「紙のムラを除去」を上げてください（方眼紙の罫線を"
+                "消したいときもこれが効きます）。")
         self._update_preview()
 
     # --- 設定値 ---
@@ -226,13 +249,15 @@ class LineExtractionDialog(QDialog):
     def threshold(self) -> int:
         return self._thresh.value()
 
-    def _gray_for(self, bgr: np.ndarray) -> np.ndarray:
-        return _apply_color_correction(bgr, self._contrast.value(),
+    def _gray_for(self, bgr: np.ndarray, scale: float = 1.0) -> np.ndarray:
+        gray = _apply_color_correction(bgr, self._contrast.value(),
                                        self._brightness.value(),
                                        self._desat.value())
+        # ぼかし半径も px 指定なので、プレビューでは同じ比率に縮める。
+        return _flatten_paper(gray, int(round(self._flatten.value() * scale)))
 
     def _mask_for(self, bgr: np.ndarray, scale: float) -> np.ndarray:
-        gray = self._gray_for(bgr)
+        gray = self._gray_for(bgr, scale)
         block = max(3, int(round(self._block.value() * scale)))
         denoise = int(round(self._denoise.value() * scale))
         return _extract_line_mask(gray, self.adaptive(), self.threshold(),

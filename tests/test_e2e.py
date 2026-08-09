@@ -2691,3 +2691,163 @@ class TestThemeIsolation:
             w._apply_theme(keys[i % len(keys)])
             w.close()
         QApplication.processEvents()
+
+
+
+# ── 方眼紙の罫線を除去する前処理 ──────────────────────────────────────────
+
+class TestFlattenPaper:
+    """方眼紙に描いた絵を撮った写真から、罫線だけを落として線画を抜く。
+    照明ムラがあるので固定しきい値は使えず、適応的しきい値だと罫線まで
+    拾ってしまう、という板挟みを _flatten_paper が解消する。"""
+
+    def _graph_paper(self, size=300, grid=20, gradient=True):
+        """方眼紙に太いペンで描いた写真を模す。(BGR画像, 真の線マスク) を返す。"""
+        import cv2
+        paper = np.full((size, size), 200, dtype=np.uint8)
+        # 薄い罫線（紙とほとんど同じ明るさ）
+        for i in range(0, size, grid):
+            paper[i, :] = 175
+            paper[:, i] = 175
+        # 濃いペンの線（太い）
+        truth = np.zeros((size, size), dtype=np.uint8)
+        cv2.line(truth, (30, 40), (250, 90), 255, 6)
+        cv2.circle(truth, (150, 200), 60, 255, 6)
+        paper[truth > 0] = 30
+        if gradient:
+            # 左から右へ暗くなる照明ムラ
+            ramp = np.linspace(1.0, 0.45, size, dtype=np.float32)[None, :]
+            paper = np.clip(paper.astype(np.float32) * ramp, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(paper, cv2.COLOR_GRAY2BGR), truth
+
+    def _scores(self, mask, truth):
+        """(線の再現率, 罫線などの誤検出率) を返す。"""
+        line = truth > 0
+        recall = float((mask[line] > 0).mean())
+        false = float((mask[~line] > 0).mean())
+        return recall, false
+
+    def test_flatten_removes_lighting_gradient(self):
+        """平坦化すると、紙の明るさが場所によらず揃う。"""
+        from main import _flatten_paper, _apply_color_correction
+        bgr, truth = self._graph_paper()
+        gray = _apply_color_correction(bgr, 0, 0, 0)
+        # 平坦化前は左端と右端で紙の明るさが大きく違う
+        before = abs(int(np.median(gray[:, :30])) - int(np.median(gray[:, -30:])))
+        flat = _flatten_paper(gray, 81)
+        after = abs(int(np.median(flat[:, :30])) - int(np.median(flat[:, -30:])))
+        assert before > 60, f"テスト画像にムラが無い ({before})"
+        assert after <= 5, f"ムラが残っている ({after})"
+
+    def test_flatten_lets_fixed_threshold_drop_grid(self):
+        """平坦化＋固定しきい値なら、罫線を落としつつ線を残せる。"""
+        from main import _flatten_paper, _apply_color_correction, _extract_line_mask
+        bgr, truth = self._graph_paper()
+        gray = _apply_color_correction(bgr, 0, 0, 0)
+        flat = _flatten_paper(gray, 81)
+        mask = _extract_line_mask(flat, adaptive=False, threshold=175,
+                                  sensitivity=12, block=21, denoise=0)
+        recall, false = self._scores(mask, truth)
+        assert recall > 0.9, f"線が抜けている (recall={recall:.2f})"
+        assert false < 0.02, f"罫線を拾っている (false={false:.2f})"
+
+    def test_adaptive_alone_picks_up_the_grid(self):
+        """比較用：平坦化なしの適応的しきい値は罫線を拾ってしまう。
+        これがユーザーの遭遇した現象で、_flatten_paper 追加の動機。"""
+        from main import _apply_color_correction, _extract_line_mask
+        bgr, truth = self._graph_paper()
+        gray = _apply_color_correction(bgr, 0, 0, 0)
+        mask = _extract_line_mask(gray, adaptive=True, threshold=180,
+                                  sensitivity=12, block=21, denoise=0)
+        recall, false = self._scores(mask, truth)
+        assert recall > 0.9
+        assert false > 0.05, f"罫線を拾っていない？ (false={false:.2f})"
+
+    def test_flatten_radius_zero_is_identity(self):
+        """0 のときは何もしない（従来の動作を変えない）。"""
+        from main import _flatten_paper
+        g = np.random.randint(0, 255, (40, 40), dtype=np.uint8)
+        assert np.array_equal(_flatten_paper(g, 0), g)
+        assert np.array_equal(_flatten_paper(g, -10), g)
+
+    def test_flatten_handles_even_and_tiny_radius(self):
+        """偶数・極小の半径でも GaussianBlur が落ちない。"""
+        from main import _flatten_paper
+        g = np.full((30, 30), 180, dtype=np.uint8)
+        for r in (1, 2, 4, 8, 100):
+            out = _flatten_paper(g, r)
+            assert out.shape == g.shape
+            assert out.dtype == np.uint8
+
+    def test_flatten_does_not_divide_by_zero(self):
+        """真っ黒な画像でもゼロ除算・NaN を出さない。"""
+        from main import _flatten_paper
+        g = np.zeros((30, 30), dtype=np.uint8)
+        out = _flatten_paper(g, 21)
+        assert np.isfinite(out).all()
+
+    def test_dialog_flatten_slider_removes_grid(self):
+        """ダイアログ経由でもスライダーを上げれば罫線が消える。"""
+        import cv2
+        from PyQt6.QtGui import QImage
+        from main import LineExtractionDialog
+        bgr, truth = self._graph_paper()
+        h, w = bgr.shape[:2]
+        bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+        src = QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+
+        dlg = LineExtractionDialog(src)
+        dlg._mode_fixed.setChecked(True)
+        dlg._thresh.setValue(175)
+
+        dlg._flatten.setValue(0)
+        off = dlg._mask_for(dlg._bgr, 1.0)
+        dlg._flatten.setValue(81)
+        on = dlg._mask_for(dlg._bgr, 1.0)
+
+        r_off, f_off = self._scores(off, truth)
+        r_on, f_on = self._scores(on, truth)
+        assert f_on < f_off, "平坦化で誤検出が減っていない"
+        assert r_on > 0.9, f"線が失われた (recall={r_on:.2f})"
+
+    def test_dialog_extract_stays_transparent_with_flatten(self):
+        """平坦化を効かせても、出力は背景透過・黒線のまま。"""
+        import cv2
+        from PyQt6.QtGui import QImage
+        from main import LineExtractionDialog
+        bgr, truth = self._graph_paper()
+        h, w = bgr.shape[:2]
+        bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+        src = QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+        dlg = LineExtractionDialog(src)
+        dlg._mode_fixed.setChecked(True)
+        dlg._thresh.setValue(175)
+        dlg._flatten.setValue(81)
+        out = dlg.extract()
+        assert out.size() == src.size()
+        ptr = out.bits()
+        ptr.setsize(out.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+        ink = arr[:, :, 3] > 0
+        assert ink.any(), "線が一本も無い"
+        # 線は黒、それ以外は完全透過
+        assert (arr[ink][:, :3] == 0).all()
+        assert (arr[~ink][:, 3] == 0).all()
+
+    def test_preview_and_full_agree_with_flatten(self):
+        """半径は px 指定なので、プレビューでも同じ見え方になること。"""
+        import cv2
+        from PyQt6.QtGui import QImage
+        from main import LineExtractionDialog
+        bgr, truth = self._graph_paper(size=600)
+        h, w = bgr.shape[:2]
+        bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+        src = QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+        dlg = LineExtractionDialog(src)
+        dlg._mode_fixed.setChecked(True)
+        dlg._thresh.setValue(175)
+        dlg._flatten.setValue(120)
+        small = dlg._mask_for(dlg._bgr_small, dlg._scale)
+        full = dlg._mask_for(dlg._bgr, 1.0)
+        d = abs(float((small > 0).mean()) - float((full > 0).mean()))
+        assert d < 0.02, f"プレビューと確定結果がずれている ({d:.3f})"
