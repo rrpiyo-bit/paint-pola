@@ -256,8 +256,8 @@ python -m pytest tests/ -v
 
 | ファイル | テスト数 | 内容 |
 |----------|----------|------|
-| test_unit_layer.py | 36 | Layer / GroupLayer / LayerStack のデータ操作 |
-| test_unit_canvas_logic.py | 42 | フラッドフィル（バケツ塗り）・隙間閉じ・薄い線判定・白背景の地色判別・囲み内塗りつぶしアルゴリズム |
+| test_unit_layer.py | 41 | Layer / GroupLayer / LayerStack のデータ操作 |
+| test_unit_canvas_logic.py | 54 | フラッドフィル（バケツ塗り）・隙間閉じ・薄い線判定・白背景の地色判別・囲み内塗りつぶしアルゴリズム |
 | test_rasterize.py | 7 | レイヤーラスタライズ・統合時のエフェクト焼き込み |
 | test_component_canvas.py | 61 | Canvas ウィジェットの操作・状態管理・履歴メモリ上限 |
 | test_animation.py | 24 | AnimationPanel のフレーム管理・再生・GIF出力 |
@@ -267,13 +267,13 @@ python -m pytest tests/ -v
 <details>
 <summary>テスト詳細一覧（クリックで展開）</summary>
 
-### test_unit_layer.py (36件)
+### test_unit_layer.py (41件)
 
 - Layer初期状態（透明、is_group=False）、clear、縁取り（有効/無効/サイズ0）
 - GroupLayer（is_group=True、composite、非表示子、opacity、resize）
 - LayerStack（add/remove/move/set_active、merge_down/merge_all_visible、composite、add_group）
 
-### test_unit_canvas_logic.py (42件)
+### test_unit_canvas_logic.py (54件)
 
 - FloodFill: 白キャンバス、全面、透明画像、範囲外、同色、境界停止、参照画像
 - FloodFillExpanded: 拡張0、正の拡張、負の拡張
