@@ -2493,3 +2493,201 @@ class TestLineExtraction:
             LineExtractionDialog.exec = orig
         assert len(win.layer_stack.layers) == before + 1
         assert any(l.name == "線画" for l in win.layer_stack.layers)
+
+
+# ── ズームの中心維持・方眼・テーマ ────────────────────────────────────────────
+
+class TestZoomKeepsCenter:
+    """拡大縮小したときに、今見えている中心が動かないこと。
+    以前は set_zoom がスクロール位置を触らなかったため、拡大中に
+    描いていた場所を見失っていた。"""
+
+    def _look_at(self, win, cx, cy, zoom):
+        """キャンバス座標 (cx,cy) がビューポート中心に来るようにする。"""
+        from PyQt6.QtCore import QPointF
+        c, sc = win.canvas, win._scroll
+        vp = sc.viewport()
+        c.set_zoom(zoom)
+        QApplication.processEvents()
+        w = c._c2w().map(QPointF(cx, cy))
+        pp = c.mapTo(sc.widget(), w.toPoint())
+        sc.horizontalScrollBar().setValue(int(pp.x() - vp.width() // 2))
+        sc.verticalScrollBar().setValue(int(pp.y() - vp.height() // 2))
+        QApplication.processEvents()
+
+    def _center(self, win):
+        from PyQt6.QtCore import QPointF, QPoint
+        c, vp = win.canvas, win._scroll.viewport()
+        local = c.mapFrom(vp, QPoint(vp.width() // 2, vp.height() // 2))
+        return c._w2c().map(QPointF(local))
+
+    def test_zoom_keeps_view_center(self, win):
+        win.resize(1200, 800)
+        QApplication.processEvents()
+        for cx, cy in [(2100, 2100), (2100, 400), (1250, 1250), (200, 1250)]:
+            self._look_at(win, cx, cy, 2.0)
+            start = self._center(win)
+            for z in (1.0, 0.5, 1.0, 3.0, 2.0):
+                win.canvas.set_zoom(z)
+                QApplication.processEvents()
+                now = self._center(win)
+                dist = ((now.x() - start.x()) ** 2 + (now.y() - start.y()) ** 2) ** 0.5
+                assert dist < 15, f"({cx},{cy}) zoom={z} でズレ {dist:.1f}px"
+
+    def test_zoom_out_does_not_drift_to_top_left(self, win):
+        """右下を見ている状態で縮小しても左上へ飛ばない。"""
+        win.resize(1200, 800)
+        QApplication.processEvents()
+        self._look_at(win, 2100, 2100, 2.0)
+        before = self._center(win)
+        win.canvas.set_zoom(1.0)
+        QApplication.processEvents()
+        after = self._center(win)
+        assert abs(before.x() - after.x()) < 15
+        assert abs(before.y() - after.y()) < 15
+
+    def test_zoom_keeps_margin_scrollable(self, win):
+        """拡大時はキャンバス外の余白までスクロールできる（端を中央に置ける）。"""
+        win.resize(1200, 800)
+        QApplication.processEvents()
+        win.canvas.set_zoom(3.0)
+        QApplication.processEvents()
+        assert win._scroll.horizontalScrollBar().maximum() > 0
+        assert win._scroll.verticalScrollBar().maximum() > 0
+
+    def test_set_zoom_without_scroll_area_does_not_crash(self):
+        """スクロールエリアが注入されていない Canvas でも set_zoom は動く。"""
+        from canvas import Canvas
+        from layer import LayerStack
+        ls = LayerStack(100, 100)
+        ls.add("l1")
+        c = Canvas(ls)
+        c._scroll_area = None
+        c.set_zoom(2.0)
+        assert c.zoom == 2.0
+
+
+class TestGridSettings:
+    """方眼（グリッド）のサイズと基準位置。"""
+
+    def test_corner_grid_starts_at_zero(self):
+        from canvas import _grid_lines
+        assert _grid_lines(1000, 100, "corner")[0] == 0
+        assert _grid_lines(500, 120, "corner") == [0, 120, 240, 360, 480]
+
+    def test_center_grid_puts_line_on_center(self):
+        """中心基準では、キャンバス中央に必ず線が来る。"""
+        from canvas import _grid_lines
+        for length, g in [(1000, 100), (1000, 300), (500, 120), (2500, 100)]:
+            lines = _grid_lines(length, g, "center")
+            center = length / 2.0
+            assert any(abs(x - center) < 0.51 for x in lines), \
+                f"length={length} g={g} で中心に線が無い"
+
+    def test_grid_lines_stay_inside_canvas(self):
+        from canvas import _grid_lines
+        for length in (100, 333, 1000, 2500):
+            for g in (4, 7, 100, 499):
+                for origin in ("corner", "center"):
+                    lines = _grid_lines(length, g, origin)
+                    if lines:
+                        assert lines[0] >= 0
+                        assert lines[-1] <= length
+
+    def test_grid_spacing_is_uniform(self):
+        from canvas import _grid_lines
+        for origin in ("corner", "center"):
+            lines = _grid_lines(1000, 130, origin)
+            gaps = {lines[i + 1] - lines[i] for i in range(len(lines) - 1)}
+            assert gaps == {130}
+
+    def test_grid_size_never_zero(self):
+        """0 や負値を渡しても 0除算・無限ループにならない。"""
+        from canvas import _grid_lines
+        for bad in (0, -5):
+            assert len(_grid_lines(100, bad, "corner")) > 0
+
+    def test_dialog_cancel_restores_previous_state(self, win):
+        from main import GridSettingsDialog
+        c = win.canvas
+        c.set_grid_size(50)
+        c.set_grid_origin("corner")
+        c.set_grid_visible(False)
+        before = (c._show_grid, c._grid_size, c._grid_origin)
+        dlg = GridSettingsDialog(c, win)
+        dlg._size.setValue(250)
+        dlg._origin_center.setChecked(True)
+        # プレビューが効いている
+        assert (c._show_grid, c._grid_size, c._grid_origin) != before
+        dlg.reject()
+        assert (c._show_grid, c._grid_size, c._grid_origin) == before
+
+    def test_dialog_ok_applies_settings(self, win):
+        from main import GridSettingsDialog
+        c = win.canvas
+        dlg = GridSettingsDialog(c, win)
+        dlg._size.setValue(175)
+        dlg._origin_center.setChecked(True)
+        dlg._show.setChecked(True)
+        dlg.accept()
+        assert c._show_grid is True
+        assert c._grid_size == 175
+        assert c._grid_origin == "center"
+
+    def test_grid_is_display_only(self, win):
+        """方眼は表示だけで、レイヤー画像には焼き込まれない。"""
+        c = win.canvas
+
+        def layer_bytes():
+            img = win.layer_stack.active.image
+            ptr = img.bits()
+            ptr.setsize(img.sizeInBytes())
+            return np.frombuffer(ptr, dtype=np.uint8).reshape(
+                img.height(), img.width(), 4).copy()
+
+        c.set_grid_visible(False)
+        QApplication.processEvents()
+        before = layer_bytes()
+        c.set_grid_size(40)
+        c.set_grid_origin("center")
+        c.set_grid_visible(True)
+        QApplication.processEvents()
+        # 方眼を出しても、レイヤーの画素は 1 つも変わらない
+        assert np.array_equal(before, layer_bytes())
+
+
+class TestThemeIsolation:
+    """テーマ適用がウィンドウ単位で完結すること。
+    以前は QApplication.setStyleSheet を使っており、閉じた（破棄前の）
+    ウィンドウまで再スタイルされてクラッシュすることがあった。"""
+
+    def test_theme_applies_to_window_not_application(self, win):
+        from themes import get_theme_keys
+        key = get_theme_keys()[1]
+        win._apply_theme(key)
+        assert len(win.styleSheet()) > 0
+        assert not QApplication.instance().styleSheet()
+
+    def test_two_windows_keep_independent_themes(self):
+        from main import MainWindow
+        from themes import get_theme_keys
+        keys = get_theme_keys()
+        a, b = MainWindow(), MainWindow()
+        try:
+            a._apply_theme(keys[0])
+            b._apply_theme(keys[-1])
+            assert a.styleSheet() != b.styleSheet()
+        finally:
+            a.close()
+            b.close()
+
+    def test_many_windows_can_be_created_and_closed(self):
+        """大量に生成・破棄してもクラッシュしない。"""
+        from main import MainWindow
+        from themes import get_theme_keys
+        keys = get_theme_keys()
+        for i in range(8):
+            w = MainWindow()
+            w._apply_theme(keys[i % len(keys)])
+            w.close()
+        QApplication.processEvents()

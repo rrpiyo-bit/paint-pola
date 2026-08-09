@@ -45,6 +45,26 @@ GRID_COLOR = QColor(180, 180, 180, 160)
 SELECTION_COLOR = QColor(0, 120, 215)
 
 
+# ── 方眼 ─────────────────────────────────────────────────────────────────────
+
+def _grid_lines(length: int, spacing: int, origin: str) -> list[int]:
+    """0〜length の範囲に引く方眼の線の座標を返す。
+
+    origin="corner" は隅（0）を起点にマス目を並べる。
+    origin="center" は中央に線の交点が来るようにし、そこから両方向へ
+    等間隔に伸ばす（中心を基準に構図を取りたいとき用）。
+    """
+    g = max(1, int(spacing))
+    if origin == "center":
+        center = length / 2.0
+        # 中心から g 刻みで両側へ。始点は範囲内に入る最小の線。
+        first = center - math.floor(center / g) * g
+        start = int(round(first))
+    else:
+        start = 0
+    return list(range(start, length + 1, g))
+
+
 # ── 変形ユーティリティ ────────────────────────────────────────────────────────────
 
 def _constrain_corner_shift(pt: QPointF, fixed_x: float, fixed_y: float,
@@ -438,6 +458,9 @@ class Canvas(QWidget):
         self._flip_h = False
         self._show_grid = False
         self._grid_size = 100  # canvas px (must stay > 0)
+        # 方眼の基準位置。"center" はキャンバス中心に線の交点が来るように、
+        # "corner" は左上の隅を起点にマス目を並べる。
+        self._grid_origin = "corner"
 
         # パンニング（Space+ドラッグ）
         self._panning = False
@@ -553,9 +576,59 @@ class Canvas(QWidget):
         self.brush_type = brush_type
         self._stabilizer = StabilizedBrush(get_brush(brush_type), smooth=6)
 
-    def set_zoom(self, zoom: float):
+    def _viewport_anchor(self, widget_pos: QPointF | None = None):
+        """拡大縮小の基準点を「ビューポート上の位置」と「その下にある
+        キャンバス座標」の組で返す。スクロールエリアが無ければ None。
+
+        widget_pos を渡すとその点（Ctrl+ホイールのカーソル位置）、
+        省略すると今見えている範囲の中心が基準になる。
+        """
+        if self._scroll_area is None:
+            return None
+        vp = self._scroll_area.viewport()
+        if widget_pos is None:
+            # ビューポート中心をこのウィジェットの座標系へ変換する
+            center_vp = QPointF(vp.width() / 2.0, vp.height() / 2.0)
+            local = self.mapFrom(vp, center_vp.toPoint())
+            widget_pos = QPointF(local)
+        else:
+            center_vp = QPointF(self.mapTo(vp, widget_pos.toPoint()))
+        canvas_pt = self._w2c().map(widget_pos)
+        return center_vp, canvas_pt
+
+    def _restore_anchor(self, anchor):
+        """_viewport_anchor で覚えた点が、ズーム後も同じ位置に来るように
+        スクロールバーを合わせる。これをしないと拡大縮小のたびに
+        表示が左上へ寄って、描いていた場所を見失う。"""
+        if anchor is None or self._scroll_area is None:
+            return
+        center_vp, canvas_pt = anchor
+        pad = self._scroll_area.widget()
+        # resize は非同期にイベントとして届くため、この時点ではまだ
+        # _CanvasPad が新しいサイズになっておらず、スクロールバーの
+        # maximum も古い値のままになる。そのまま setValue すると
+        # 旧 maximum で頭打ちされてしまうので、先に確定させる。
+        if pad is not None and hasattr(pad, "_relayout"):
+            pad._relayout()
+        vp = self._scroll_area.viewport()
+        # ズーム後、その canvas 座標がウィジェットのどこに来たか
+        new_widget = self._c2w().map(canvas_pt)
+        # スクロール内容（_CanvasPad）上の座標へ
+        pad_pt = self.mapTo(self._scroll_area.widget(), new_widget.toPoint())
+        hbar = self._scroll_area.horizontalScrollBar()
+        vbar = self._scroll_area.verticalScrollBar()
+        hbar.setValue(int(round(pad_pt.x() - center_vp.x())))
+        vbar.setValue(int(round(pad_pt.y() - center_vp.y())))
+
+    def set_zoom(self, zoom: float, anchor_pos: QPointF | None = None):
+        """ズームを変更する。今見えている範囲の中心（anchor_pos を渡した
+        場合はその点）が動かないようにスクロール位置も合わせる。"""
+        anchor = self._viewport_anchor(anchor_pos)
         self.zoom = max(MIN_ZOOM, zoom)
         self._update_size()
+        # _update_size → resize → _CanvasPad._relayout が走ってから
+        # スクロール位置を決める必要があるため、ここで確定させる
+        self._restore_anchor(anchor)
         self.zoom_changed.emit(self.zoom)
 
     def set_rotation(self, degrees: int):
@@ -581,6 +654,15 @@ class Canvas(QWidget):
 
     def set_grid_size(self, size: int):
         self._grid_size = max(1, size)  # 0除算・無限ループ防止
+        self.update()
+
+    def set_grid_origin(self, origin: str):
+        """方眼の基準を "center"（キャンバス中心）か "corner"（左上の隅）に。"""
+        self._grid_origin = "center" if origin == "center" else "corner"
+        self.update()
+
+    def set_grid_visible(self, visible: bool):
+        self._show_grid = bool(visible)
         self.update()
 
     # ── coordinate conversion ────────────────────────────────────────────────
@@ -985,9 +1067,9 @@ class Canvas(QWidget):
         p.setPen(QPen(GRID_COLOR, 1))
         cw, ch = self.layer_stack.width, self.layer_stack.height
         g = self._grid_size
-        for x in range(0, cw + 1, g):
+        for x in _grid_lines(cw, g, self._grid_origin):
             p.drawLine(x, 0, x, ch)
-        for y in range(0, ch + 1, g):
+        for y in _grid_lines(ch, g, self._grid_origin):
             p.drawLine(0, y, cw, y)
 
     def _draw_shape_preview(self, p: QPainter):
@@ -2844,9 +2926,9 @@ class Canvas(QWidget):
         mods = event.modifiers()
         delta = event.angleDelta().y()
         if mods & Qt.KeyboardModifier.ControlModifier:
-            # Ctrl+スクロール → ズーム
+            # Ctrl+スクロール → ズーム（カーソル下の点を固定する）
             factor = 1.15 if delta > 0 else 1 / 1.15
-            self.set_zoom(self.zoom * factor)
+            self.set_zoom(self.zoom * factor, event.position())
             event.accept()
         else:
             super().wheelEvent(event)

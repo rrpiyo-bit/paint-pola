@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QFileDialog,
                               QColorDialog, QLabel, QStatusBar, QMessageBox,
                               QDialog, QDialogButtonBox, QSlider, QFormLayout,
                               QSpinBox, QRadioButton, QButtonGroup, QGroupBox,
-                              QVBoxLayout, QSplitter, QPushButton)
+                              QVBoxLayout, QSplitter, QPushButton, QCheckBox)
 from PyQt6.QtCore import Qt, QSize, QRect, QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QRectF, QEvent, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
                           QFont, QPainter, QIcon, QImageReader)
@@ -254,6 +254,85 @@ class LineExtractionDialog(QDialog):
         bgra = np.zeros((h, w, 4), dtype=np.uint8)
         bgra[mask > 0] = [0, 0, 0, 255]
         return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+
+
+class GridSettingsDialog(QDialog):
+    """方眼（グリッド）の表示・マス目のサイズ・基準位置を設定する。
+    キャンバス上でリアルタイムにプレビューし、キャンセルで元に戻す。"""
+
+    def __init__(self, canvas, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("方眼をキャンバスに表示")
+        self.setMinimumWidth(360)
+        self._canvas = canvas
+        # キャンセル時に戻すための元の状態
+        self._orig = (canvas._show_grid, canvas._grid_size, canvas._grid_origin)
+
+        root = QVBoxLayout(self)
+
+        self._show = QCheckBox("方眼を表示する")
+        self._show.setChecked(True)
+        root.addWidget(self._show)
+
+        form = QFormLayout()
+        root.addLayout(form)
+
+        size_row = QHBoxLayout()
+        self._size = QSlider(Qt.Orientation.Horizontal)
+        self._size.setRange(4, 500)
+        self._size.setValue(canvas._grid_size)
+        self._size_label = QLabel(f"{canvas._grid_size} px")
+        self._size_label.setFixedWidth(60)
+        size_row.addWidget(self._size)
+        size_row.addWidget(self._size_label)
+        form.addRow("マス目のサイズ", size_row)
+
+        origin_box = QGroupBox("方眼の基準")
+        origin_layout = QVBoxLayout(origin_box)
+        self._origin_center = QRadioButton("キャンバスの中心")
+        self._origin_corner = QRadioButton("四方の隅（左上から）")
+        if canvas._grid_origin == "center":
+            self._origin_center.setChecked(True)
+        else:
+            self._origin_corner.setChecked(True)
+        self._origin_group = QButtonGroup(self)
+        self._origin_group.addButton(self._origin_center, 0)
+        self._origin_group.addButton(self._origin_corner, 1)
+        origin_layout.addWidget(self._origin_center)
+        origin_layout.addWidget(self._origin_corner)
+        root.addWidget(origin_box)
+
+        hint = QLabel("「中心」はキャンバス中央に線の交点が来るように並べます。"
+                      "「隅」は左上の角を起点にします。方眼は表示だけで、"
+                      "画像には描き込まれません。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        root.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._show.toggled.connect(self._apply)
+        self._size.valueChanged.connect(self._apply)
+        self._origin_group.idToggled.connect(lambda *_: self._apply())
+        self._apply()
+
+    def _apply(self, *_):
+        self._size_label.setText(f"{self._size.value()} px")
+        self._canvas.set_grid_size(self._size.value())
+        self._canvas.set_grid_origin(
+            "center" if self._origin_center.isChecked() else "corner")
+        self._canvas.set_grid_visible(self._show.isChecked())
+
+    def reject(self):
+        show, size, origin = self._orig
+        self._canvas.set_grid_size(size)
+        self._canvas.set_grid_origin(origin)
+        self._canvas.set_grid_visible(show)
+        super().reject()
 
 
 def _selection_mask_for_layer(layer, sel, mask) -> np.ndarray | None:
@@ -1203,6 +1282,7 @@ class MainWindow(QMainWindow):
         self._add_action(image_menu, "レイヤーをラスタライズ", self._rasterize_layer)
         image_menu.addSeparator()
         self._add_action(image_menu, "線画抽出...", self._extract_line)
+        self._add_action(image_menu, "方眼をキャンバスに表示...", self._grid_settings)
         self._add_action(image_menu, "レイヤーを変形（拡大縮小・回転）...", self._transform_layer_dialog)
 
         filter_menu = mb.addMenu("フィルター")
@@ -1225,6 +1305,7 @@ class MainWindow(QMainWindow):
         self._add_action(view_menu, "左右反転表示", self.canvas.toggle_flip_h, "Ctrl+Shift+H")
         view_menu.addSeparator()
         self._add_action(view_menu, "グリッド表示切替", self.canvas.toggle_grid, "Ctrl+G")
+        self._add_action(view_menu, "方眼をキャンバスに表示...", self._grid_settings)
 
         mode_menu = mb.addMenu("モード")
         self._anim_mode_action = QAction("アニメーションモード", self)
@@ -1635,7 +1716,11 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self, key: str):
         qss = get_theme_qss(key)
-        QApplication.instance().setStyleSheet(qss)
+        # QApplication.setStyleSheet だとプロセス内の全ウィジェットが対象になり、
+        # すでに閉じた（が破棄はされていない）ウィンドウの半壊したウィジェット
+        # ツリーまで Qt が走査してクラッシュすることがある。自分のウィンドウ
+        # だけに適用すれば十分で、複数ウィンドウでも互いに干渉しない。
+        self.setStyleSheet(qss)
         for k, action in self._theme_actions.items():
             action.setChecked(k == key)
         self._current_theme = key
@@ -1815,6 +1900,10 @@ class MainWindow(QMainWindow):
         self.layer_panel.refresh()
         self.canvas.update()
         self.navigator.refresh()
+
+    def _grid_settings(self):
+        GridSettingsDialog(self.canvas, self).exec()
+        self.canvas.update()
 
     def _select_layer_alpha(self):
         """編集メニュー: アクティブレイヤーの不透明部分（イラスト）の形で選択範囲を作る。"""
