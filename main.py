@@ -30,9 +30,59 @@ from toolbar import make_tool_cursors
 from themes import get_theme_keys, get_theme_label, get_theme_qss
 
 
+def _apply_color_correction(bgr: np.ndarray, contrast: int, brightness: int,
+                            desaturate: int) -> np.ndarray:
+    """線画抽出の前処理。BGR画像に彩度・コントラスト・明るさ補正をかけて
+    グレースケールを返す。
+
+    彩度を落とすと色かぶり（蛍光灯の緑かぶり等）の影響を減らせるが、
+    HSV の彩度を下げることは色を「白へ寄せる」ことなので、色ペンの線は
+    かえって紙との明暗差を失って薄くなる。既定を 0 にしてあるのはこのため。
+    色の線が拾いにくいときはむしろコントラストを上げるほうが効く。
+    """
+    if desaturate > 0:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 1] *= (1.0 - desaturate / 100.0)
+        bgr = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if contrast != 0:
+        # 128 を中心に伸縮する。contrast=100 でおよそ 2 倍のコントラスト。
+        factor = 1.0 + contrast / 100.0
+        gray = (gray - 128.0) * factor + 128.0
+    if brightness != 0:
+        gray += brightness * 1.28
+    return np.clip(gray, 0, 255).astype(np.uint8)
+
+
+def _extract_line_mask(gray: np.ndarray, adaptive: bool, threshold: int,
+                       sensitivity: int, block: int, denoise: int) -> np.ndarray:
+    """グレースケールから線のマスク（線=255）を作る。
+
+    adaptive=True では画素ごとに「周囲の平均より暗いか」で判定する。
+    写真は照明ムラで片側が影になりがちで、全体共通のしきい値だと
+    「影を拾わないと薄い線も拾えない」状態になる。局所平均を基準に
+    すればムラが相殺され、影があっても線だけを抜ける。
+    """
+    if adaptive:
+        # blockSize は奇数かつ 3 以上でなければならない
+        bs = max(3, int(block) | 1)
+        mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, bs, float(sensitivity))
+    else:
+        _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+    if denoise > 0:
+        # 紙の繊維やセンサーノイズが孤立した黒点として残るので、
+        # 開処理で小さな塊だけ消す（線は連結しているので残る）。
+        ksize = int(denoise) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+
 class LineExtractionDialog(QDialog):
     """線画抽出ダイアログ。
-    閾値処理（暗いピクセルを線として抽出）＋リアルタイムプレビュー付き。"""
+    色彩補正（彩度・コントラスト・明るさ）＋しきい値／適応的しきい値による
+    線の抽出＋ノイズ除去。リアルタイムプレビュー付き。"""
 
     PREVIEW_MAX = 400  # プレビュー画像の最大辺 px
 
@@ -41,21 +91,23 @@ class LineExtractionDialog(QDialog):
         self.setWindowTitle("線画抽出")
         self.setMinimumWidth(480)
 
-        # --- numpy グレースケールをあらかじめ作成 ---
+        # --- numpy BGR をあらかじめ作成 ---
         self._source = source
         sw, sh = source.width(), source.height()
         ptr = source.bits()
         ptr.setsize(sh * sw * 4)
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape(sh, sw, 4).copy()
-        bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-        self._gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        self._bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
 
         # プレビュー用縮小スケール
         scale = min(1.0, self.PREVIEW_MAX / max(sw, sh))
         pw = max(1, int(sw * scale))
         ph = max(1, int(sh * scale))
-        self._gray_small = cv2.resize(self._gray, (pw, ph), interpolation=cv2.INTER_AREA)
+        self._bgr_small = cv2.resize(self._bgr, (pw, ph), interpolation=cv2.INTER_AREA)
         self._preview_size = (pw, ph)
+        # プレビューは縮小されているので、px 単位の設定も同じ比率で縮める。
+        # そうしないとプレビューと確定結果で見え方がずれる。
+        self._scale = scale
 
         # --- レイアウト ---
         root = QVBoxLayout(self)
@@ -67,25 +119,45 @@ class LineExtractionDialog(QDialog):
         self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self._preview_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # しきい値スライダー
-        form = QFormLayout()
-        root.addLayout(form)
+        # --- 抽出方式 ---
+        mode_box = QGroupBox("抽出方式")
+        mode_layout = QVBoxLayout(mode_box)
+        self._mode_fixed = QRadioButton("しきい値（イラスト・スキャン向け）")
+        self._mode_adaptive = QRadioButton("自動（写真・照明ムラに強い）")
+        self._mode_fixed.setChecked(True)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self._mode_fixed, 0)
+        self._mode_group.addButton(self._mode_adaptive, 1)
+        mode_layout.addWidget(self._mode_fixed)
+        mode_layout.addWidget(self._mode_adaptive)
+        root.addWidget(mode_box)
 
-        thresh_row = QHBoxLayout()
-        self._thresh = QSlider(Qt.Orientation.Horizontal)
-        self._thresh.setRange(0, 255)
-        self._thresh.setValue(180)
-        self._thresh_label = QLabel("180")
-        self._thresh_label.setFixedWidth(30)
-        thresh_row.addWidget(self._thresh)
-        thresh_row.addWidget(self._thresh_label)
-        form.addRow("線のしきい値（明るさ）", thresh_row)
+        # --- 色彩補正 ---
+        corr_box = QGroupBox("色彩補正（抽出前の下ごしらえ）")
+        corr_form = QFormLayout(corr_box)
+        self._desat = self._add_slider(corr_form, "彩度を落とす", 0, 100, 0, "%")
+        self._contrast = self._add_slider(corr_form, "コントラスト", -100, 100, 0, "")
+        self._brightness = self._add_slider(corr_form, "明るさ", -100, 100, 0, "")
+        root.addWidget(corr_box)
+
+        # --- 抽出設定 ---
+        ext_box = QGroupBox("抽出")
+        ext_form = QFormLayout(ext_box)
+        self._thresh = self._add_slider(ext_form, "線のしきい値（明るさ）", 0, 255, 180, "")
+        self._thresh_row = ext_form.rowCount() - 1
+        self._sensitivity = self._add_slider(ext_form, "感度", 1, 40, 12, "")
+        self._sens_row = ext_form.rowCount() - 1
+        self._block = self._add_slider(ext_form, "線を探す範囲", 3, 61, 21, "px")
+        self._block_row = ext_form.rowCount() - 1
+        self._denoise = self._add_slider(ext_form, "ノイズ除去", 0, 6, 0, "px")
+        self._ext_form = ext_form
+        root.addWidget(ext_box)
 
         # 説明
-        hint = QLabel("スライダーを下げると薄い線も抽出されます。上げると濃い線だけになります。")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#666; font-size:11px;")
-        root.addWidget(hint)
+        self._hint = QLabel()
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet("color:#666; font-size:11px;")
+        root.addWidget(self._hint)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
@@ -93,27 +165,92 @@ class LineExtractionDialog(QDialog):
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
-        self._thresh.valueChanged.connect(self._update_preview)
-        self._update_preview(self._thresh.value())
+        self._mode_group.idToggled.connect(lambda *_: self._sync_mode())
+        self._sync_mode()
 
-    def _update_preview(self, value: int):
-        self._thresh_label.setText(str(value))
+    def _add_slider(self, form: QFormLayout, label: str, lo: int, hi: int,
+                    value: int, unit: str) -> QSlider:
+        """ラベル付きスライダーを1行追加して返す。"""
+        row = QHBoxLayout()
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(lo, hi)
+        slider.setValue(value)
+        text = QLabel(f"{value}{unit}")
+        text.setFixedWidth(46)
+        row.addWidget(slider)
+        row.addWidget(text)
+        slider.valueChanged.connect(lambda v: text.setText(f"{v}{unit}"))
+        slider.valueChanged.connect(lambda _: self._update_preview())
+        form.addRow(label, row)
+        return slider
+
+    def _set_row_visible(self, form: QFormLayout, row: int, visible: bool):
+        for role in (QFormLayout.ItemRole.LabelRole, QFormLayout.ItemRole.FieldRole):
+            item = form.itemAt(row, role)
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is not None:
+                widget.setVisible(visible)
+                continue
+            layout = item.layout()
+            if layout is not None:
+                for i in range(layout.count()):
+                    w = layout.itemAt(i).widget()
+                    if w is not None:
+                        w.setVisible(visible)
+
+    def _sync_mode(self):
+        """抽出方式に応じて関係のないスライダーを隠す。"""
+        adaptive = self.adaptive()
+        self._set_row_visible(self._ext_form, self._thresh_row, not adaptive)
+        self._set_row_visible(self._ext_form, self._sens_row, adaptive)
+        self._set_row_visible(self._ext_form, self._block_row, adaptive)
+        if adaptive:
+            self._hint.setText(
+                "周囲の明るさと比べて暗いところを線として抽出します。影や照明ムラが"
+                "あっても線だけを拾えます。感度を上げると濃い線だけ、下げると薄い線も"
+                "拾います。ざらつく場合はノイズ除去を上げてください。")
+        else:
+            self._hint.setText(
+                "しきい値より暗いピクセルを線として抽出します。下げると薄い線も"
+                "抽出され、上げると濃い線だけになります。写真で影の部分が真っ黒に"
+                "なる場合は「自動」に切り替えてください。")
+        self._update_preview()
+
+    # --- 設定値 ---
+
+    def adaptive(self) -> bool:
+        return self._mode_adaptive.isChecked()
+
+    def threshold(self) -> int:
+        return self._thresh.value()
+
+    def _gray_for(self, bgr: np.ndarray) -> np.ndarray:
+        return _apply_color_correction(bgr, self._contrast.value(),
+                                       self._brightness.value(),
+                                       self._desat.value())
+
+    def _mask_for(self, bgr: np.ndarray, scale: float) -> np.ndarray:
+        gray = self._gray_for(bgr)
+        block = max(3, int(round(self._block.value() * scale)))
+        denoise = int(round(self._denoise.value() * scale))
+        return _extract_line_mask(gray, self.adaptive(), self.threshold(),
+                                  self._sensitivity.value(), block, denoise)
+
+    def _update_preview(self):
         pw, ph = self._preview_size
-        # 閾値より暗いピクセルを線（黒）として抽出
-        _, mask = cv2.threshold(self._gray_small, value, 255, cv2.THRESH_BINARY_INV)
+        mask = self._mask_for(self._bgr_small, self._scale)
         # プレビュー: 白背景 + 黒線
         preview = np.full((ph, pw, 3), 255, dtype=np.uint8)
         preview[mask > 0] = [0, 0, 0]
         img = QImage(preview.tobytes(), pw, ph, pw * 3, QImage.Format.Format_RGB888).copy()
         self._preview_label.setPixmap(QPixmap.fromImage(img))
 
-    def threshold(self) -> int:
-        return self._thresh.value()
-
     def extract(self) -> QImage:
         """フルサイズで線画を生成して返す。"""
-        h, w = self._gray.shape
-        _, mask = cv2.threshold(self._gray, self.threshold(), 255, cv2.THRESH_BINARY_INV)
+        mask = self._mask_for(self._bgr, 1.0)
+        h, w = mask.shape
         bgra = np.zeros((h, w, 4), dtype=np.uint8)
         bgra[mask > 0] = [0, 0, 0, 255]
         return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()

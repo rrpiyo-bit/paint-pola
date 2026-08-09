@@ -2305,3 +2305,191 @@ class TestClipStudioStyle_ModeSwitch:
             os.unlink(gif_path)
 
         win._toggle_anim_mode(False)
+
+
+# ── 線画抽出: 色彩補正と適応的しきい値 ──────────────────────────────────────
+
+class TestLineExtraction:
+    """写真からの線画抽出。照明ムラのある画像で、固定しきい値では
+    「影を拾わずに線を拾う」設定が存在しないことと、適応的しきい値なら
+    拾えることを確認する。"""
+
+    def _photo(self, size=200, gradient=True):
+        """紙に描いた線を照明ムラつきで撮った写真を模す。(QImage, 真の線マスク)"""
+        import cv2
+        from PyQt6.QtGui import QImage, QPen
+        img = QImage(size, size, QImage.Format.Format_ARGB32)
+        img.fill(QColor(255, 255, 255, 255))
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(60, 55, 50), 4))
+        p.drawEllipse(30, 30, 70, 70)
+        p.drawRect(40, 120, 120, 55)
+        p.end()
+        ptr = img.bits()
+        ptr.setsize(size * size * 4)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(size, size, 4).copy()
+        bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+        truth = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) < 150
+
+        if gradient:
+            yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+            lit = bgr.astype(np.float32) * (1.0 - 0.65 * ((xx + yy) / (2.0 * size)))[:, :, None]
+        else:
+            lit = bgr.astype(np.float32)
+        out = QImage(size, size, QImage.Format.Format_ARGB32)
+        ob = out.bits()
+        ob.setsize(size * size * 4)
+        oarr = np.frombuffer(ob, dtype=np.uint8).reshape(size, size, 4)
+        oarr[:, :, :3] = np.clip(lit, 0, 255).astype(np.uint8)
+        oarr[:, :, 3] = 255
+        return out, truth
+
+    def test_adaptive_beats_fixed_on_uneven_lighting(self):
+        """照明ムラのある写真では、固定しきい値をどう振っても適応的しきい値に
+        及ばない（影が丸ごと線として拾われてしまう）。"""
+        import cv2
+        from main import _apply_color_correction, _extract_line_mask
+        src, truth = self._photo()
+        ptr = src.bits()
+        ptr.setsize(src.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(src.height(), src.width(), 4).copy()
+        bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+        gray = _apply_color_correction(bgr, 0, 0, 0)
+
+        def f1(mask):
+            m = mask > 0
+            tp = int(np.count_nonzero(m & truth))
+            fp = int(np.count_nonzero(m & ~truth))
+            fn = int(np.count_nonzero(~m & truth))
+            prec = tp / max(1, tp + fp)
+            rec = tp / max(1, tp + fn)
+            return 2 * prec * rec / max(1e-9, prec + rec)
+
+        best_fixed = max(f1(_extract_line_mask(gray, False, t, 12, 21, 0))
+                         for t in range(60, 241, 20))
+        adaptive = f1(_extract_line_mask(gray, True, 180, 12, 21, 1))
+        assert adaptive > best_fixed
+        assert adaptive > 0.85
+
+    def test_fixed_threshold_still_works_on_clean_scan(self):
+        """照明ムラのないきれいな画像では従来どおり固定しきい値で拾える
+        （既存の使い方を壊していないこと）。"""
+        import cv2
+        from main import _apply_color_correction, _extract_line_mask
+        src, truth = self._photo(gradient=False)
+        ptr = src.bits()
+        ptr.setsize(src.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(src.height(), src.width(), 4).copy()
+        gray = _apply_color_correction(cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR), 0, 0, 0)
+        mask = _extract_line_mask(gray, False, 180, 12, 21, 0) > 0
+        recall = np.count_nonzero(mask & truth) / max(1, np.count_nonzero(truth))
+        assert recall > 0.95
+
+    def test_brightness_makes_faint_lines_detectable(self):
+        """薄い線は「明るさを下げる」でしきい値の下に入る。"""
+        import cv2
+        from main import _apply_color_correction, _extract_line_mask
+        from PyQt6.QtGui import QImage, QPen
+        s = 120
+        img = QImage(s, s, QImage.Format.Format_ARGB32)
+        img.fill(QColor(250, 248, 245, 255))
+        p = QPainter(img)
+        p.setPen(QPen(QColor(200, 200, 200), 4))
+        p.drawLine(10, 60, 110, 60)
+        p.end()
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        bgr = cv2.cvtColor(np.frombuffer(ptr, dtype=np.uint8).reshape(s, s, 4).copy(),
+                           cv2.COLOR_BGRA2BGR)
+        plain = np.count_nonzero(_extract_line_mask(
+            _apply_color_correction(bgr, 0, 0, 0), False, 180, 12, 21, 0))
+        darker = np.count_nonzero(_extract_line_mask(
+            _apply_color_correction(bgr, 0, -40, 0), False, 180, 12, 21, 0))
+        assert plain == 0
+        assert darker > 200
+
+    def test_denoise_removes_speckles_not_lines(self):
+        """ノイズ除去は孤立した点だけを消し、線は残す。"""
+        from main import _extract_line_mask
+        gray = np.full((120, 120), 255, dtype=np.uint8)
+        gray[54:66, 10:110] = 30           # 線（ノイズ除去の径より太い）
+        rng = np.random.default_rng(3)
+        ys = rng.integers(0, 120, 200)
+        xs = rng.integers(0, 120, 200)
+        gray[ys, xs] = 30                  # 孤立した点
+        before = _extract_line_mask(gray, False, 180, 12, 21, 0)
+        after = _extract_line_mask(gray, False, 180, 12, 21, 2)
+        line_before = np.count_nonzero(before[54:66, 10:110])
+        line_after = np.count_nonzero(after[54:66, 10:110])
+        assert np.count_nonzero(after) < np.count_nonzero(before)
+        assert line_after > line_before * 0.9
+
+    def test_adaptive_block_size_accepts_even_values(self):
+        """範囲スライダーが偶数でも adaptiveThreshold は落ちない
+        （blockSize は奇数でなければならないため内部で補正している）。"""
+        from main import _extract_line_mask
+        gray = np.full((60, 60), 200, dtype=np.uint8)
+        gray[20:40, 20:40] = 40
+        for block in (3, 4, 10, 21, 60):
+            mask = _extract_line_mask(gray, True, 180, 12, block, 0)
+            assert mask.shape == gray.shape
+
+    def test_desaturate_is_neutral_on_gray_art(self):
+        """無彩色の絵では彩度スライダーが結果を変えない。"""
+        from main import _apply_color_correction
+        gray_bgr = np.full((40, 40, 3), 180, dtype=np.uint8)
+        gray_bgr[10:30, 10:30] = 40
+        a = _apply_color_correction(gray_bgr, 0, 0, 0)
+        b = _apply_color_correction(gray_bgr, 0, 0, 100)
+        assert np.array_equal(a, b)
+
+    def test_dialog_preview_matches_full_result(self):
+        """プレビュー（縮小）と確定結果（フルサイズ）で線の比率がほぼ一致する。"""
+        from main import LineExtractionDialog
+        src, _ = self._photo(size=300)
+        dlg = LineExtractionDialog(src)
+        dlg._mode_adaptive.setChecked(True)
+        dlg._denoise.setValue(2)
+        full = dlg._mask_for(dlg._bgr, 1.0)
+        prev = dlg._mask_for(dlg._bgr_small, dlg._scale)
+        full_ratio = np.count_nonzero(full) / full.size
+        prev_ratio = np.count_nonzero(prev) / prev.size
+        assert abs(full_ratio - prev_ratio) < 0.02
+
+    def test_dialog_extract_returns_transparent_black_lines(self):
+        """extract() は背景透過・線は黒の ARGB32 を返す。"""
+        from main import LineExtractionDialog
+        from PyQt6.QtGui import QImage
+        src, _ = self._photo(size=200)
+        dlg = LineExtractionDialog(src)
+        dlg._mode_adaptive.setChecked(True)
+        out = dlg.extract()
+        assert out.format() == QImage.Format.Format_ARGB32
+        assert (out.width(), out.height()) == (200, 200)
+        ptr = out.bits()
+        ptr.setsize(out.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(200, 200, 4)
+        opaque = arr[:, :, 3] > 0
+        assert np.count_nonzero(opaque) > 100          # 線がある
+        assert np.count_nonzero(~opaque) > 0           # 背景は透過
+        assert arr[opaque][:, :3].max() == 0           # 線は黒
+
+    def test_extract_line_menu_adds_layer(self, win):
+        """メニューからの線画抽出が「線画」レイヤーを追加する。"""
+        from main import LineExtractionDialog
+        from PyQt6.QtWidgets import QDialog
+        before = len(win.layer_stack.layers)
+        orig = LineExtractionDialog.exec
+
+        def fake_exec(self):
+            self._mode_adaptive.setChecked(True)
+            return QDialog.DialogCode.Accepted
+
+        LineExtractionDialog.exec = fake_exec
+        try:
+            win._extract_line()
+        finally:
+            LineExtractionDialog.exec = orig
+        assert len(win.layer_stack.layers) == before + 1
+        assert any(l.name == "線画" for l in win.layer_stack.layers)
