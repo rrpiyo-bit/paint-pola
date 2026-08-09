@@ -2851,3 +2851,195 @@ class TestFlattenPaper:
         full = dlg._mask_for(dlg._bgr, 1.0)
         d = abs(float((small > 0).mean()) - float((full > 0).mean()))
         assert d < 0.02, f"プレビューと確定結果がずれている ({d:.3f})"
+
+
+
+# ── 色調補正（線を濃く） ──────────────────────────────────────────────────
+
+class TestToneAdjust:
+    """薄くなった線画を濃くする補正。薄さは alpha と RGB の2か所に宿るので、
+    線画抽出直後（alpha が 0/255・RGB が真っ黒）と手描き（半端な alpha・
+    灰色の RGB）の両方で狙いどおりに効くことを確認する。"""
+
+    def _extracted_line(self, size=120):
+        """線画抽出の直後を模したレイヤー配列（alpha は 0/255、RGB は黒）。"""
+        import cv2
+        arr = np.zeros((size, size, 4), dtype=np.uint8)
+        mask = np.zeros((size, size), dtype=np.uint8)
+        cv2.line(mask, (10, 20), (110, 60), 255, 2)
+        cv2.circle(mask, (60, 85), 25, 255, 2)
+        arr[mask > 0] = [0, 0, 0, 255]
+        return arr
+
+    def _hand_drawn(self, size=120):
+        """手描きを模したレイヤー配列（薄い alpha と灰色の RGB）。"""
+        from PyQt6.QtGui import QImage, QPen
+        img = QImage(size, size, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(0, 0, 0, 90), 3))
+        p.drawLine(10, 10, 110, 60)
+        p.setPen(QPen(QColor(120, 120, 120, 255), 3))
+        p.drawLine(10, 80, 110, 110)
+        p.end()
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        return np.frombuffer(ptr, dtype=np.uint8).reshape(size, size, 4).copy()
+
+    def test_identity_when_all_zero(self):
+        """全て 0 なら何も変わらない。"""
+        from main import _adjust_line_tone
+        arr = self._hand_drawn()
+        assert np.array_equal(_adjust_line_tone(arr, 0, 0, 0, 0), arr)
+
+    def test_does_not_mutate_input(self):
+        """元の配列を書き換えない。"""
+        from main import _adjust_line_tone
+        arr = self._hand_drawn()
+        before = arr.copy()
+        _adjust_line_tone(arr, -50, 30, 60, 2)
+        assert np.array_equal(arr, before)
+
+    def test_density_raises_alpha(self):
+        """「濃さ」で半端な alpha が持ち上がる。"""
+        from main import _adjust_line_tone
+        arr = self._hand_drawn()
+        ink = arr[:, :, 3] > 0
+        base = float(np.median(arr[ink][:, 3]))
+        prev = base
+        for d in (30, 60, 100):
+            out = _adjust_line_tone(arr, 0, 0, d, 0)
+            now = float(np.median(out[ink][:, 3]))
+            assert now > prev, f"濃さ{d} で alpha が上がっていない"
+            prev = now
+        assert prev > base * 1.5
+
+    def test_negative_density_fades(self):
+        """負の「濃さ」なら薄くなる。"""
+        from main import _adjust_line_tone
+        arr = self._hand_drawn()
+        ink = arr[:, :, 3] > 0
+        out = _adjust_line_tone(arr, 0, 0, -60, 0)
+        assert np.median(out[ink][:, 3]) < np.median(arr[ink][:, 3])
+
+    def test_alpha_never_overflows(self):
+        """不透明な線に濃さを掛けても 255 を超えて巻き戻らない。"""
+        from main import _adjust_line_tone
+        arr = self._extracted_line()
+        out = _adjust_line_tone(arr, 0, 0, 100, 0)
+        ink = arr[:, :, 3] == 255
+        assert (out[ink][:, 3] == 255).all()
+
+    def test_brightness_darkens_gray_lines(self):
+        """灰色がかった手描き線は「明るさ」を下げると濃くなる。"""
+        from main import _adjust_line_tone
+        arr = self._hand_drawn()
+        gray = (arr[:, :, 3] > 0) & (arr[:, :, 0] > 60)
+        assert gray.any(), "テスト画像に灰色の線が無い"
+        out = _adjust_line_tone(arr, -60, 0, 0, 0)
+        assert np.median(out[gray][:, 0]) < np.median(arr[gray][:, 0])
+
+    def test_rgb_sliders_are_noop_on_pure_black_lines(self):
+        """線画抽出の直後は RGB が既に真っ黒なので、明るさを下げても変わらない。
+        だからこそ「濃さ」と「線を太らせる」が必要、という設計の裏付け。"""
+        from main import _adjust_line_tone
+        arr = self._extracted_line()
+        out = _adjust_line_tone(arr, -100, 0, 0, 0)
+        assert np.array_equal(out, arr)
+
+    def test_thicken_grows_the_line(self):
+        """「線を太らせる」で不透明ピクセルが増える。"""
+        from main import _adjust_line_tone
+        arr = self._extracted_line()
+        base = int((arr[:, :, 3] > 0).sum())
+        prev = base
+        for t in (1, 2, 3):
+            out = _adjust_line_tone(arr, 0, 0, 0, t)
+            now = int((out[:, :, 3] > 0).sum())
+            assert now > prev, f"太らせ{t}px で増えていない"
+            prev = now
+
+    def test_thicken_keeps_line_color(self):
+        """太らせても線の色が変わらない（黒以外でも）。"""
+        from main import _adjust_line_tone
+        import cv2
+        arr = np.zeros((80, 80, 4), dtype=np.uint8)
+        mask = np.zeros((80, 80), dtype=np.uint8)
+        cv2.line(mask, (10, 40), (70, 40), 255, 3)
+        arr[mask > 0] = [40, 30, 200, 255]   # BGRA: 赤い線
+        out = _adjust_line_tone(arr, 0, 0, 0, 2)
+        ink = out[:, :, 3] > 0
+        med = np.median(out[ink][:, :3], axis=0)
+        assert np.allclose(med, [40, 30, 200], atol=2), f"色が変わった {med}"
+
+    def test_thicken_zero_is_noop(self):
+        from main import _adjust_line_tone
+        arr = self._extracted_line()
+        assert np.array_equal(_adjust_line_tone(arr, 0, 0, 0, 0), arr)
+
+    def test_area_mask_limits_the_effect(self):
+        """選択範囲の内側だけが補正され、外側は元のまま。"""
+        from main import _adjust_line_tone
+        arr = self._hand_drawn()
+        mask = np.zeros(arr.shape[:2], dtype=bool)
+        mask[:60, :] = True
+        out = _adjust_line_tone(arr, -100, 50, 100, 2, mask)
+        assert not np.array_equal(out[:60], arr[:60]), "範囲内が変わっていない"
+        assert np.array_equal(out[60:], arr[60:]), "範囲外まで変わっている"
+
+    def test_dialog_preview_and_cancel_restore(self, win):
+        """ダイアログはプレビューし、キャンセルで元の画像に戻す。"""
+        from main import ToneAdjustDialog
+        layer = win.layer_stack.active
+        layer.image = self._as_qimage(self._hand_drawn())
+        before = layer.image.copy()
+
+        dlg = ToneAdjustDialog(win.canvas, layer, None, win)
+        dlg._density.setValue(80)
+        dlg._thicken.setValue(2)
+        assert layer.image != before, "プレビューが効いていない"
+        dlg.reject()
+        assert layer.image == before, "キャンセルで戻っていない"
+
+    def test_dialog_ok_keeps_result(self, win):
+        from main import ToneAdjustDialog
+        layer = win.layer_stack.active
+        layer.image = self._as_qimage(self._hand_drawn())
+        before = layer.image.copy()
+        dlg = ToneAdjustDialog(win.canvas, layer, None, win)
+        dlg._density.setValue(80)
+        dlg.accept()
+        assert layer.image != before
+
+    def _as_qimage(self, arr):
+        from PyQt6.QtGui import QImage
+        h, w = arr.shape[:2]
+        return QImage(arr.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+
+    def test_menu_action_is_undoable(self, win):
+        """メニューから実行した結果が Undo で元に戻る。"""
+        from main import ToneAdjustDialog
+        from PyQt6.QtWidgets import QDialog
+        layer = win.layer_stack.active
+        layer.image = self._as_qimage(self._hand_drawn())
+        before = layer.image.copy()
+
+        # _filter_tone_adjust と同じ手順（ダイアログは自動 accept）
+        win.canvas._save_history()
+        dlg = ToneAdjustDialog(win.canvas, layer, None, win)
+        dlg._density.setValue(90)
+        dlg.accept()
+        assert layer.image != before
+        win.canvas.undo()
+        assert win.layer_stack.active.image == before
+
+    def test_group_layer_is_rejected(self, win):
+        """グループレイヤーでは実行できない（警告して何もしない）。"""
+        win.layer_stack.add_group("フォルダ")
+        group = next(l for l in win.layer_stack.layers if l.is_group)
+        win.layer_stack.active_path = [win.layer_stack.layers.index(group)]
+        assert win.layer_stack.active.is_group
+        before = len(win.canvas._history)
+        win._filter_tone_adjust()
+        assert len(win.canvas._history) == before, "履歴を積んでしまっている"

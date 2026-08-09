@@ -391,6 +391,135 @@ def _selection_mask_for_layer(layer, sel, mask) -> np.ndarray | None:
     return local
 
 
+def _adjust_line_tone(arr: np.ndarray, brightness: int, contrast: int,
+                      density: int, thicken: int,
+                      area_mask: np.ndarray | None = None) -> np.ndarray:
+    """BGRA 配列の線を濃く・くっきりさせる。新しい配列を返す（元は変更しない）。
+
+    薄さは2か所に宿る。線画抽出の直後は RGB が真っ黒で alpha が 0/255 なので
+    RGB をいじっても何も起きず、効くのは「濃さ(alpha)」と「太さ」だけ。
+    一方、手で描いた線は alpha が半端な値を持ち RGB も灰色がかるため、
+    明るさ・コントラストが効く。両方を1つのダイアログで賄う。
+
+    area_mask（レイヤーローカル座標の bool）を渡すと、その内側だけを補正する。
+    """
+    out = arr.copy()
+    rgb = out[:, :, :3].astype(np.float32)
+    alpha = out[:, :, 3].astype(np.float32)
+
+    if contrast != 0:
+        # 128 を中心に伸縮する。線画抽出の前処理と同じ考え方。
+        rgb = (rgb - 128.0) * (1.0 + contrast / 100.0) + 128.0
+    if brightness != 0:
+        rgb += brightness * 1.28
+    if density != 0:
+        # 不透明度を持ち上げる。半端な alpha ほど大きく持ち上がるよう、
+        # 単純な倍率ではなくガンマで曲げる（density=100 でおよそ 2.6 倍相当）。
+        gamma = 1.0 / (1.0 + density / 60.0) if density > 0 else 1.0 - density / 100.0
+        alpha = 255.0 * np.power(np.clip(alpha / 255.0, 0.0, 1.0), gamma)
+
+    out[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+    out[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+
+    if thicken > 0:
+        # 線を太らせる = alpha を膨張させる。抽出直後の線画のように
+        # RGB が一様な場合に、色を保ったまま線だけを強くできる。
+        ksize = int(thicken) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        grown = cv2.dilate(out[:, :, 3], kernel)
+        # 新しく増えた縁には、既存の線の色を塗る（透明部分の RGB は 0 なので
+        # そのままだと黒くなる。線が黒以外のときに色が変わってしまう）。
+        added = (grown > 0) & (out[:, :, 3] == 0)
+        if added.any():
+            ink = out[:, :, 3] > 0
+            if ink.any():
+                color = np.median(out[ink][:, :3], axis=0).astype(np.uint8)
+                out[added, 0], out[added, 1], out[added, 2] = color
+        out[:, :, 3] = grown
+
+    if area_mask is not None:
+        # 選択範囲の外は元のまま
+        keep = ~area_mask.astype(bool)
+        out[keep] = arr[keep]
+    return out
+
+
+class ToneAdjustDialog(QDialog):
+    """フィルター → 色調補正（線を濃く）: 選択レイヤーの線を濃く・くっきりさせる。
+    キャンバス上でリアルタイムにプレビューし、OKで確定・キャンセルで元に戻す。"""
+
+    def __init__(self, canvas, layer, area_mask: np.ndarray | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("色調補正（線を濃く）")
+        self.setMinimumWidth(380)
+        self._canvas = canvas
+        self._layer = layer
+        self._orig_image = layer.image.copy()
+        self._area_mask = area_mask
+
+        img = self._orig_image
+        w, h = img.width(), img.height()
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        self._orig_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        root.addLayout(form)
+        self._brightness = self._add_slider(form, "明るさ", -100, 100, 0, "")
+        self._contrast = self._add_slider(form, "コントラスト", -100, 100, 0, "")
+        self._density = self._add_slider(form, "濃さ（不透明度）", -100, 100, 0, "")
+        self._thicken = self._add_slider(form, "線を太らせる", 0, 10, 0, "px")
+
+        hint = QLabel(
+            "薄くなった線を濃くします。線画抽出の直後は線が既に真っ黒なので、"
+            "「濃さ」と「線を太らせる」が効きます。手描きの線が灰色がかっている"
+            "ときは「明るさ」を下げるか「コントラスト」を上げてください。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        root.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._update_preview()
+
+    def _add_slider(self, form: QFormLayout, label: str, lo: int, hi: int,
+                    value: int, unit: str) -> QSlider:
+        row = QHBoxLayout()
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(lo, hi)
+        slider.setValue(value)
+        text = QLabel(f"{value}{unit}")
+        text.setFixedWidth(46)
+        row.addWidget(slider)
+        row.addWidget(text)
+        slider.valueChanged.connect(lambda v: text.setText(f"{v}{unit}"))
+        slider.valueChanged.connect(lambda _: self._update_preview())
+        form.addRow(label, row)
+        return slider
+
+    def result_array(self) -> np.ndarray:
+        return _adjust_line_tone(self._orig_arr, self._brightness.value(),
+                                 self._contrast.value(), self._density.value(),
+                                 self._thicken.value(), self._area_mask)
+
+    def _update_preview(self):
+        arr = self.result_array()
+        h, w = arr.shape[:2]
+        self._layer.image = QImage(arr.tobytes(), w, h, w * 4,
+                                   QImage.Format.Format_ARGB32).copy()
+        self._canvas.update()
+
+    def reject(self):
+        self._layer.image = self._orig_image
+        self._canvas.update()
+        super().reject()
+
+
 class DespeckleDialog(QDialog):
     """フィルター → ゴミ取り: 面積が指定px²以下の孤立した不透明の塊を透明化する。
     キャンバス上でリアルタイムにプレビューし、OKで確定・キャンセルで元に戻す。"""
@@ -1313,6 +1442,7 @@ class MainWindow(QMainWindow):
         filter_menu = mb.addMenu("フィルター")
         self._add_action(filter_menu, "ぼかし (ガウス)...", self._filter_blur)
         self._add_action(filter_menu, "ゴミ取り...", self._filter_despeckle)
+        self._add_action(filter_menu, "色調補正（線を濃く）...", self._filter_tone_adjust)
 
         view_menu = mb.addMenu("表示")
         zoom_menu = view_menu.addMenu("ズーム")
@@ -2091,6 +2221,27 @@ class MainWindow(QMainWindow):
         p.drawImage(0, 0, result)
         p.end()
         self.canvas.update()
+
+    def _filter_tone_adjust(self):
+        """フィルター → 色調補正: 選択レイヤーの線を濃く・くっきりさせる。"""
+        layer = self.canvas.layer_stack.active
+        if not layer or layer.is_group:
+            QMessageBox.warning(self, "色調補正", "通常レイヤーを選択してください。")
+            return
+
+        local_mask = _selection_mask_for_layer(
+            layer, self.canvas._selection_rect, self.canvas._lasso_mask)
+
+        self.canvas._save_history()
+        dlg = ToneAdjustDialog(self.canvas, layer, local_mask, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # キャンセル時は _save_history() で積んだ undo エントリを巻き戻す
+            if self.canvas._history and self.canvas._history[-1][0] == "pixel":
+                self.canvas._history.pop()
+            return
+        self.layer_panel.refresh()
+        self.canvas.update()
+        self.navigator.refresh()
 
     def _filter_despeckle(self):
         """フィルター → ゴミ取り: 選択レイヤー上の孤立した小さな塊（面積 px² 以下）を透明化する。"""
