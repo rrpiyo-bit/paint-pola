@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QImage, QColor, QPainter, QPen, QMouseEvent
-from PyQt6.QtCore import Qt, QPoint, QPointF
+from PyQt6.QtCore import Qt, QPoint, QPointF, QRect
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -790,3 +790,103 @@ class TestFillReferenceMode:
         ls.active_path = [0]
         c = Canvas(ls)
         assert c.fill_reference_mode == "ref_self"
+
+
+class TestInvertSelection:
+    """選択範囲の反転（編集メニュー / 選択ツールのオプション）。"""
+
+    def _canvas(self, w=60, h=60):
+        stack = LayerStack(w, h)
+        lyr = Layer("a", w, h)
+        lyr.image.fill(Qt.GlobalColor.transparent)
+        stack.layers = [lyr]
+        stack.active_path = [0]
+        return Canvas(stack), lyr
+
+    def _selected(self, c) -> int:
+        m = c._lasso_mask
+        ptr = m.bits(); ptr.setsize(m.height() * m.width() * 4)
+        a = np.frombuffer(ptr, dtype=np.uint8).reshape(m.height(), m.width(), 4)
+        return int((a[:, :, 3] > 0).sum())
+
+    def test_rect_selection_inverts(self):
+        """矩形選択を反転すると、矩形の外側だけが選ばれる。"""
+        c, _ = self._canvas()
+        c._selection_rect = QRect(10, 10, 20, 20)
+        c.invert_selection()
+        assert self._selected(c) == 60 * 60 - 20 * 20
+        assert px(c._lasso_mask, 15, 15).alpha() == 0    # 元の選択の中
+        assert px(c._lasso_mask, 2, 2).alpha() > 0       # 外側
+
+    def test_lasso_selection_inverts(self):
+        """投げなわ選択でも反転でき、選択＋非選択で全面になる。"""
+        c, _ = self._canvas()
+        poly = [QPoint(5, 5), QPoint(40, 5), QPoint(40, 40), QPoint(5, 40)]
+        c._lasso_mask = canvas_mod._mask_from_polygon(poly, 60, 60)
+        c._selection_rect = QRect(5, 5, 35, 35)
+        before = self._selected(c)
+        c.invert_selection()
+        after = self._selected(c)
+        assert before + after == 60 * 60
+
+    def test_twice_restores_original(self):
+        """2回反転すれば元の選択に戻る。"""
+        c, _ = self._canvas()
+        c._selection_rect = QRect(10, 10, 20, 20)
+        c.invert_selection()
+        c.invert_selection()
+        assert self._selected(c) == 20 * 20
+        assert c._selection_rect == QRect(10, 10, 20, 20)
+
+    def test_bbox_shrinks_to_selected_area(self):
+        """反転後の外接矩形は、実際に選ばれている範囲に合う。"""
+        c, _ = self._canvas()
+        # 左上を選んで反転すると、右下側だけが残る
+        c._selection_rect = QRect(0, 0, 60, 30)
+        c.invert_selection()
+        assert c._selection_rect.top() == 30
+        assert c._selection_rect.bottom() == 59
+
+    def test_outline_is_built(self):
+        """反転後も輪郭（点線表示用）が作られる。
+
+        これがないと点線がキャンバス外周にしか出ず、
+        どこが抜けているのか見た目で分からない。
+        """
+        c, _ = self._canvas()
+        c._selection_rect = QRect(10, 10, 20, 20)
+        c.invert_selection()
+        assert c._selection_outline_path is not None
+        assert c._selection_outline_path.elementCount() > 0
+
+    def test_full_canvas_inversion_deselects(self):
+        """全面選択を反転すると何も残らないので選択解除になる。"""
+        c, _ = self._canvas()
+        c.select_all()
+        c.invert_selection()
+        assert c._selection_rect is None
+        assert c._lasso_mask is None
+
+    def test_without_selection_is_noop(self):
+        """選択がないときは何も起きない（例外も出ない）。"""
+        c, _ = self._canvas()
+        c.invert_selection()
+        assert c._selection_rect is None
+
+    def test_has_selection(self):
+        c, _ = self._canvas()
+        assert c.has_selection() is False
+        c._selection_rect = QRect(1, 1, 5, 5)
+        assert c.has_selection() is True
+
+    def test_inverted_selection_drives_delete(self):
+        """反転した選択で削除すると、元の選択内だけが残る。"""
+        c, lyr = self._canvas()
+        p = QPainter(lyr.image)
+        p.fillRect(0, 0, 60, 60, QColor(255, 0, 0, 255))
+        p.end()
+        c._selection_rect = QRect(10, 10, 20, 20)
+        c.invert_selection()
+        c.delete_selection()
+        assert px(lyr.image, 20, 20).alpha() > 0    # 元の選択内は残る
+        assert px(lyr.image, 2, 2).alpha() == 0     # 外側は消える

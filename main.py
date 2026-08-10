@@ -1271,6 +1271,8 @@ class MainWindow(QMainWindow):
             lambda v: setattr(self.canvas, 'fill_reference_mode', v))
         self.tool_options.select_mode_changed.connect(
             lambda v: setattr(self.canvas, 'select_mode', v))
+        self.tool_options.invert_selection_requested.connect(
+            self._invert_selection)
         self.tool_options.pivot_changed.connect(
             lambda ax, ay: setattr(self.canvas, '_transform_pivot', (ax, ay)))
         self.tool_options.pivot_mode_changed.connect(
@@ -1435,7 +1437,7 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         self._add_action(edit_menu, "すべて選択", self.canvas.select_all, "Ctrl+A")
         self._add_action(edit_menu, "イラストを選択", self._select_layer_alpha, "Ctrl+Shift+A")
-        self._add_action(edit_menu, "選択を反転", self.canvas.invert_selection, "Ctrl+Shift+I")
+        self._add_action(edit_menu, "選択を反転", self._invert_selection, "Ctrl+Shift+I")
         self._add_action(edit_menu, "選択解除", self.canvas.deselect, "Escape")
 
         image_menu = mb.addMenu("画像")
@@ -2079,6 +2081,14 @@ class MainWindow(QMainWindow):
             return
         if not self.canvas.select_layer_alpha(layer):
             self.statusBar().showMessage("選択できる不透明ピクセルがありません", 3000)
+
+    def _invert_selection(self):
+        """編集メニュー / 選択ツールのオプション: 選択範囲を反転する。"""
+        if not self.canvas.has_selection():
+            self.statusBar().showMessage(
+                "先に選択範囲を作ってください", 3000)
+            return
+        self.canvas.invert_selection()
 
     def _transform_layer_dialog(self):
         """画像メニュー: レイヤー全体をliftしてからTransformPercentDialogを開く。"""

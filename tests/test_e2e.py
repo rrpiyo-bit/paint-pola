@@ -3139,3 +3139,44 @@ class TestToneDensityStacking:
         assert faint_after > faint_before * 2
         assert faint_after >= dark_before * 0.8, \
             f"揃っていない (濃い={dark_before} 補正後={faint_after})"
+
+
+class TestInvertSelectionUI:
+    """選択ツールのオプションの「選択範囲を反転」ボタン。"""
+
+    def _button(self, win):
+        from PyQt6.QtWidgets import QPushButton
+        for w in win.tool_options._widgets:
+            if isinstance(w, QPushButton) and "反転" in w.text():
+                return w
+        return None
+
+    @pytest.mark.parametrize("tool", [Tool.SELECT_RECT, Tool.LASSO])
+    def test_button_shown_for_selection_tools(self, win, tool):
+        win._on_tool_change(tool)
+        assert self._button(win) is not None
+
+    def test_button_absent_for_pen(self, win):
+        win._on_tool_change(Tool.PEN)
+        assert self._button(win) is None
+
+    def test_button_inverts_canvas_selection(self, win):
+        """ボタンを押すと実際にキャンバスの選択が反転される。"""
+        win._on_tool_change(Tool.SELECT_RECT)
+        c = win.canvas
+        cw, ch = c.layer_stack.width, c.layer_stack.height
+        c._selection_rect = QRect(10, 10, 20, 20)
+        c._lasso_mask = None
+        self._button(win).click()
+        assert c._lasso_mask is not None
+        m = c._lasso_mask
+        ptr = m.bits(); ptr.setsize(ch * cw * 4)
+        a = np.frombuffer(ptr, dtype=np.uint8).reshape(ch, cw, 4)
+        assert int((a[:, :, 3] > 0).sum()) == cw * ch - 20 * 20
+
+    def test_button_without_selection_does_not_crash(self, win):
+        """選択がない状態で押しても落ちない。"""
+        win._on_tool_change(Tool.SELECT_RECT)
+        win.canvas.deselect()
+        self._button(win).click()
+        assert win.canvas._selection_rect is None

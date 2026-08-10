@@ -391,6 +391,26 @@ def _fill_closed_regions_in_area(image: QImage, area_mask: np.ndarray,
 
 # ── ポリゴンマスク ─────────────────────────────────────────────────────────────
 
+def _outline_path_from_mask(mask: np.ndarray) -> QPainterPath:
+    """選択マスク（0/1 の 2値）の輪郭を QPainterPath にする。
+
+    穴あきの選択（選択を反転したときなど）は矩形ひとつでは表せないので、
+    輪郭を全部拾って複数サブパスとして持たせる。これがないと点線が
+    キャンバス外周にしか出ず、どこが選ばれているのか見えない。
+    """
+    contours, _ = cv2.findContours((mask > 0).astype(np.uint8) * 255,
+                                   cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    outline = QPainterPath()
+    for cnt in contours:
+        if len(cnt) < 2:
+            continue
+        outline.moveTo(QPointF(float(cnt[0][0][0]), float(cnt[0][0][1])))
+        for pt in cnt[1:]:
+            outline.lineTo(QPointF(float(pt[0][0]), float(pt[0][1])))
+        outline.closeSubpath()
+    return outline
+
+
 def _mask_from_polygon(points: list[QPoint], w: int, h: int) -> QImage:
     mask = QImage(w, h, QImage.Format.Format_ARGB32)
     mask.fill(Qt.GlobalColor.transparent)
@@ -2289,12 +2309,15 @@ class Canvas(QWidget):
         self._sync_ant_timer()
         self.update()
 
+    def has_selection(self) -> bool:
+        """確定した選択範囲があるか。ドラッグ途中の投げなわは含めない。"""
+        return self._selection_rect is not None
+
     def invert_selection(self):
         """選択範囲を反転する。矩形選択・投げなわ選択どちらにも対応。"""
         if not self._selection_rect:
             return
         w, h = self.layer_stack.width, self.layer_stack.height
-        canvas_rect = QRect(0, 0, w, h)
 
         if self._lasso_mask is None:
             # 矩形選択 → 選択範囲マスクを作ってから反転する
@@ -2313,10 +2336,23 @@ class Canvas(QWidget):
         ip.drawImage(0, 0, base_mask)
         ip.end()
 
+        inv_ptr = inverted.bits(); inv_ptr.setsize(h * w * 4)
+        inv_arr = np.frombuffer(inv_ptr, dtype=np.uint8).reshape(h, w, 4)
+        inv_mask = inv_arr[:, :, 3] > 0
+        if not inv_mask.any():
+            # 全面が選ばれていた場合、反転すると何も残らない。
+            # 空の選択を持ち回ると以降の処理が対象なしで詰まるので解除する。
+            self.deselect()
+            return
+
+        ys, xs = np.nonzero(inv_mask)
         self._lasso_mask = inverted
-        self._selection_rect = canvas_rect
-        self._selection_outline_path = None
+        self._selection_rect = QRect(int(xs.min()), int(ys.min()),
+                                     int(xs.max() - xs.min() + 1),
+                                     int(ys.max() - ys.min() + 1))
+        self._selection_outline_path = _outline_path_from_mask(inv_mask)
         self._lasso_path_points = []
+        self._lasso_points = []
         self._sync_ant_timer()
         self.update()
 
@@ -2380,16 +2416,7 @@ class Canvas(QWidget):
         mask_arr = np.frombuffer(mptr, dtype=np.uint8).reshape(ch, cw, 4)
         mask_arr[canvas_mask > 0] = [255, 255, 255, 255]
 
-        contours, _ = cv2.findContours(canvas_mask * 255, cv2.RETR_LIST,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-        outline = QPainterPath()
-        for cnt in contours:
-            if len(cnt) < 2:
-                continue
-            outline.moveTo(QPointF(float(cnt[0][0][0]), float(cnt[0][0][1])))
-            for pt in cnt[1:]:
-                outline.lineTo(QPointF(float(pt[0][0]), float(pt[0][1])))
-            outline.closeSubpath()
+        outline = _outline_path_from_mask(canvas_mask)
 
         self._selection_rect = sel
         self._lasso_mask = mask_img

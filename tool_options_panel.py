@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QSpinBox, QSlider, QComboBox, QFrame,
-                              QSizePolicy, QScrollArea, QAbstractSpinBox)
+                              QSizePolicy, QScrollArea, QAbstractSpinBox,
+                              QPushButton)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from tools import Tool
@@ -89,6 +90,7 @@ class ToolOptionsPanel(QWidget):
     fill_line_sensitivity_changed = pyqtSignal(int)  # 薄い線を拾う感度(%)
     fill_reference_mode_changed = pyqtSignal(str)  # 複数参照 ref / ref_self
     select_mode_changed   = pyqtSignal(str)   # "select" | "transform"
+    invert_selection_requested = pyqtSignal()
     pivot_changed         = pyqtSignal(int, int)  # (ax, ay) 変形基準点
     pivot_mode_changed    = pyqtSignal(str)        # "preset" | "custom"
     transform_mode_changed = pyqtSignal(str)       # "standard" | "perspective" | "mesh"
@@ -226,6 +228,7 @@ class ToolOptionsPanel(QWidget):
 
         elif tool in (Tool.SELECT_RECT, Tool.LASSO):
             self._add_select_mode_combo(select_mode)
+            self._add_invert_selection_button()
             self._add_transform_mode_combo(transform_mode, mesh_div)
             self._add_pivot_selector()
 
@@ -346,6 +349,17 @@ class ToolOptionsPanel(QWidget):
         cb.toggled.connect(callback)
         self._content_layout.insertWidget(self._content_layout.count() - 1, cb)
         self._widgets.append(cb)
+
+    def _add_invert_selection_button(self):
+        """選択範囲を反転する。選択がないときは押しても何も起きない。"""
+        btn = QPushButton("選択範囲を反転")
+        btn.setToolTip("選択されている部分と、されていない部分を入れ替えます。\n"
+                       "背景だけを塗りたいときなど、囲みたくない側が\n"
+                       "単純な形のときに便利です。（Ctrl+Shift+I）")
+        btn.clicked.connect(lambda: self.invert_selection_requested.emit())
+        # ラベル行は付けない（ボタン自身が何をするか示しているため）
+        self._content_layout.insertWidget(self._content_layout.count() - 1, btn)
+        self._widgets.append(btn)
 
     def _add_select_mode_combo(self, current: str):
         cb = QComboBox()
