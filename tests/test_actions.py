@@ -1649,11 +1649,20 @@ class TestUkiyoe:
               "paper_color": QColor(240, 230, 205)}
 
     def test_paper_color_shows_through(self):
-        """絵の無い所は指定した紙の色になる。"""
+        """紙で埋める指定にすると、絵の無い所は指定した紙の色になる。"""
         ls, layer = _make_colorful_stack()
-        result = execute_ukiyoe(ls, layer, dict(self.PARAMS))
+        result = execute_ukiyoe(ls, layer, dict(self.PARAMS, keep_alpha=False))
         c = result.image.pixelColor(0, 0)
         assert (c.red(), c.green(), c.blue()) == (240, 230, 205)
+
+    def test_keeps_transparent_background_by_default(self):
+        """既定では、元が透明だった所は紙で埋めずに透明のまま残す。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_ukiyoe(ls, layer, dict(self.PARAMS))
+        arr = _qimage_to_array_test(result.image)
+        src = _qimage_to_array_test(layer.image)
+        assert arr[0, 0, 3] == 0, "絵の無い隅が埋まっている"
+        assert (arr[:, :, 3] > 10)[src[:, :, 3] > 10].all(), "絵の部分が抜けている"
 
     def test_reduces_color_count(self):
         """版画らしく色数が元より減る。"""
@@ -1745,6 +1754,14 @@ class TestStainedGlass:
         outside = out_a[src_a == 0]
         assert (outside == 0).mean() > 0.5
 
+    def test_default_keeps_transparency(self):
+        """glass_bg を指定しないときの既定は「埋めない」。
+        既定で埋めると、透明背景の絵に掛けたとき背景が黒く潰れる。"""
+        params = {k: v for k, v in self.PARAMS.items() if k != "glass_bg"}
+        ls, layer = _make_colorful_stack()
+        result = execute_stained_glass(ls, layer, params)
+        assert _qimage_to_array_test(result.image)[0, 0, 3] == 0
+
     def test_larger_cells_make_fewer_pieces(self):
         """ガラス片を大きくすると鉛線の総量が減る。"""
         ls1, l1 = _make_colorful_stack()
@@ -1826,10 +1843,21 @@ class TestEtching:
         dark_side = ink[:, 60:].mean()
         assert dark_side > light_side
 
-    def test_fills_whole_canvas(self):
-        """紙に刷るので全面が不透明になる。"""
+    def test_keeps_transparent_background_by_default(self):
+        """既定では、元が透明だった所は紙で埋めずに透明のまま残す。
+        全面を埋めると下のレイヤーが隠れて重ねて使えなくなる。"""
         ls, layer = _make_colorful_stack()
         result = execute_etching(ls, layer, dict(self.PARAMS))
+        arr = _qimage_to_array_test(result.image)
+        src = _qimage_to_array_test(layer.image)
+        assert arr[0, 0, 3] == 0, "絵の無い隅が埋まっている"
+        assert (arr[:, :, 3] > 10)[src[:, :, 3] > 10].all(), "絵の部分が抜けている"
+
+    def test_fills_whole_canvas_when_requested(self):
+        """紙で埋める指定なら従来どおり全面が不透明になる。"""
+        ls, layer = _make_colorful_stack()
+        result = execute_etching(ls, layer,
+                                 dict(self.PARAMS, keep_alpha=False))
         alpha = _qimage_to_array_test(result.image)[:, :, 3]
         assert (alpha == 255).all()
 
@@ -1865,3 +1893,48 @@ class TestStyleEffectsInGacha:
         for _ in range(10):
             params = _gacha_random_params("warhol", colors)
             assert len(params["palettes"]) == params["cols"] * params["rows"]
+
+
+class TestStyleEffectsKeepTransparency:
+    """「紙／ガラスを敷く」系の効果が、元の透明部分を塗り潰さないこと。
+
+    透明背景の絵に掛けたときに全面が埋まると、下のレイヤーが隠れて
+    重ねて使えなくなる。ガチャは効果を連続適用するので、途中で1つでも
+    全面を埋めると、それ以前の結果がすべて隠れてしまう。
+    """
+
+    CASES = [
+        ("ukiyoe", execute_ukiyoe,
+         {"levels": 4, "misalign": 0, "sumi": 2, "paper": 0.0}),
+        ("stained_glass", execute_stained_glass,
+         {"cell": 20, "lead": 3, "vivid": 1.5}),
+        ("etching", execute_etching,
+         {"spacing": 4, "layers": 4, "wobble": 0.0, "grain": 0.0}),
+    ]
+
+    @pytest.mark.parametrize("key,fn,params", CASES)
+    def test_transparent_area_stays_transparent(self, key, fn, params):
+        ls, layer = _make_colorful_stack()
+        src_a = _qimage_to_array_test(layer.image)[:, :, 3].copy()
+        result = fn(ls, layer, dict(params))
+        assert result is not None
+        out_a = _qimage_to_array_test(result.image)[:, :, 3]
+        outside = out_a[src_a == 0]
+        assert outside.size > 0
+        assert (outside == 0).mean() > 0.5, f"{key}: 透明部分が埋まっている"
+
+    @pytest.mark.parametrize("key", ["ukiyoe", "stained_glass", "etching"])
+    def test_gacha_params_do_not_fill_background(self, key):
+        """ガチャが渡すパラメータでも全面を埋めない（重ねがけが壊れる）。
+
+        セルの大きさや版ズレの分だけ絵の外側にはみ出るのは正常。
+        見たいのは「キャンバス全面が埋まる」壊れ方なので、不透明率で見る。
+        """
+        colors = [QColor(c) for c in GACHA_PALETTES[0][1]]
+        for _ in range(5):
+            ls, layer = _make_colorful_stack()
+            params = _gacha_random_params(key, colors)
+            result = _GACHA_EXEC[key](ls, layer, params)
+            assert result is not None
+            out_a = _qimage_to_array_test(result.image)[:, :, 3]
+            assert (out_a > 10).mean() < 0.95,                 f"{key}: ガチャ経由で全面が埋まっている {params}"

@@ -3660,6 +3660,13 @@ class UkiyoeDialog(QDialog):
         self._line_sensitivity.setToolTip("上げるほど薄い線も境界として拾う")
         form.addRow("薄い線を拾う", self._line_sensitivity)
 
+        self._keep_alpha = QComboBox()
+        # 既定は透過を保つ。元が透明だった部分まで紙で埋めると、
+        # 下のレイヤーが隠れて重ねて使えなくなるため。
+        self._keep_alpha.addItem("透明部分はそのまま（絵にだけ摺る）", "keep")
+        self._keep_alpha.addItem("紙で全面を埋める", "fill")
+        form.addRow("背景", self._keep_alpha)
+
         layout.addLayout(form)
 
         desc = QLabel("色数を絞って版画のように平坦化し、版ズレ・墨線・和紙の\n"
@@ -3686,6 +3693,7 @@ class UkiyoeDialog(QDialog):
             "pigment": self._pigment.value() / 100.0,
             "close_gap": self._close_gap.value(),
             "line_sensitivity": self._line_sensitivity.value(),
+            "keep_alpha": self._keep_alpha.currentData() == "keep",
         }
 
 
@@ -3706,6 +3714,7 @@ def execute_ukiyoe(layer_stack: LayerStack, source_layer: Layer,
     pigment = max(0.0, min(1.0, float(params.get("pigment", 0.6))))
     close_gap = max(0, int(params.get("close_gap", 0)))
     line_threshold = round(10 * (100 - max(0, min(100, int(params.get("line_sensitivity", 0))))) / 100)
+    keep_alpha = bool(params.get("keep_alpha", True))
 
     arr = _qimage_to_array(src_img).astype(np.float32)
     rgb, alpha = arr[:, :, :3], arr[:, :, 3]
@@ -3724,6 +3733,8 @@ def execute_ukiyoe(layer_stack: LayerStack, source_layer: Layer,
     bg_mask = _uniform_background_mask(rgb, alpha)
     if bg_mask is not None:
         alpha = np.where(bg_mask, 0.0, alpha)
+    # 「絵のある範囲」。透明部分に加え、紙とみなした白地もここでは絵ではない。
+    src_alpha = alpha.copy()
 
     # 平滑化して面をまとめる。ここでチャンネルごとに量子化してしまうと、
     # 肌色のように3チャンネルが同じ段に丸まる色が無彩色の灰色になって
@@ -3803,6 +3814,18 @@ def execute_ukiyoe(layer_stack: LayerStack, source_layer: Layer,
     if paper > 0:
         tex = _paper_texture((h, w), paper * 40.0)
         out[:, :, :3] = np.clip(out[:, :, :3] + tex[:, :, None], 0, 255)
+
+    if keep_alpha:
+        # 元が透明だった部分は紙で埋めずに透明のまま残す。
+        # ただし版ズレで絵が動くぶん、シルエットを misalign px だけ広げて
+        # おかないと、ずらした版の縁が切り落とされてしまう。
+        keep = src_alpha > 10
+        margin = misalign + sumi
+        if margin > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (margin * 2 + 1, margin * 2 + 1))
+            keep = cv2.dilate(keep.astype(np.uint8), k) > 0
+        out[:, :, 3] = np.where(keep, 255.0, 0.0)
 
     result = Layer(f"{source_layer.name} - 浮世絵風", w, h)
     result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
@@ -3992,8 +4015,11 @@ class StainedGlassDialog(QDialog):
         form.addRow("透過光の強さ", self._vivid)
 
         self._bg = QCheckBox("背景もガラスにする")
-        self._bg.setChecked(True)
-        self._bg.setToolTip("オフにすると絵のある部分だけがガラスになる")
+        # 既定はオフ。元が透明だった部分まで暗いガラスで埋めると、
+        # 下のレイヤーが隠れて重ねて使えなくなるため。
+        self._bg.setChecked(False)
+        self._bg.setToolTip("オンにすると、絵の無い部分も暗いガラスで埋めて画面全体を覆う。\n"
+                            "オフなら元が透明だった部分は透明のまま残る")
         form.addRow("", self._bg)
 
         layout.addLayout(form)
@@ -4032,7 +4058,9 @@ def execute_stained_glass(layer_stack: LayerStack, source_layer: Layer,
     lead = max(1, int(params.get("lead", 3)))
     lead_color = params.get("lead_color") or QColor(25, 22, 20)
     vivid = float(params.get("vivid", 1.7))
-    glass_bg = params.get("glass_bg", True)
+    # 既定は透過を保つ。元が透明だった部分まで暗いガラスで埋めると、
+    # 下のレイヤーが隠れて重ねて使えなくなるため。
+    glass_bg = params.get("glass_bg", False)
 
     arr = _qimage_to_array(src_img).astype(np.float32)
     rgb, alpha = arr[:, :, :3], arr[:, :, 3]
@@ -4309,6 +4337,13 @@ class EtchingDialog(QDialog):
         self._grain.setSuffix(" %")
         form.addRow("紙の質感", self._grain)
 
+        self._keep_alpha = QComboBox()
+        # 既定は透過を保つ。元が透明だった部分まで紙で埋めると、
+        # 下のレイヤーが隠れて重ねて使えなくなるため。
+        self._keep_alpha.addItem("透明部分はそのまま（絵にだけ彫る）", "keep")
+        self._keep_alpha.addItem("紙で全面を埋める", "fill")
+        form.addRow("背景", self._keep_alpha)
+
         layout.addLayout(form)
 
         desc = QLabel("明暗を細かい彫り線の密度に置き換えて、銅版画のように\n"
@@ -4330,6 +4365,7 @@ class EtchingDialog(QDialog):
             "ink_color": self._ink_color._color,
             "paper_color": self._paper_color._color,
             "grain": self._grain.value() / 100.0,
+            "keep_alpha": self._keep_alpha.currentData() == "keep",
         }
 
 
@@ -4348,6 +4384,7 @@ def execute_etching(layer_stack: LayerStack, source_layer: Layer,
     ink_color = params.get("ink_color") or QColor(35, 28, 22)
     paper_color = params.get("paper_color") or QColor(238, 230, 214)
     grain = float(params.get("grain", 0.3))
+    keep_alpha = bool(params.get("keep_alpha", True))
 
     arr = _qimage_to_array(src_img).astype(np.float32)
     rgb, alpha = arr[:, :, :3], arr[:, :, 3]
@@ -4401,6 +4438,10 @@ def execute_etching(layer_stack: LayerStack, source_layer: Layer,
     if grain > 0:
         tex = _paper_texture((h, w), grain * 35.0)
         out[:, :, :3] = np.clip(out[:, :, :3] + tex[:, :, None], 0, 255)
+
+    if keep_alpha:
+        # 元が透明だった部分は紙で埋めずに透明のまま残す
+        out[:, :, 3] = np.where(alpha > 10, 255.0, 0.0)
 
     result = Layer(f"{source_layer.name} - 銅版画風", w, h)
     result.image = _array_to_qimage(np.clip(out, 0, 255).astype(np.uint8))
@@ -4573,24 +4614,29 @@ def _gacha_random_params(key: str, colors: list[QColor]) -> dict:
                 "dot_color": pick(), "line_color": dark,
                 "white_bg": rb(0.7)}
     if key == "ukiyoe":
+        # ガチャは効果を重ねがけするので、透明部分を紙で埋めると
+        # 直前までの結果が隠れてしまう。透過は保つ。
         return {"levels": ri(3, 6), "misalign": ri(0, 10), "sumi": ri(1, 4),
                 "paper": ru(0.15, 0.5),
-                "paper_color": light if rb(0.5) else QColor(240, 230, 205)}
+                "paper_color": light if rb(0.5) else QColor(240, 230, 205),
+                "keep_alpha": True}
     if key == "impressionist":
         return {"length": ri(6, 20), "width": ri(2, 5),
                 "density": ru(1.5, 3.0), "jitter": ri(5, 35),
                 "follow": rb(0.75)}
     if key == "stained_glass":
+        # 同上。背景まで暗いガラスで覆うと重ねがけの意味が無くなる。
         return {"cell": ri(18, 60), "lead": ri(2, 6), "lead_color": dark,
-                "vivid": ru(1.2, 2.2), "glass_bg": rb(0.6)}
+                "vivid": ru(1.2, 2.2), "glass_bg": False}
     if key == "blueprint":
         return {"paper_color": dark, "ink_color": light,
                 "thickness": ri(1, 4), "grid": random.choice([0, 16, 24, 32, 48]),
                 "major": ri(3, 8), "fade": ru(0.1, 0.4)}
     if key == "etching":
+        # 同上。重ねがけで下の結果を紙で塗り潰さないよう透過を保つ。
         return {"spacing": ri(3, 8), "layers": ri(3, 5), "wobble": ru(0.2, 0.7),
                 "ink_color": dark, "paper_color": light,
-                "grain": ru(0.15, 0.45)}
+                "grain": ru(0.15, 0.45), "keep_alpha": True}
     return {}
 
 
