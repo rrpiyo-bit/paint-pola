@@ -179,7 +179,8 @@ def _line_free_mask(judge_arr: np.ndarray, threshold: int = LINE_ALPHA_THRESHOLD
 
 def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
                 ref_image: QImage | None = None,
-                close_gap: int = 0, line_threshold: int = LINE_ALPHA_THRESHOLD):
+                close_gap: int = 0, line_threshold: int = LINE_ALPHA_THRESHOLD,
+                include_self: bool = False):
     """連結領域を numpy/cv2 のラベリングで検出し、一括書き込みする塗りつぶし。
     QImage.pixel()/setPixel() を1ピクセルずつ呼ぶ旧scanline実装は、大キャンバスで
     UIスレッドが長時間ブロックされフリーズ/クラッシュする原因になっていたため廃止。
@@ -189,7 +190,12 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
         塗りが痩せることはない。
     line_threshold: この alpha 以下のピクセルは「線ではない」とみなす。
         値を上げると薄いアンチエイリアス部分を線扱いしなくなり、
-        「色が薄いせいで途切れ扱いされる」のを防げる（参照モードのみ有効）。"""
+        「色が薄いせいで途切れ扱いされる」のを防げる（参照モードのみ有効）。
+    include_self: 参照レイヤーだけでなく、塗る対象レイヤー自身に既に描かれている
+        ピクセルも境界として扱う（クリスタの「複数参照: 参照レイヤー＋編集レイヤー」
+        に相当）。off だと、塗る側に描いた囲み線を素通りして外まで漏れる。
+        アニメ塗りのように「線画だけを境界にして下のレイヤーで色を塗り分ける」
+        使い方では off が正しいので、既定は off のまま切り替え式にしてある。"""
     w, h = image.width(), image.height()
     if not (0 <= x < w and 0 <= y < h):
         return
@@ -205,6 +211,13 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
     # 通常モード: image の同色ピクセルが対象
     if ref_image is not None:
         candidate = _line_free_mask(judge_arr, line_threshold)
+        if include_self:
+            # 自分のレイヤーに既に描かれている部分も境界にする。
+            # 参照が線画だけのとき、塗る側に描いた囲み線は判定に入らないため
+            # そこを素通りして外まで漏れる。ここで AND を取って止める。
+            self_ptr = image.bits(); self_ptr.setsize(nbytes)
+            self_arr = np.frombuffer(self_ptr, dtype=np.uint8).reshape(h, w, 4)
+            candidate = candidate & (self_arr[:, :, 3] <= line_threshold)
         if not candidate[y, x]:
             return
         candidate = candidate.astype(np.uint8)
@@ -244,6 +257,11 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         grown = cv2.dilate(fill_mask.astype(np.uint8), kernel)
         original_candidate = _line_free_mask(judge_arr, line_threshold)
+        if include_self:
+            # 膨張し直すときも同じ境界でクリップしないと、自分の線を越えて戻る。
+            self_ptr2 = image.bits(); self_ptr2.setsize(nbytes)
+            self_arr2 = np.frombuffer(self_ptr2, dtype=np.uint8).reshape(h, w, 4)
+            original_candidate = original_candidate & (self_arr2[:, :, 3] <= line_threshold)
         fill_mask = (grown > 0) & original_candidate
 
     if ref_image is not None:
@@ -264,15 +282,18 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
 def _flood_fill_expanded(image: QImage, x: int, y: int,
                           fill_color: QColor, ref_image: QImage | None,
                           expand: int, close_gap: int = 0,
-                          line_threshold: int = LINE_ALPHA_THRESHOLD):
+                          line_threshold: int = LINE_ALPHA_THRESHOLD,
+                          include_self: bool = False):
     """flood fill 後に expand px だけ塗り範囲を膨張(正)/収縮(負)させる。"""
     if expand == 0:
-        _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold)
+        _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold,
+                    include_self)
         return
 
     # fill 前のスナップショット
     before = image.copy()
-    _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold)
+    _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold,
+                include_self)
 
     # 「新たに塗られたピクセル」のマスクを numpy で取り出す
     w, h = image.width(), image.height()
@@ -446,6 +467,10 @@ class Canvas(QWidget):
         # 「色が薄いせいで途切れ扱いされる」のを防ぐ。
         # 0% = 従来どおり alpha>10 のみ線、100% = alpha が少しでもあれば線。
         self.fill_line_sensitivity: int = 0
+        # バケツ塗りの複数参照（クリスタ相当）。"ref"=参照レイヤーのみ、
+        # "ref_self"=参照レイヤー＋編集中レイヤー。編集中レイヤーに描いた
+        # 囲み線で止めたいときは後者。
+        self.fill_reference_mode: str = "ref_self"
         self.select_mode: str = "select"  # "select" | "transform"
 
         # ぼかしツール
@@ -1645,7 +1670,8 @@ class Canvas(QWidget):
                     ref_img = ref_img.copy(lox, loy, lw, lh)
             thr = _sensitivity_to_threshold(self.fill_line_sensitivity)
             _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img,  # type: ignore
-                                 self.fill_expand, self.fill_close_gap, thr)
+                                 self.fill_expand, self.fill_close_gap, thr,
+                                 self.fill_reference_mode == "ref_self")
             self.update()
 
         elif self.tool == Tool.BLUR:

@@ -694,3 +694,99 @@ class TestFillOnOpaqueBackground:
         ref.fill(QColor(20, 20, 20, 255))
         img = self._fill(ref, (50, 50))
         assert img.pixelColor(50, 50).alpha() == 0
+
+
+
+class TestFillReferenceMode:
+    """複数参照（クリスタ相当）: 編集中レイヤーに描いた囲み線で塗りが止まるか。
+
+    参照レイヤーが線画だけのとき、塗る側に描いた〇は境界判定に入らないため
+    素通りして外まで漏れていた。ref_self では自分のレイヤーの不透明部分も
+    境界に含める。ref（参照のみ）は従来どおりで、アニメ塗りの塗り分け用。
+    """
+
+    CYAN = QColor(0, 174, 205, 255)
+    RED = QColor(255, 0, 0, 255)
+    SIZE = 200
+
+    def _ref_lineart(self):
+        """線画レイヤー。〇は含まない（〇は編集側に描かれている）。"""
+        ref = QImage(self.SIZE, self.SIZE, QImage.Format.Format_ARGB32)
+        ref.fill(Qt.GlobalColor.transparent)
+        p = QPainter(ref)
+        p.setPen(QPen(QColor(0, 0, 0, 255), 4))
+        p.drawLine(0, 170, self.SIZE, 170)
+        p.end()
+        return ref
+
+    def _target_with_circle(self):
+        """編集中レイヤー。ここに水色の〇を描いてある。"""
+        t = QImage(self.SIZE, self.SIZE, QImage.Format.Format_ARGB32)
+        t.fill(Qt.GlobalColor.transparent)
+        p = QPainter(t)
+        p.setPen(QPen(self.CYAN, 12))
+        p.drawEllipse(50, 40, 90, 90)
+        p.end()
+        return t
+
+    def _mask(self, img, color):
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        a = np.frombuffer(ptr, dtype=np.uint8).reshape(self.SIZE, self.SIZE, 4)
+        want = np.array([color.blue(), color.green(),
+                         color.red(), color.alpha()], dtype=np.uint8)
+        return np.all(a == want, axis=2)
+
+    def test_self_line_blocks_fill(self):
+        """ref_self: 〇の中をクリックしたら、〇の外へ漏れない。"""
+        t = self._target_with_circle()
+        _flood_fill(t, 95, 85, self.RED, self._ref_lineart(), 0, 10, True)
+        red = self._mask(t, self.RED)
+        assert red[85, 95], "〇の中が塗れていない"
+        assert not red[20, 20], "〇の外まで漏れている"
+        assert red.mean() < 0.30, "塗り面積が広すぎる（漏れている）"
+
+    def test_reference_only_keeps_old_behavior(self):
+        """ref: 従来どおり自分の線は無視する（アニメ塗りの塗り分け用）。"""
+        t = self._target_with_circle()
+        _flood_fill(t, 95, 85, self.RED, self._ref_lineart(), 0, 10, False)
+        red = self._mask(t, self.RED)
+        assert red[20, 20], "参照のみモードの挙動が変わってしまった"
+
+    def test_default_is_reference_only(self):
+        """引数を省略したときは従来の挙動（＝既存の呼び出しを壊さない）。"""
+        a = self._target_with_circle()
+        b = self._target_with_circle()
+        _flood_fill(a, 95, 85, self.RED, self._ref_lineart())
+        _flood_fill(b, 95, 85, self.RED, self._ref_lineart(), 0, 10, False)
+        assert self._mask(a, self.RED).sum() == self._mask(b, self.RED).sum()
+
+    def test_enclosing_line_is_preserved(self):
+        """塗っても囲み線そのものは消えない。"""
+        t = self._target_with_circle()
+        before = self._mask(t, self.CYAN).sum()
+        _flood_fill(t, 95, 85, self.RED, self._ref_lineart(), 0, 10, True)
+        assert self._mask(t, self.CYAN).sum() == before
+
+    def test_seed_on_own_line_does_nothing(self):
+        """囲み線そのものをクリックしても、線は境界なので塗られない。"""
+        t = self._target_with_circle()
+        _flood_fill(t, 95, 45, self.RED, self._ref_lineart(), 0, 10, True)
+        assert self._mask(t, self.RED).sum() == 0
+
+    @pytest.mark.parametrize("gap,expand", [(0, 0), (3, 0), (0, 2), (3, 2)])
+    def test_no_leak_with_gap_and_expand(self, gap, expand):
+        """隙間閉じ・拡張と併用しても、自分の線を越えて漏れない。"""
+        t = self._target_with_circle()
+        _flood_fill_expanded(t, 95, 85, self.RED, self._ref_lineart(),
+                             expand, gap, 10, True)
+        assert not self._mask(t, self.RED)[20, 20], \
+            f"隙間={gap} 拡張={expand} で漏れた"
+
+    def test_canvas_default_mode(self):
+        """Canvas の既定は「参照＋編集」。手描きを囲んで塗る使い方が事故らない。"""
+        ls = LayerStack(50, 50)
+        ls.layers = [Layer("L", 50, 50)]
+        ls.active_path = [0]
+        c = Canvas(ls)
+        assert c.fill_reference_mode == "ref_self"

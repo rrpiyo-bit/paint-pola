@@ -1267,6 +1267,8 @@ class MainWindow(QMainWindow):
             lambda v: setattr(self.canvas, 'fill_close_gap', v))
         self.tool_options.fill_line_sensitivity_changed.connect(
             lambda v: setattr(self.canvas, 'fill_line_sensitivity', v))
+        self.tool_options.fill_reference_mode_changed.connect(
+            lambda v: setattr(self.canvas, 'fill_reference_mode', v))
         self.tool_options.select_mode_changed.connect(
             lambda v: setattr(self.canvas, 'select_mode', v))
         self.tool_options.pivot_changed.connect(
@@ -1321,6 +1323,7 @@ class MainWindow(QMainWindow):
             fill_expand=self.canvas.fill_expand,
             fill_close_gap=self.canvas.fill_close_gap,
             fill_line_sensitivity=self.canvas.fill_line_sensitivity,
+            fill_reference_mode=self.canvas.fill_reference_mode,
             select_mode=self.canvas.select_mode,
             transform_mode=self.canvas.transform_mode,
             blur_size=self.canvas.blur_size,

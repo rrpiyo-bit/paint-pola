@@ -87,6 +87,7 @@ class ToolOptionsPanel(QWidget):
     fill_expand_changed   = pyqtSignal(int)   # バケツ塗り拡張px（負=縮小）
     fill_close_gap_changed = pyqtSignal(int)  # 線画の途切れを塞ぐpx
     fill_line_sensitivity_changed = pyqtSignal(int)  # 薄い線を拾う感度(%)
+    fill_reference_mode_changed = pyqtSignal(str)  # 複数参照 ref / ref_self
     select_mode_changed   = pyqtSignal(str)   # "select" | "transform"
     pivot_changed         = pyqtSignal(int, int)  # (ax, ay) 変形基準点
     pivot_mode_changed    = pyqtSignal(str)        # "preset" | "custom"
@@ -154,6 +155,7 @@ class ToolOptionsPanel(QWidget):
                  brush_key: str = "round", symmetry: bool = False,
                  shape_fill: str = "none", fill_expand: int = 0,
                  fill_close_gap: int = 0, fill_line_sensitivity: int = 0,
+                 fill_reference_mode: str = "ref_self",
                  select_mode: str = "select",
                  transform_mode: str = "standard",
                  blur_size: int = 30, blur_strength: int = 50,
@@ -191,6 +193,7 @@ class ToolOptionsPanel(QWidget):
                               lambda v: self.eraser_size_changed.emit(v))
 
         elif tool == Tool.FILL:
+            self._add_fill_reference_combo(fill_reference_mode)
             self._add_spinbox("拡張/縮小 (px)", fill_expand, -30, 30,
                               lambda v: self.fill_expand_changed.emit(v),
                               tooltip="正: 塗り範囲を広げる  負: 塗り範囲を縮める")
@@ -316,6 +319,25 @@ class ToolOptionsPanel(QWidget):
         cb.currentIndexChanged.connect(
             lambda i: self.shape_fill_changed.emit(cb.itemData(i)))
         self._add_row("図形塗り", cb)
+
+    def _add_fill_reference_combo(self, current: str):
+        """クリスタの「複数参照」に相当。どのレイヤーを見て塗りを止めるか。"""
+        cb = QComboBox()
+        cb.addItem("参照レイヤー＋編集レイヤー", "ref_self")
+        cb.addItem("参照レイヤーのみ", "ref")
+        idx = {"ref_self": 0, "ref": 1}.get(current, 0)
+        cb.setCurrentIndex(idx)
+        cb.setToolTip(
+            "塗りを止める境界をどのレイヤーから探すか。\n\n"
+            "参照レイヤー＋編集レイヤー:\n"
+            "  今のレイヤーに描いた囲み線でも塗りが止まります。\n"
+            "  自分で丸く囲ってその中だけ塗るとき用。\n\n"
+            "参照レイヤーのみ:\n"
+            "  線画レイヤーだけを境界にします。すでに塗った色は\n"
+            "  無視するので、隣り合う色を塗り分けるとき塗り漏れが出ません。")
+        cb.currentIndexChanged.connect(
+            lambda i: self.fill_reference_mode_changed.emit(cb.itemData(i)))
+        self._add_row("複数参照", cb)
 
     def _add_toggle(self, label: str, value: bool, callback):
         from PyQt6.QtWidgets import QCheckBox
