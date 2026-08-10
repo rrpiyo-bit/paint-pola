@@ -1449,8 +1449,10 @@ class MainWindow(QMainWindow):
         self._add_action(image_menu, "レイヤーをラスタライズ", self._rasterize_layer)
         image_menu.addSeparator()
         self._add_action(image_menu, "線画抽出...", self._extract_line)
+        # 方眼は「表示」メニューにも同じものが出ていたが、これは実際に
+        # キャンバスへ描き込む操作（表示だけの「グリッド表示切替」とは別物）
+        # なので、画像メニュー側に一本化した。
         self._add_action(image_menu, "方眼をキャンバスに表示...", self._grid_settings)
-        self._add_action(image_menu, "レイヤーを変形（拡大縮小・回転）...", self._transform_layer_dialog)
 
         filter_menu = mb.addMenu("フィルター")
         self._add_action(filter_menu, "ぼかし (ガウス)...", self._filter_blur)
@@ -1473,7 +1475,6 @@ class MainWindow(QMainWindow):
         self._add_action(view_menu, "左右反転表示", self.canvas.toggle_flip_h, "Ctrl+Shift+H")
         view_menu.addSeparator()
         self._add_action(view_menu, "グリッド表示切替", self.canvas.toggle_grid, "Ctrl+G")
-        self._add_action(view_menu, "方眼をキャンバスに表示...", self._grid_settings)
 
         mode_menu = mb.addMenu("モード")
         self._anim_mode_action = QAction("アニメーションモード", self)
@@ -1487,6 +1488,9 @@ class MainWindow(QMainWindow):
         self._add_action(transform_menu, "変形をキャンセル", self.canvas.cancel_transform)
         transform_menu.addSeparator()
         self._add_action(transform_menu, "拡大縮小・回転（%指定）...", self._open_transform_percent_dialog)
+        # 「画像」メニューの線画抽出・方眼と並んでいたが、内容は変形なので
+        # 同種の「拡大縮小・回転（%指定）」の隣に移した。
+        self._add_action(transform_menu, "レイヤーを変形（拡大縮小・回転）...", self._transform_layer_dialog)
 
         design_menu = mb.addMenu("デザイン")
         self._theme_actions: dict[str, QAction] = {}

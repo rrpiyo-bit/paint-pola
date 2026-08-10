@@ -28,20 +28,47 @@ _HISTORY_MAX = 10  # ツールバーに表示するカラーヒストリーの�
 
 _TOOL_ICONS: dict[Tool, str] = {
     Tool.PEN: "✏️",
-    Tool.ERASER: "◻",
-    Tool.FILL: "\U0001f4a7",
-    Tool.EYEDROPPER: "\U0001f4a7",
+    # 以前は白い四角で、図形ツールの「四角形」と見分けがつかなかった。
+    Tool.ERASER: "\U0001f9fd",
+    # 塗りつぶし・スポイト・ぼかしは以前どれも同じ雫アイコンで
+    # 見分けがつかなかったので、それぞれ別の絵文字にしてある。
+    Tool.FILL: "\U0001faa3",
+    Tool.EYEDROPPER: "\U0001f489",
     Tool.LINE: "╱",
     Tool.RECT: "□",
     Tool.ELLIPSE: "○",
     Tool.TEXT: "T",
     Tool.BLUR: "💧",
     Tool.SELECT_RECT: "⬚",
-    Tool.LASSO: "〇",
+    # 以前は白丸で、図形ツールの「楕円」と紛らわしかった。
+    Tool.LASSO: "➿",
     Tool.LASSO_FILL: "\U0001f7e2",
     Tool.MOVE: "✥",
     Tool.TRANSFORM: "⤢",
 }
+
+# ツールバーの表示順。Tool の宣言順そのままだと「スポイト」が消しゴムと
+# 直線の間、「ぼかし」が投げなわとテキストの離れた位置に来て、用途の
+# 近いものが散らばっていた。用途ごとにまとめ、グループ間に区切り線を入れる。
+# None が区切り線。ショートカットキーは変えていないので手は覚え直さなくてよい。
+_TOOL_ORDER: list[Tool | None] = [
+    # 描画
+    Tool.PEN, Tool.ERASER, Tool.FILL, Tool.BLUR,
+    None,
+    # 図形・文字
+    Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.TEXT,
+    None,
+    # 選択
+    Tool.SELECT_RECT, Tool.LASSO, Tool.LASSO_FILL,
+    None,
+    # 補助・変形
+    Tool.EYEDROPPER, Tool.MOVE, Tool.TRANSFORM,
+]
+
+# ツールを追加したとき _TOOL_ORDER への追記を忘れると、ボタンが
+# 黙って消えて気づけない。起動時に取りこぼしを検出する。
+assert set(t for t in _TOOL_ORDER if t is not None) == set(Tool), \
+    "_TOOL_ORDER に載っていないツールがあります"
 
 _TOOL_LABELS: dict[Tool, str] = {
     Tool.PEN: "ペン",
@@ -236,7 +263,10 @@ class Toolbar(QWidget):
         layout.setSpacing(4)
 
         self._buttons: dict[Tool, QPushButton] = {}
-        for tool in Tool:
+        for tool in _TOOL_ORDER:
+            if tool is None:
+                layout.addWidget(self._separator())
+                continue
             icon = _TOOL_ICONS.get(tool, "")
             key = TOOL_SHORTCUTS.get(tool, "")
             label = _TOOL_LABELS[tool]

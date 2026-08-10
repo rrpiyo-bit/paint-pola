@@ -498,6 +498,20 @@ class TestHistoryMemoryLimit:
             canvas._save_history()
         assert len(canvas._history) == canvas_mod.HISTORY_LIMIT
 
+    def test_big_canvas_undo_depth_is_practical(self):
+        """大きなキャンバスでも実用的な回数を戻せること。
+
+        実際に戻せる回数は件数上限ではなくメモリ上限で決まる。
+        ここが小さいと「戻れる数が少ない」という形で表に出るので、
+        2500x2500 で最低 30 回は戻せることを固定する。
+        """
+        import canvas as canvas_mod
+        c = self._big_canvas()
+        for _ in range(canvas_mod.HISTORY_LIMIT + 20):
+            c._save_history()
+        assert len(c._history) >= 30, \
+            f"2500x2500 で {len(c._history)} 回しか戻せない"
+
     def test_undo_redo_still_works_after_trim(self):
         c = self._big_canvas()
         layer = c.layer_stack.active

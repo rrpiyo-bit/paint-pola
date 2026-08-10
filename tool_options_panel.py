@@ -226,9 +226,16 @@ class ToolOptionsPanel(QWidget):
             if tool in (Tool.RECT, Tool.ELLIPSE):
                 self._add_fill_combo(shape_fill)
 
+        elif tool == Tool.LASSO_FILL:
+            self._add_label("囲んだ範囲の中で、線で閉じている\n"
+                            "ところだけを塗ります。\n"
+                            "マウスを離すと自動で実行されます。")
+
         elif tool in (Tool.SELECT_RECT, Tool.LASSO):
             self._add_select_mode_combo(select_mode)
             self._add_invert_selection_button()
+            # 以下は「変形モード」のときだけ効く設定なので、区切って下にまとめる。
+            self._add_separator()
             self._add_transform_mode_combo(transform_mode, mesh_div)
             self._add_pivot_selector()
 
@@ -430,6 +437,14 @@ class ToolOptionsPanel(QWidget):
             self.pivot_mode_changed.emit(mode)
 
         mode_cb.currentIndexChanged.connect(on_mode_change)
+
+    def _add_separator(self):
+        """設定のまとまりを視覚的に区切る横線。"""
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        line.setStyleSheet("color:#ccc;")
+        self._content_layout.insertWidget(self._content_layout.count() - 1, line)
 
     def _add_label(self, text: str):
         lbl = QLabel(text)

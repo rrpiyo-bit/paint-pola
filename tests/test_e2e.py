@@ -3180,3 +3180,97 @@ class TestInvertSelectionUI:
         win.canvas.deselect()
         self._button(win).click()
         assert win.canvas._selection_rect is None
+
+
+class TestToolbarLayout:
+    """ツールバーの並び順とアイコン。"""
+
+    def test_all_tools_have_a_button(self, win):
+        """全ツールがボタンとして出ている。
+
+        並び順を _TOOL_ORDER で明示しているので、ツールを追加して
+        追記を忘れるとボタンが黙って消えるため。
+        """
+        from toolbar import _TOOL_ORDER
+        assert set(win.toolbar._buttons) == set(Tool)
+        assert set(t for t in _TOOL_ORDER if t is not None) == set(Tool)
+
+    def test_icons_are_unique(self):
+        """アイコンが重複していない（以前は3ツールが同じ雫だった）。"""
+        from toolbar import _TOOL_ICONS
+        icons = list(_TOOL_ICONS.values())
+        assert len(icons) == len(set(icons))
+
+    def test_related_tools_are_adjacent(self):
+        """用途の近いツールが同じグループに入っている。"""
+        from toolbar import _TOOL_ORDER
+        groups, cur = [], []
+        for t in _TOOL_ORDER:
+            if t is None:
+                groups.append(cur); cur = []
+            else:
+                cur.append(t)
+        groups.append(cur)
+        assert [Tool.SELECT_RECT, Tool.LASSO, Tool.LASSO_FILL] in groups
+        draw = next(g for g in groups if Tool.PEN in g)
+        assert Tool.ERASER in draw and Tool.FILL in draw
+        shapes = next(g for g in groups if Tool.RECT in g)
+        assert Tool.ELLIPSE in shapes and Tool.LINE in shapes
+
+    def test_every_tool_shows_some_options(self, win):
+        """どのツールを選んでもオプション欄が空白にならない。
+
+        設定がないツールは使い方の説明を出す。
+        """
+        for tool in Tool:
+            win._on_tool_change(tool)
+            # タイトル行＋伸縮スペーサー以外に何かあること
+            assert win.tool_options._content_layout.count() > 1, tool.name
+
+
+class TestMenuLayout:
+    """メニューの並び・重複。"""
+
+    def _items(self, win):
+        """(項目名, 属するメニュー名) の一覧。"""
+        out = []
+        for top in win.menuBar().actions():
+            menu = top.menu()
+            if not menu:
+                continue
+            for a in menu.actions():
+                if a.isSeparator() or a.menu():
+                    continue
+                out.append((a.text(), top.text()))
+        return out
+
+    def test_no_duplicate_menu_items(self, win):
+        """同じ項目が複数のメニューに出てこない。
+
+        「方眼をキャンバスに表示」が「画像」と「表示」の
+        両方に出ていて、どちらが本体か分からなかった。
+        """
+        from collections import Counter
+        names = [n for n, _ in self._items(win)]
+        dupes = {n: c for n, c in Counter(names).items() if c > 1}
+        assert not dupes, f"重複しているメニュー項目: {dupes}"
+
+    def test_transform_items_are_in_transform_menu(self, win):
+        """変形系の項目は「変形」メニューにまとめる。"""
+        items = dict(self._items(win))
+        assert items["レイヤーを変形（拡大縮小・回転）..."] == "変形"
+
+    def test_shortcuts_are_unique(self, win):
+        """ショートカットキーが衝突していない。"""
+        from collections import Counter
+        keys = []
+        for top in win.menuBar().actions():
+            menu = top.menu()
+            if not menu:
+                continue
+            for a in menu.actions():
+                k = a.shortcut().toString()
+                if k:
+                    keys.append(k)
+        dupes = {k: c for k, c in Counter(keys).items() if c > 1}
+        assert not dupes, f"衝突しているショートカット: {dupes}"
