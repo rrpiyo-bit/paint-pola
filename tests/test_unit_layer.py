@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QImage, QColor
+from PyQt6.QtGui import QImage, QColor, QPainter
 from PyQt6.QtCore import Qt
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -462,3 +462,117 @@ class TestLayerStack:
         grp = ls.add_group("G")
         assert grp.is_group
         assert len(ls.layers) == 1
+
+
+class TestEffectCache:
+    """効果適用済み画像のキャッシュ。
+
+    再描画のたびに縁取りやぼかしを計算し直すと、
+    レイヤーが増えるほど描画が重くなる。
+    """
+
+    def _layer(self):
+        l = Layer("t", 120, 120)
+        p = QPainter(l.image)
+        p.fillRect(20, 20, 60, 60, QColor(220, 40, 40))
+        p.end()
+        l.border_enabled = True
+        l.border_size = 3
+        return l
+
+    def _count_recompute(self, monkeypatch):
+        calls = []
+        orig = Layer._compute_effects
+        def spy(self):
+            calls.append(1)
+            return orig(self)
+        monkeypatch.setattr(Layer, "_compute_effects", spy)
+        return calls
+
+    def test_second_call_uses_cache(self, monkeypatch):
+        l = self._layer()
+        l.image_with_effects()
+        calls = self._count_recompute(monkeypatch)
+        l.image_with_effects()
+        l.image_with_effects()
+        assert not calls, "キャッシュが効いていない"
+
+    def test_reading_image_does_not_break_cache(self, monkeypatch):
+        """効果の適用自体がキャッシュを失効させないこと。
+
+        QImage.bits() は書き込み用でデタッチが走り cacheKey が
+        変わる。効果の中でこれを使うと、毎回キャッシュが
+        外れて黙って遅くなる（テストでは落ちない）ので固める。
+        """
+        l = self._layer()
+        l.shadow_enabled = True
+        l.glow_enabled = True
+        l.blur_enabled = True
+        l.hsl_enabled = True
+        l.hsl_hue = 20
+        before = l.image.cacheKey()
+        l.image_with_effects()
+        assert l.image.cacheKey() == before,             "効果の適用で元画像の cacheKey が変わっている"
+        calls = self._count_recompute(monkeypatch)
+        l.image_with_effects()
+        assert not calls, "効果ONのときにキャッシュが毎回外れている"
+
+    # (先に有効化しておく効果, 変更する項目, 変更後の値)
+    # 各パラメータは対応する *_enabled が True のときだけ効くので、
+    # 先に有効化してから変えないと見た目は変わらない。
+    @pytest.mark.parametrize("enable,attr,value", [
+        (None, "border_size", 9),
+        (None, "border_color", QColor(0, 255, 0)),
+        (None, "shadow_enabled", True),
+        (None, "glow_enabled", True),
+        (None, "blur_enabled", True),
+        # hsl_enabled 単体は色相/彩度/明度が全部0だと何も変えないので、
+        # 値を入れた状態で有効化する形で確認する。
+        ("hsl_hue_set", "hsl_enabled", True),
+        ("hsl_enabled", "hsl_hue", 90),
+        ("hsl_enabled", "hsl_saturation", 60),
+        ("hsl_enabled", "hsl_lightness", 40),
+        ("shadow_enabled", "shadow_offset_x", 15),
+        ("shadow_enabled", "shadow_offset_y", 15),
+        ("shadow_enabled", "shadow_blur", 12),
+        ("shadow_enabled", "shadow_color", QColor(0, 0, 255)),
+        ("shadow_enabled", "shadow_strength", 40),
+        ("glow_enabled", "glow_size", 20),
+        ("glow_enabled", "glow_color", QColor(255, 0, 0)),
+        ("glow_enabled", "glow_strength", 30),
+        ("blur_enabled", "blur_radius", 8),
+        ("blur_enabled", "blur_strength", 50),
+    ])
+    def test_param_change_recomputes(self, enable, attr, value):
+        """設定を変えたら必ず見た目が追従すること。
+
+        キーに入れ忘れた項目は「変えても画面に反映されない」
+        という不具合になるので、全項目を網羅する。
+        """
+        l = self._layer()
+        if enable == "hsl_hue_set":
+            l.hsl_hue = 120
+        elif enable:
+            setattr(l, enable, True)
+        first = l.image_with_effects().copy()
+        setattr(l, attr, value)
+        assert l.image_with_effects().copy() != first, \
+            f"{attr} を変えても結果が変わらない"
+
+    def test_drawing_recomputes(self):
+        l = self._layer()
+        first = l.image_with_effects().copy()
+        p = QPainter(l.image)
+        p.fillRect(0, 0, 15, 15, QColor(0, 0, 255))
+        p.end()
+        assert l.image_with_effects().copy() != first,             "画像を描き換えても結果が変わらない"
+
+    def test_no_effects_returns_live_image(self):
+        """効果なしのときは別名参照をキャッシュしないこと。"""
+        l = Layer("t", 60, 60)
+        assert l.image_with_effects() is l.image
+        assert l._effect_cache is None
+        p = QPainter(l.image)
+        p.fillRect(0, 0, 20, 20, QColor(255, 0, 0))
+        p.end()
+        assert l.image_with_effects() is l.image

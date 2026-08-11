@@ -61,6 +61,33 @@ class Layer:
         self.hsl_hue: int = 0        # -180 ~ +180
         self.hsl_saturation: int = 0  # -100 ~ +100
         self.hsl_lightness: int = 0   # -100 ~ +100
+        # 効果適用済み画像のキャッシュ（_effect_key, QImage）
+        self._effect_cache: tuple[tuple, QImage] | None = None
+
+    def _effect_key(self) -> tuple:
+        """効果の見た目を決める値をすべて集めたキー。
+
+        画像自体の変更は QImage.cacheKey() で拾う。これは QPainter 経由でも
+        numpy で bits() を直接書き換えても変わるので、描画方法によらず
+        取りこぼさない（レイヤーの全変更箇所を追いかけるより確実）。
+        キーに入れ忘れた項目は「変えても画面に反映されない」不具合になるため、
+        効果パラメータを追加したときはここにも必ず足すこと。
+        """
+        return (
+            self.image.cacheKey(),
+            self.border_enabled, self.border_size, self.border_color.rgba(),
+            self.shadow_enabled, self.shadow_color.rgba(), self.shadow_offset_x,
+            self.shadow_offset_y, self.shadow_blur, self.shadow_strength,
+            self.glow_enabled, self.glow_color.rgba(), self.glow_size,
+            self.glow_strength,
+            self.blur_enabled, self.blur_radius, self.blur_strength,
+            self.hsl_enabled, self.hsl_hue, self.hsl_saturation,
+            self.hsl_lightness,
+        )
+
+    def invalidate_effect_cache(self) -> None:
+        """効果キャッシュを明示的に捨てる。"""
+        self._effect_cache = None
 
     def clear(self):
         self.image.fill(Qt.GlobalColor.transparent)
@@ -70,7 +97,10 @@ class Layer:
             return self.image
         img = self.image
         w, h = img.width(), img.height()
-        ptr = img.bits()
+        # 読むだけなので constBits を使う。bits() は書き込み用でデタッチが
+        # 走り、QImage.cacheKey() が変わってしまう。cacheKey は効果キャッシュ
+        # の判定に使っているので、ここで変わると毎回キャッシュが外れる。
+        ptr = img.constBits()
         ptr.setsize(h * w * 4)
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
         alpha = arr[:, :, 3]
@@ -101,7 +131,24 @@ class Layer:
         return out.convertToFormat(QImage.Format.Format_ARGB32)
 
     def image_with_effects(self) -> QImage:
-        """全レイヤー効果を適用した画像を返す。"""
+        """全レイヤー効果を適用した画像を返す。
+
+        結果はキャッシュする。再描画のたびに縁取りやぼかしを計算し直すと、
+        レイヤーが増えるほど描画が重くなる（30枚・縁取りONで1回4秒超）。
+        """
+        key = self._effect_key()
+        if self._effect_cache is not None and self._effect_cache[0] == key:
+            return self._effect_cache[1]
+        img = self._compute_effects()
+        # 効果が何も有効でないときは self.image がそのまま返る。これを
+        # キャッシュに持つと、レイヤー画像への描き込みで中身が変わり続ける
+        # 別名参照になるので持たない（元々この経路は計算コストも無い）。
+        if img is not self.image:
+            self._effect_cache = (key, img)
+        return img
+
+    def _compute_effects(self) -> QImage:
+        """効果を実際に適用する（キャッシュ無しの本体）。"""
         img = self.image_with_border()
         w, h = img.width(), img.height()
 
@@ -124,8 +171,13 @@ class Layer:
         return img
 
     def _qimage_to_array(self, img: QImage) -> np.ndarray:
+        """QImage を numpy 配列にコピーして返す（読み取り専用）。
+
+        すぐ copy() するので constBits で十分。bits() だとデタッチで
+        cacheKey が変わり、効果キャッシュが毎回外れる。
+        """
         w, h = img.width(), img.height()
-        ptr = img.bits()
+        ptr = img.constBits()
         ptr.setsize(h * w * 4)
         return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
 
