@@ -274,6 +274,47 @@ class TestLayerStack:
         # a の青も残っているはず
         assert px(merged.image, 55, 55).blue() > 200
 
+    def test_merge_down_clipping_is_masked(self):
+        """クリッピング中のレイヤーを下に統合すると、下の不透明部分だけに残る。
+
+        これが効かないと、下の一部だけ色を変えていたべた塗りが統合で
+        全面に広がってしまう（クリスタ・Photoshop と同じ挙動に合わせる）。
+        """
+        from PyQt6.QtGui import QPainter
+        ls = LayerStack(W, H)
+        base = ls.add("base")
+        top = ls.add("top")   # index0（上）
+        top.clipping = True
+        p = QPainter(base.image)
+        p.fillRect(0, 0, 20, 20, QColor(0, 0, 255, 255))  # 下の絵はここだけ
+        p.end()
+        p = QPainter(top.image)
+        p.fillRect(0, 0, 80, 80, QColor(255, 0, 0, 255))  # べた塗りは広い
+        p.end()
+        ls.set_active(0)
+        assert ls.merge_down() is True
+        merged = ls.layers[0]
+        # 下の絵がある範囲は赤で上書きされる
+        assert px(merged.image, 5, 5).red() > 200
+        # 下の絵がない範囲へは、はみ出さない
+        assert px(merged.image, 50, 50).alpha() == 0
+
+    def test_merge_down_without_clipping_keeps_full_paint(self):
+        """クリッピングOFFなら従来どおり全面が残る（回帰防止）。"""
+        from PyQt6.QtGui import QPainter
+        ls = LayerStack(W, H)
+        base = ls.add("base")
+        top = ls.add("top")
+        p = QPainter(base.image)
+        p.fillRect(0, 0, 20, 20, QColor(0, 0, 255, 255))
+        p.end()
+        p = QPainter(top.image)
+        p.fillRect(0, 0, 80, 80, QColor(255, 0, 0, 255))
+        p.end()
+        ls.set_active(0)
+        assert ls.merge_down() is True
+        assert px(ls.layers[0].image, 50, 50).red() > 200
+
     def test_merge_down_fails_at_bottom(self):
         ls = LayerStack(W, H)
         ls.add("A")

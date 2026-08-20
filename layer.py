@@ -562,11 +562,29 @@ class LayerStack:
         p = QPainter(merged)
         p.setOpacity(lower.opacity / 255)
         p.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
+        upper_img = upper.image_with_effects()
+        u_dx, u_dy = u_ox - min_x, u_oy - min_y
+        if upper.clipping:
+            # 上がクリッピング（マスク）中なら、下レイヤーの不透明部分だけに
+            # 焼き込む。そうしないと、下の一部だけ色を変えていたべた塗りが
+            # 統合で全面に広がってしまう。クリスタ・Photoshop 等と同じ挙動。
+            # ここでの「下」は統合先そのものなので、下の α でマスクする。
+            # 合成モードと併用できるよう、描画時ではなく先に上の画像を
+            # 切り抜いておく（QPainter は合成モードを1つしか持てないため）。
+            masked = QImage(mw, mh, QImage.Format.Format_ARGB32_Premultiplied)
+            masked.fill(Qt.GlobalColor.transparent)
+            mp = QPainter(masked)
+            mp.drawImage(u_dx, u_dy, upper_img)
+            mp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            mp.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
+            mp.end()
+            upper_img = masked
+            u_dx = u_dy = 0
         p.setOpacity(upper.opacity / 255)
         blend = BLEND_KEY_TO_MODE.get(getattr(upper, 'blend_mode', 'normal'))
         if blend:
             p.setCompositionMode(blend)
-        p.drawImage(u_ox - min_x, u_oy - min_y, upper.image_with_effects())
+        p.drawImage(u_dx, u_dy, upper_img)
         p.end()
         lower.image = merged.convertToFormat(QImage.Format.Format_ARGB32)
         lower.opacity = 255
