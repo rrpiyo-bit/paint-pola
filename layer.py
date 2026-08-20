@@ -297,14 +297,20 @@ class GroupLayer:
                 p.end()
                 child.image = new_img.convertToFormat(QImage.Format.Format_ARGB32)  # type: ignore
 
-    def composite(self) -> QImage:
+    def composite(self, skip: object = None) -> QImage:
+        """グループ内を合成する。
+
+        skip に渡したレイヤーは除外する。バケツ塗りの参照画像を作るとき、
+        塗る対象のレイヤーがこのグループの中にあると、自分の塗った色まで
+        境界になってしまうため。
+        """
         result = QImage(self._w, self._h, QImage.Format.Format_ARGB32)
         result.fill(Qt.GlobalColor.transparent)
         p = QPainter(result)
         children = self.children
         for i in range(len(children) - 1, -1, -1):
             child = children[i]
-            if not child.visible:
+            if not child.visible or child is skip:
                 continue
             clipping = child.clipping and i < len(children) - 1
             if clipping:
@@ -313,14 +319,14 @@ class GroupLayer:
                 # （LayerStack.composite と同じロジック）。
                 below = children[i + 1]
                 if child.is_group:
-                    src_img = child.composite()
+                    src_img = child.composite(skip)
                     ox = oy = 0
                 else:
                     src_img = child.image_with_effects()  # type: ignore
                     ox = getattr(child, 'offset_x', 0)
                     oy = getattr(child, 'offset_y', 0)
                 if below.is_group:
-                    below_img = below.composite()
+                    below_img = below.composite(skip)
                     box = boy = 0
                 else:
                     below_img = below.image_with_effects()  # type: ignore
@@ -338,7 +344,7 @@ class GroupLayer:
                 p.drawImage(0, 0, mask_img)
             elif child.is_group:
                 p.setOpacity(child.opacity / 255)
-                p.drawImage(0, 0, child.composite())
+                p.drawImage(0, 0, child.composite(skip))
             else:
                 ox = getattr(child, 'offset_x', 0)
                 oy = getattr(child, 'offset_y', 0)
@@ -463,9 +469,18 @@ class LayerStack:
 
     @property
     def references(self) -> list:
+        return self.references_excluding(None)
+
+    def references_excluding(self, skip: object) -> list:
         """参照フラグが立っている表示中のレイヤー（通常・グループ）を全て返す。
         グループは composite() で合成した画像を持つ疑似オブジェクトとして扱う。
-        戻り値は .image を持つオブジェクトのリスト。"""
+        戻り値は .image を持つオブジェクトのリスト。
+
+        skip に渡したレイヤーは、グループの合成結果からも取り除く。
+        バケツ塗りで「塗る対象のレイヤー」を渡すために使う。参照にした
+        グループの中に塗る対象が入っていると、自分の塗った色まで境界に
+        なってしまい、「参照レイヤーのみ」を選んでも塗り漏れが出るため。
+        """
         class _RefProxy:
             def __init__(self, img, opacity, offset_x=0, offset_y=0):
                 self.image = img
@@ -476,12 +491,12 @@ class LayerStack:
         result = []
         def _collect(items: list[Layer | GroupLayer]):
             for layer in items:
-                if not layer.visible:
+                if not layer.visible or layer is skip:
                     continue
                 if layer.reference:
                     if layer.is_group:
                         # composite() はキャンバス全体サイズでオフセット 0,0 の画像を返す
-                        result.append(_RefProxy(layer.composite(), layer.opacity, 0, 0))  # type: ignore
+                        result.append(_RefProxy(layer.composite(skip), layer.opacity, 0, 0))  # type: ignore
                     else:
                         result.append(layer)
                 elif layer.is_group:

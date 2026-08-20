@@ -2,9 +2,10 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import numpy as np
 import pytest
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QImage, QColor, QMouseEvent, QPainter, QKeyEvent
+from PyQt6.QtGui import QImage, QColor, QMouseEvent, QPainter, QKeyEvent, QPen
 from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -592,3 +593,112 @@ class TestLassoFillShapes:
         from layer import GroupLayer
         g = GroupLayer("g", W, H)
         canvas._apply_lasso_fill(g, self._ring(50, 50, 30))
+
+
+class TestFillReference:
+    """バケツ塗りの参照レイヤー。
+
+    参照画像は「塗る対象のレイヤーの座標系・サイズ」で
+    返され、対象レイヤー自身は含まないことが条件。
+    """
+
+    def _stack(self):
+        """グループG[線画, レイヤー2] + グループ外に1枚。
+
+        線画には x=50 に縦線を引いてある。
+        """
+        ls = LayerStack(100, 100)
+        g = ls.add_group("G")
+        line = ls.add("線画")
+        other = ls.add("レイヤー2")
+        for l in (line, other):
+            ls.layers.remove(l)
+            g.children.append(l)
+        outside = ls.add("外")
+        p = QPainter(line.image)
+        p.setPen(QPen(QColor(0, 0, 0), 3))
+        p.drawLine(50, 0, 50, 100)
+        p.end()
+        return ls, g, line, other, outside
+
+    def _alpha(self, img):
+        w, h = img.width(), img.height()
+        ptr = img.constBits()
+        ptr.setsize(w * h * 4)
+        return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)[:, :, 3]
+
+    def test_layer_in_group_is_referenced(self):
+        """フォルダ内の1枚を参照にして、同じフォルダの別のレイヤーで塗る。"""
+        ls, g, line, other, outside = self._stack()
+        line.reference = True
+        c = Canvas(ls)
+        c.resize(100, 100)
+        ref = c._build_fill_reference(other)
+        assert ref is not None
+        assert int((self._alpha(ref) > 0).sum()) == 300
+
+    def test_group_reference_excludes_target_layer(self):
+        """グループを参照にしたとき、中にある塗る対象を含めないこと。
+
+        含めてしまうと自分の塗った色が境界になり、
+        「参照レイヤーのみ」を選んでも塗り漏れが出る。
+        """
+        ls, g, line, other, outside = self._stack()
+        p = QPainter(other.image)
+        p.fillRect(0, 0, 40, 40, QColor(0, 0, 255))
+        p.end()
+        g.reference = True
+        c = Canvas(ls)
+        c.resize(100, 100)
+        ref = c._build_fill_reference(other)
+        assert ref is not None
+        a = self._alpha(ref)
+        assert a[10, 10] == 0, "塗る対象自身が参照に混入している"
+        assert int((a > 0).sum()) == 300
+
+    def test_group_reference_from_outside(self):
+        """フォルダごと参照にして、フォルダ外のレイヤーで塗る。"""
+        ls, g, line, other, outside = self._stack()
+        g.reference = True
+        c = Canvas(ls)
+        c.resize(100, 100)
+        ref = c._build_fill_reference(outside)
+        assert ref is not None
+        assert int((self._alpha(ref) > 0).sum()) == 300
+
+    @pytest.mark.parametrize("ox,oy", [(0, 0), (20, 0), (-20, 0), (0, -30), (0, 25)])
+    def test_reference_follows_layer_offset(self, ox, oy):
+        """対象レイヤーがずれていても参照の線が正しい位置に残ること。
+
+        以前は QImage.copy() で切り出していたため、offset がマイナスの
+        ときに範囲外が透明で埋まり、線が消えて「参照が効かない」
+        状態になっていた。
+        """
+        ls, g, line, other, outside = self._stack()
+        line.reference = True
+        other.offset_x, other.offset_y = ox, oy
+        c = Canvas(ls)
+        c.resize(100, 100)
+        ref = c._build_fill_reference(other)
+        assert ref is not None
+        assert ref.width() == other.image.width()
+        assert ref.height() == other.image.height()
+        a = self._alpha(ref)
+        cols = np.nonzero((a > 0).any(axis=0))[0]
+        assert len(cols) > 0, "参照の線が丸ごと消えている"
+        # 線はローカル座標で x = 50 - offset_x に来る
+        assert abs(int(cols.min()) - (50 - ox)) <= 2
+
+    def test_reference_none_when_no_reference_layer(self):
+        ls, g, line, other, outside = self._stack()
+        c = Canvas(ls)
+        c.resize(100, 100)
+        assert c._build_fill_reference(other) is None
+
+    def test_target_itself_as_reference_is_ignored(self):
+        """塗る対象自身だけが参照なら、参照なしと同じになること。"""
+        ls, g, line, other, outside = self._stack()
+        other.reference = True
+        c = Canvas(ls)
+        c.resize(100, 100)
+        assert c._build_fill_reference(other) is None

@@ -1682,14 +1682,9 @@ class Canvas(QWidget):
 
         elif self.tool == Tool.FILL:
             self._save_history()
+            # 参照画像は _build_fill_reference が対象レイヤーの座標系に
+            # 合わせて返す（offset のずれもここで吸収される）。
             ref_img = self._build_fill_reference(layer)
-            if ref_img is not None:
-                lw, lh = layer.image.width(), layer.image.height()  # type: ignore
-                if ref_img.width() != lw or ref_img.height() != lh or lox or loy:
-                    # 参照画像はキャンバス座標系の合成画像なので、対象レイヤーの
-                    # ローカル座標系（offset_x/offset_y 分ずれている）に合わせて切り出す
-                    # （_apply_lasso_fill と同じ考え方）。
-                    ref_img = ref_img.copy(lox, loy, lw, lh)
             thr = _sensitivity_to_threshold(self.fill_line_sensitivity)
             _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img,  # type: ignore
                                  self.fill_expand, self.fill_close_gap, thr,
@@ -2058,7 +2053,8 @@ class Canvas(QWidget):
         通常レイヤーはローカル画像に offset_x/offset_y が付いているため、
         グループの composite() 結果（既にキャンバスサイズ・offset 0,0）と
         混在しても正しく重なるよう、必ず offset 付きで描画してから返す。"""
-        refs = [r for r in self.layer_stack.references if r is not layer]
+        refs = [r for r in self.layer_stack.references_excluding(layer)
+                if r is not layer]
         if len(refs) == 0:
             return None
         w, h = self.layer_stack.width, self.layer_stack.height
@@ -2069,7 +2065,24 @@ class Canvas(QWidget):
             rp.setOpacity(r.opacity / 255)
             rp.drawImage(getattr(r, 'offset_x', 0), getattr(r, 'offset_y', 0), r.image)
         rp.end()
-        return ref_img.convertToFormat(QImage.Format.Format_ARGB32)
+        ref_img = ref_img.convertToFormat(QImage.Format.Format_ARGB32)
+
+        # 対象レイヤーのローカル座標系に合わせる。
+        # QImage.copy() は範囲外を透明で埋めるので、レイヤーが移動や貼り付けで
+        # ずれている（offset がマイナス、またはキャンバス幅を超える）場合、
+        # 参照の線が消えた透明画像になり「参照レイヤーが効かない」状態になる。
+        # 切り出しではなく、正しい位置に描き直すことで範囲外でも欠けない。
+        lw, lh = layer.image.width(), layer.image.height()
+        lox = getattr(layer, 'offset_x', 0)
+        loy = getattr(layer, 'offset_y', 0)
+        if lw != w or lh != h or lox or loy:
+            local = QImage(lw, lh, QImage.Format.Format_ARGB32)
+            local.fill(Qt.GlobalColor.transparent)
+            lp = QPainter(local)
+            lp.drawImage(-lox, -loy, ref_img)
+            lp.end()
+            ref_img = local
+        return ref_img
 
     def _apply_lasso_fill(self, layer, lasso_points: list[QPoint]) -> None:
         """投げなわで囲んだ範囲内にある、線で閉じた領域だけを自動で塗りつぶす。"""
@@ -2092,11 +2105,9 @@ class Canvas(QWidget):
             return
 
         self._save_history()
+        # 参照画像は _build_fill_reference が対象レイヤーの座標系・サイズに
+        # 合わせて返すので、ここでの切り出しは不要。
         ref_img = self._build_fill_reference(layer)
-        if ref_img is not None and (ref_img.width() != lw or ref_img.height() != lh):
-            # 参照レイヤーはキャンバス座標系の合成画像なので、対象レイヤーのローカル
-            # 座標系に合わせて切り出す（サイズ不一致のままだと numpy 演算が失敗する）。
-            ref_img = ref_img.copy(lox, loy, lw, lh)
         filled = _fill_closed_regions_in_area(layer.image, area_mask, self.pen_color, ref_img)  # type: ignore
         if filled == 0 and self._history and self._history[-1][0] == "pixel":
             # 何も塗られなかった場合は空の undo エントリを積まない
