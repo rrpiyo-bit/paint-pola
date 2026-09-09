@@ -216,6 +216,67 @@ class TestSaveLoad:
         finally:
             os.unlink(path)
 
+
+    def test_offcanvas_content_survives_save(self, win, tmp_path):
+        """キャンバス外の絵も保存されるか。"""
+        from PyQt6.QtGui import QImage
+        ls = win.layer_stack
+        ls.width = ls.height = 200
+        win.canvas._update_size()
+        layer = ls.layers[0]
+        img = QImage(400, 400, QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.fillRect(0, 0, 60, 60, QColor(255, 0, 0))       # キャンバス外
+        p.fillRect(200, 200, 60, 60, QColor(0, 0, 255))   # キャンバス内
+        p.end()
+        layer.image = img
+        layer.offset_x = layer.offset_y = -150
+
+        path = str(tmp_path / "off.pola")
+        win._write_pola(path)
+        win._load_pola(path)
+        got = win.layer_stack.layers[0]
+
+        def at(cx, cy):
+            return QColor(got.image.pixel(cx - got.offset_x, cy - got.offset_y)).getRgb()
+
+        assert at(-120, -120) == (255, 0, 0, 255)
+        assert at(80, 80) == (0, 0, 255, 255)
+
+    def test_empty_padding_is_trimmed_on_save(self, win, tmp_path):
+        """空の余白は切り詰められ、ファイルが肥大化しないか。"""
+        from PyQt6.QtGui import QImage
+        ls = win.layer_stack
+        layer = ls.layers[0]
+        img = QImage(4000, 4000, QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.fillRect(1500, 1500, 100, 100, QColor(255, 0, 0))
+        p.end()
+        layer.image = img
+        layer.offset_x = layer.offset_y = -1000
+
+        path = str(tmp_path / "big.pola")
+        win._write_pola(path)
+        win._load_pola(path)
+        got = win.layer_stack.layers[0]
+        assert got.image.width() == 100 and got.image.height() == 100
+        assert QColor(got.image.pixel(50, 50)).getRgb() == (255, 0, 0, 255)
+
+    def test_fully_transparent_layer_saves_as_empty(self, win, tmp_path):
+        from PyQt6.QtGui import QImage
+        layer = win.layer_stack.layers[0]
+        img = QImage(500, 500, QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        layer.image = img
+        layer.offset_x = layer.offset_y = 30
+        path = str(tmp_path / "empty.pola")
+        win._write_pola(path)
+        win._load_pola(path)
+        got = win.layer_stack.layers[0]
+        assert got.image.width() == 1 and got.image.height() == 1
+
     def test_load_clears_undo_history(self, win):
         c = win.canvas
         c._save_history()

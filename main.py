@@ -1596,27 +1596,54 @@ class MainWindow(QMainWindow):
             path += ".pola"
         self._write_pola(path)
 
+    # 保存するレイヤー1枚の上限（px）。Qt の画像読み込み上限に
+    # 引っかかって「保存はできたのに開けない」のを防ぐための保険。
+    _MAX_SAVE_DIM = 30000
+
     @staticmethod
-    def _clip_layer_image_for_save(image: QImage, offset_x: int, offset_y: int,
-                                    canvas_w: int, canvas_h: int) -> tuple[QImage, int, int]:
-        """保存用にレイヤー画像をキャンバス範囲へクロップする。
-        拡大縮小・移動でキャンバス外にはみ出した絵は編集中は画素データとして
-        保持されるが（_ensure_layer_bounds）、その分だけ .pola ファイルが
-        際限なく肥大化し、Qtの画像読み込み上限を超えて保存後に開けなくなる
-        バグの原因になったため、保存時はキャンバス外を切り捨てる。
-        編集中のレイヤーオブジェクト自体は変更しない（保存用コピーのみ）。"""
-        img_rect = QRect(offset_x, offset_y, image.width(), image.height())
-        canvas_rect = QRect(0, 0, canvas_w, canvas_h)
-        if canvas_rect.contains(img_rect):
-            return image, offset_x, offset_y
-        clipped_rect = img_rect.intersected(canvas_rect)
-        if clipped_rect.isEmpty():
-            # レイヤーが完全にキャンバス外: 空画像として保存する
+    def _trim_layer_overflow_for_save(image: QImage, offset_x: int, offset_y: int,
+                                      canvas_w: int, canvas_h: int) -> tuple[QImage, int, int]:
+        """保存用にレイヤー画像を「絵がある範囲」へ切り詰める。
+
+        キャンバス外の絵もそのまま保存する（あとでキャンバスを広げれば戻せる）。
+        ファイルが肥大化して開けなくなる原因は、拡大縮小や描画で広がった
+        「中身が空の余白」なので、そこだけ落とせば絵を捨てずに済む。
+        完全に透明なレイヤーは 1x1 の空画像にする。
+        万一絵自体が巨大だった場合のだけ、Qt の読み込み上限を超えて
+        保存後に開けなくならないよう上限で止める。
+        編集中のレイヤー自体は変更しない（保存用コピーのみ）。
+        """
+        src = image.convertToFormat(QImage.Format.Format_ARGB32)
+        w, h = src.width(), src.height()
+        ptr = src.constBits()
+        ptr.setsize(h * w * 4)
+        alpha = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)[:, :, 3]
+        rows = np.flatnonzero(alpha.any(axis=1))
+        cols = np.flatnonzero(alpha.any(axis=0))
+        if rows.size == 0 or cols.size == 0:
             empty = QImage(1, 1, QImage.Format.Format_ARGB32)
             empty.fill(Qt.GlobalColor.transparent)
             return empty, 0, 0
-        local_rect = clipped_rect.translated(-offset_x, -offset_y)
-        return image.copy(local_rect), clipped_rect.x(), clipped_rect.y()
+        top, bottom = int(rows[0]), int(rows[-1])
+        left, right = int(cols[0]), int(cols[-1])
+        local = QRect(left, top, right - left + 1, bottom - top + 1)
+
+        cap = MainWindow._MAX_SAVE_DIM
+        if local.width() > cap or local.height() > cap:
+            # 絵そのものが上限を超える場合は、キャンバスを中心に
+            # 上限分だけ残す。ここに来るのは事故的な大きさのときだけ。
+            cx = canvas_w // 2 - offset_x
+            cy = canvas_h // 2 - offset_y
+            keep = QRect(cx - cap // 2, cy - cap // 2, cap, cap)
+            local = local.intersected(keep)
+            if local.isEmpty():
+                empty = QImage(1, 1, QImage.Format.Format_ARGB32)
+                empty.fill(Qt.GlobalColor.transparent)
+                return empty, 0, 0
+
+        if local == QRect(0, 0, w, h):
+            return image, offset_x, offset_y
+        return image.copy(local), offset_x + local.x(), offset_y + local.y()
 
     def _write_pola(self, path: str):
         """レイヤー構造を .pola（ZIP）形式で保存する。"""
@@ -1679,7 +1706,7 @@ class MainWindow(QMainWindow):
                         info["hsl_hue"] = lyr.hsl_hue
                         info["hsl_saturation"] = lyr.hsl_saturation
                         info["hsl_lightness"] = lyr.hsl_lightness
-                        save_img, save_ox, save_oy = self._clip_layer_image_for_save(
+                        save_img, save_ox, save_oy = self._trim_layer_overflow_for_save(
                             lyr.image, lyr.offset_x, lyr.offset_y, ls.width, ls.height)
                         info["offset_x"] = save_ox
                         info["offset_y"] = save_oy
@@ -1792,8 +1819,10 @@ class MainWindow(QMainWindow):
                         from layer import BLEND_KEYS
                         lyr.blend_mode = bm if bm in BLEND_KEYS else "normal"
 
-                        lyr.offset_x = self._clamp(info.get("offset_x", 0), -20000, 20000, 0)
-                        lyr.offset_y = self._clamp(info.get("offset_y", 0), -20000, 20000, 0)
+                        # 保存側の上限と揃える。キャンバス外に遠く置いた絵も読み戻せるようにするため。
+                        lim = self._MAX_SAVE_DIM
+                        lyr.offset_x = self._clamp(info.get("offset_x", 0), -lim, lim, 0)
+                        lyr.offset_y = self._clamp(info.get("offset_y", 0), -lim, lim, 0)
                         lyr.border_enabled = bool(info.get("border_enabled", False))
                         lyr.border_size = self._clamp(info.get("border_size", 3), 0, 50, 3)
                         lyr.border_color = self._safe_color(
