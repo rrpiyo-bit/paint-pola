@@ -562,8 +562,9 @@ class LayerStack:
         merged = QImage(mw, mh, QImage.Format.Format_ARGB32_Premultiplied)
         merged.fill(Qt.GlobalColor.transparent)
         p = QPainter(merged)
-        p.setOpacity(lower.opacity / 255)
-        p.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
+        if lower.visible:
+            p.setOpacity(lower.opacity / 255)
+            p.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
         upper_img = upper.image_with_effects()
         u_dx, u_dy = u_ox - min_x, u_oy - min_y
         if upper.clipping:
@@ -582,14 +583,20 @@ class LayerStack:
             mp.end()
             upper_img = masked
             u_dx = u_dy = 0
-        p.setOpacity(upper.opacity / 255)
-        blend = BLEND_KEY_TO_MODE.get(getattr(upper, 'blend_mode', 'normal'))
-        if blend:
-            p.setCompositionMode(blend)
-        p.drawImage(u_dx, u_dy, upper_img)
+        # 非表示レイヤーは画面に出ていないので統合結果にも入れない。
+        # 入れてしまうと、消したつもりの絵が統合で復活して見える。
+        if upper.visible:
+            p.setOpacity(upper.opacity / 255)
+            blend = BLEND_KEY_TO_MODE.get(getattr(upper, 'blend_mode', 'normal'))
+            if blend:
+                p.setCompositionMode(blend)
+            p.drawImage(u_dx, u_dy, upper_img)
         p.end()
         lower.image = merged.convertToFormat(QImage.Format.Format_ARGB32)
         lower.opacity = 255
+        # 両方とも非表示だったときだけ非表示のまま。どちらかが見えていた
+        # なら、その絵が結果に入っているので表示にする。
+        lower.visible = lower.visible or upper.visible
         lower.offset_x = min_x
         lower.offset_y = min_y
         # 統合後は効果を焼き込み済みなので、旧設定が残って二重適用されないようリセットする

@@ -315,6 +315,52 @@ class TestLayerStack:
         assert ls.merge_down() is True
         assert px(ls.layers[0].image, 50, 50).red() > 200
 
+    def _two_colored(self, hide_upper=False, hide_lower=False):
+        from PyQt6.QtGui import QPainter
+        ls = LayerStack(W, H)
+        lower = ls.add("lower")
+        upper = ls.add("upper")
+        p = QPainter(lower.image)
+        p.fillRect(0, 0, 60, 60, QColor(0, 0, 255, 255))
+        p.end()
+        p = QPainter(upper.image)
+        p.fillRect(0, 0, 60, 60, QColor(255, 0, 0, 255))
+        p.end()
+        upper.visible = not hide_upper
+        lower.visible = not hide_lower
+        return ls, lower, upper
+
+    def test_merge_down_skips_hidden_upper(self):
+        """非表示の上レイヤーは統合結果に入らない。
+
+        入ってしまうと、消したつもりの絵が統合で復活して見える。
+        """
+        ls, _, _ = self._two_colored(hide_upper=True)
+        ls.set_active(0)
+        assert ls.merge_down() is True
+        merged = ls.layers[0]
+        assert px(merged.image, 5, 5).red() < 100     # 非表示の赤は入らない
+        assert px(merged.image, 5, 5).blue() > 200    # 表示中の青は残る
+
+    def test_merge_down_skips_hidden_lower(self):
+        ls, _, _ = self._two_colored(hide_lower=True)
+        ls.set_active(0)
+        assert ls.merge_down() is True
+        assert px(ls.layers[0].image, 5, 5).red() > 200
+
+    def test_merge_down_result_visible_when_either_visible(self):
+        """片方でも表示なら、その絵が入っているので結果は表示にする。"""
+        ls, _, _ = self._two_colored(hide_upper=True)
+        ls.set_active(0)
+        ls.merge_down()
+        assert ls.layers[0].visible is True
+
+    def test_merge_down_result_hidden_when_both_hidden(self):
+        ls, _, _ = self._two_colored(hide_upper=True, hide_lower=True)
+        ls.set_active(0)
+        ls.merge_down()
+        assert ls.layers[0].visible is False
+
     def test_merge_marked_two_layers(self):
         ls = LayerStack(W, H)
         a = ls.add("A")
