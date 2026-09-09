@@ -259,13 +259,6 @@ class ToolOptionsPanel(QWidget):
                 w.setValue(v)
                 w.blockSignals(False)
 
-    def sync_fill_expand(self, v: int):
-        for w in self._widgets:
-            if getattr(w, '_opt_key', None) == 'fill_expand':
-                w.blockSignals(True)
-                w.setValue(v)
-                w.blockSignals(False)
-
     # ── ビルダー ──────────────────────────────────────────────────────────────
 
     def _clear(self):

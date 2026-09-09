@@ -89,10 +89,6 @@ class Layer:
             self.hsl_lightness,
         )
 
-    def invalidate_effect_cache(self) -> None:
-        """効果キャッシュを明示的に捨てる。"""
-        self._effect_cache = None
-
     def clear(self):
         self.image.fill(Qt.GlobalColor.transparent)
 
@@ -756,17 +752,6 @@ class LayerStack:
                 vals[1] = min(vals[1], oy)
                 vals[2] = max(vals[2], ox + child.image.width())
                 vals[3] = max(vals[3], oy + child.image.height())
-
-    def _draw_layer_to(self, p: QPainter, lyr, off_x: int, off_y: int):
-        """統合用: lyrをオフセット補正して描画する。"""
-        if lyr.is_group:
-            self._draw_layers_to(p, lyr.children, off_x, off_y)
-        else:
-            ox = getattr(lyr, 'offset_x', 0)
-            oy = getattr(lyr, 'offset_y', 0)
-            img = lyr.image_with_effects() if hasattr(lyr, 'image_with_effects') else lyr.image
-            p.setOpacity(lyr.opacity / 255)
-            p.drawImage(ox - off_x, oy - off_y, img)
 
     def _draw_layers_to(self, p: QPainter, layers, off_x: int, off_y: int):
         """統合用: 同階層のレイヤー群をクリッピング・ブレンドモードを反映して描画する

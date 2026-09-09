@@ -799,11 +799,6 @@ class LayerPanel(QWidget):
             active.hsl_lightness = self._hsl_light.value()  # type: ignore
             self.layers_changed.emit()
 
-    def refresh_thumbs(self):
-        """描画後にサムネイルだけ更新する（重い composite を最小化）。"""
-        for row, layer, _ in self._rows:
-            row.refresh_thumb()
-
     def set_opacity(self, value: int):
         """数字キー等の外部操作でスライダーを同期する。"""
         self._opacity.blockSignals(True)
@@ -1077,17 +1072,6 @@ class LayerPanel(QWidget):
         self.layers_changed.emit()
 
     # ── ドラッグ＆ドロップ ──────────────────────────────────────────────────────
-
-    def _row_at_pos(self, pos) -> int:
-        """スクロールエリア内の座標からドロップ先の行インデックスを返す。"""
-        scroll_pos = self._scroll.mapFrom(self, pos)
-        inner_pos = self._inner.mapFrom(self._scroll.viewport(), scroll_pos)
-        for i, (row, _, _) in enumerate(self._rows):
-            ry = row.y()
-            rh = row.height()
-            if inner_pos.y() < ry + rh // 2:
-                return i
-        return len(self._rows)
 
     def _row_hit(self, pos) -> tuple[int, bool]:
         """行インデックスとグループ内ドロップかを返す。"""

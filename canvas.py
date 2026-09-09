@@ -136,12 +136,6 @@ def _sensitivity_to_threshold(sensitivity: int) -> int:
     return round(LINE_ALPHA_THRESHOLD * (100 - s) / 100)
 
 
-def _is_line_pixel(pixel: int, threshold: int = LINE_ALPHA_THRESHOLD) -> bool:
-    """参照レイヤーのピクセルが「線」（塗りつぶしを堰き止める境界）かどうか判定する。
-    不透明なピクセルはすべて境界（白い線も含む）。"""
-    return _alpha(pixel) > threshold
-
-
 def _line_free_mask(judge_arr: np.ndarray, threshold: int = LINE_ALPHA_THRESHOLD) -> np.ndarray:
     """参照配列(BGRA)のうち「線ではない＝塗ってよい」ピクセルの真偽マスクを返す。
 
@@ -871,10 +865,6 @@ class Canvas(QWidget):
         p.end()
         self._clip_base_image = grown
 
-    def _clear_clip_to_selection(self) -> None:
-        self._clip_base_image = None
-        self._clip_layer = None
-
     @staticmethod
     def _entry_bytes(entry) -> int:
         """履歴エントリ1件が保持している画像バイト数のおおよその合計。"""
@@ -989,10 +979,6 @@ class Canvas(QWidget):
         if path:
             path[0] = min(path[0], max(0, len(ls.layers) - 1))
         ls.active_path = path
-
-    def purge_layer_history(self, layer_id: int):
-        self._history = [e for e in self._history if not (e[0] == "pixel" and e[1] == layer_id)]
-        self._redo_stack = [e for e in self._redo_stack if not (e[0] == "pixel" and e[1] == layer_id)]
 
     def _all_layer_ids(self) -> set[int]:
         ids: set[int] = set()
@@ -1520,41 +1506,6 @@ class Canvas(QWidget):
         p.drawImage(0, 0, overlay)
         p.end()
         return base
-
-    def _draw_floating_image(self, p: QPainter):
-        """キャンバス座標系のPainter（setTransform済み）にフローティング画像を描く。"""
-        if not self._transform_rect or not self._transform_image:
-            return
-        if self._mesh_grid:
-            result = self._warp_mesh_image()
-            if result:
-                warped_img, ox, oy = result
-                p.save()
-                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-                p.drawImage(ox, oy, warped_img)
-                p.restore()
-            return
-        if self._perspective_corners:
-            result = self._warp_perspective_image()
-            if result:
-                warped_img, ox, oy = result
-                p.save()
-                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-                p.drawImage(ox, oy, warped_img)
-                p.restore()
-            return
-        r = self._transform_rect
-        img = self._transform_image
-        src_rect = QRectF(0, 0, img.width(), img.height())
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        if self._transform_angle != 0.0:
-            pv = self._pivot_point()
-            p.translate(pv.x(), pv.y())
-            p.rotate(self._transform_angle)
-            p.translate(-pv.x(), -pv.y())
-        p.drawImage(r, img, src_rect)
-        p.restore()
 
     def _draw_transform_handles(self, p: QPainter):
         """ウィジェット座標系でハンドル枠・□・○を描く。
@@ -2301,20 +2252,6 @@ class Canvas(QWidget):
             brush.stroke_to(img, self._mirror_x(a), self._mirror_x(b),
                             self.pen_color, self.pen_size)
 
-    def _draw_point(self, img: QImage, p: QPoint):
-        painter = QPainter(img)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(self._make_pen(self.pen_color, self.pen_size))
-        painter.drawPoint(p)
-        painter.end()
-
-    def _draw_line(self, img: QImage, a: QPoint, b: QPoint):
-        painter = QPainter(img)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(self._make_pen(self.pen_color, self.pen_size))
-        painter.drawLine(a, b)
-        painter.end()
-
     def _erase_point(self, img: QImage, p: QPoint):
         painter = QPainter(img)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
@@ -3038,9 +2975,6 @@ class Canvas(QWidget):
         if self._mesh_mode and self._transform_image and self._transform_rect:
             self._init_mesh_grid()
             self.update()
-
-    def set_perspective_mode(self, enabled: bool):
-        self.set_transform_mode("perspective" if enabled else "standard")
 
     def lift_whole_layer(self) -> bool:
         """アクティブレイヤー全体をフローティング化して変形モードに入る。選択範囲は使わない。

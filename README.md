@@ -447,26 +447,26 @@ MainWindow (main.py)
 
 ```
 paint_pola/
-├── main.py               # メインウィンドウ・メニュー・ダイアログ・未保存保護 (2,298行)
-├── canvas.py             # キャンバス・描画・変形・Undo/Redo (3,122行)
-├── layer.py              # Layer / GroupLayer / LayerStack (740行)
-├── layer_panel.py        # レイヤーパネルUI・D&D (1,150行)
-├── actions.py            # アクション機能・アクションガチャ (4,963行)
-├── brush.py              # ブラシエンジン (270行)
-├── color_panel.py        # カラーピッカー・パレット (570行)
+├── main.py               # メインウィンドウ・メニュー・ダイアログ・未保存保護 (2,408行)
+├── canvas.py             # キャンバス・描画・変形・Undo/Redo (3,257行)
+├── layer.py              # Layer / GroupLayer / LayerStack (875行)
+├── layer_panel.py        # レイヤーパネルUI・D&D (1,192行)
+├── actions.py            # アクション機能・アクションガチャ (5,009行)
+├── brush.py              # ブラシエンジン (274行)
+├── color_panel.py        # カラーピッカー・パレット (572行)
 ├── toolbar.py            # ツールバー・カスタムカーソル・カラーヒストリー (397行)
-├── tool_options_panel.py # ツール別設定パネル (424行)
+├── tool_options_panel.py # ツール別設定パネル (446行)
 ├── tools.py              # Tool enum (18行)
 ├── themes.py             # テーマ定義 (860行)
 ├── navigator.py          # ナビゲーター (290行)
-├── animation_panel.py    # アニメーションタイムライン (450行)
-├── generate_samples.py   # サンプル画像生成 (370行)
+├── animation_panel.py    # アニメーションタイムライン (457行)
+├── generate_samples.py   # サンプル画像生成 (373行)
 ├── start.bat             # 起動スクリプト
 ├── images/               # アイコン・サンプル出力先
 └── tests/                # テスト (635件, 8404行)
 ```
 
-合計: 約 15,000 行（プロダクション） + 5,950 行（テスト）
+合計: 約 16,400 行（プロダクション） + 8,400 行（テスト）
 
 ### 内部構造
 

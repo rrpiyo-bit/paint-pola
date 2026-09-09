@@ -43,9 +43,6 @@ class CollapsibleSection(QWidget):
     def add_widget(self, w: QWidget):
         self._body_layout.addWidget(w)
 
-    def add_layout(self, layout):
-        self._body_layout.addLayout(layout)
-
     def _toggle(self):
         self._collapsed = not self._collapsed
         self._body.setVisible(not self._collapsed)

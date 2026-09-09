@@ -206,8 +206,9 @@ class BlurBrush(BrushBase):
 
 class StabilizedBrush(BrushBase):
     """内包するブラシに移動平均による手ぶれ補正を適用する。
-    Canvas 側で _stabilize_buffer にポイントを蓄積し、
-    平均点を使って stroke_to を呼ぶことで実現する。
+    Canvas 側は self._stabilizer として本クラスを持ち、
+    push() に生の座標を渡して平均済みの座標を受け取り、
+    それを使って stroke_to を呼ぶ。点の蓄積は本クラスの _buf。
     このクラス自体は通常の stroke_to も持つ（バッファなし版）。"""
 
     def __init__(self, inner: BrushBase, smooth: int = 6):
