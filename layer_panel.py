@@ -52,6 +52,7 @@ class LayerRow(QWidget):
     clipping_changed   = pyqtSignal(object, bool)
     reference_changed  = pyqtSignal(object, bool)
     marked_changed     = pyqtSignal(object, bool)        # (layer,) 統合対象チェック
+    locked_changed     = pyqtSignal(object, bool)        # (layer,) ロック
     rename_requested   = pyqtSignal(object)              # (layer,)
     select_requested   = pyqtSignal(object)              # (layer,)
     select_alpha_requested = pyqtSignal(object)           # (layer,) サムネイルCtrlクリック
@@ -147,6 +148,16 @@ class LayerRow(QWidget):
         self._ref.toggled.connect(
             lambda s: self.reference_changed.emit(self._layer, s))
         icon_row.addWidget(self._ref)
+
+        # ロックはグループにも付けられる（中身ごと守る）ので、グループ行にも出す。
+        self._lock = QPushButton("🔒")
+        self._lock.setCheckable(True)
+        self._lock.setChecked(getattr(self._layer, 'locked', False))
+        self._lock.setToolTip("ロック（描画・移動・変形から守る）")
+        self._lock.setStyleSheet(_ICON_BTN_CSS)
+        self._lock.toggled.connect(
+            lambda s: self.locked_changed.emit(self._layer, s))
+        icon_row.addWidget(self._lock)
 
         # 統合対象マーク（複数選んで「選択レイヤーを統合」で使う）。
         # グループは統合対象外なので出さない。
@@ -559,6 +570,7 @@ class LayerPanel(QWidget):
         row.clipping_changed.connect(self._on_clipping)
         row.reference_changed.connect(self._on_reference)
         row.marked_changed.connect(self._on_marked)
+        row.locked_changed.connect(self._on_locked)
         row.rename_requested.connect(self._on_rename)
         row.select_requested.connect(self._on_select)
         row.select_alpha_requested.connect(self.select_alpha_requested)
@@ -848,6 +860,9 @@ class LayerPanel(QWidget):
     def _on_marked(self, layer: Layer | GroupLayer, marked: bool):
         layer.merge_marked = marked
 
+    def _on_locked(self, layer: Layer | GroupLayer, locked: bool):
+        layer.locked = locked
+
     def _collect_marked(self) -> list:
         """統合対象マークが付いた通常レイヤーを、表示順に集める。"""
         found = []
@@ -924,6 +939,7 @@ class LayerPanel(QWidget):
         dst.opacity = src.opacity
         dst.clipping = src.clipping
         dst.reference = src.reference
+        dst.locked = src.locked
         dst.blend_mode = src.blend_mode
         dst.offset_x = src.offset_x
         dst.offset_y = src.offset_y
@@ -957,6 +973,7 @@ class LayerPanel(QWidget):
             new_g.opacity = src.opacity
             new_g.clipping = src.clipping
             new_g.reference = src.reference
+            new_g.locked = src.locked
             new_g.collapsed = src.collapsed
             for child in src.children:
                 new_g.children.append(self._deep_copy_layer(child, ls, False))

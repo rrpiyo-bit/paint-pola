@@ -30,6 +30,8 @@ class Layer:
         self.opacity = 255
         self.clipping = False
         self.reference = False
+        # ロック。つけると描画・消しゴム・塗りつぶし・移動・変形から守られる。
+        self.locked = False
         # レイヤーパネルの「統合対象」チェック。ファイルには保存しない一時的な印。
         self.merge_marked = False
         self.offset_x: int = 0
@@ -275,6 +277,8 @@ class GroupLayer:
         self.opacity = 255
         self.clipping = False
         self.reference = False
+        # グループのロックは中のレイヤー全部に効く。
+        self.locked = False
         self.collapsed = False  # True のとき子レイヤーをパネルで非表示
         self.children: list[Layer | GroupLayer] = []
         self._w = w

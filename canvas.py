@@ -459,6 +459,7 @@ class Canvas(QWidget):
     layer_opacity_changed = pyqtSignal(int)  # 数字キーで不透明度が変わったとき
     tool_shortcut_pressed = pyqtSignal(object)  # Tool — キーボードショートカットでツール切替
     edited = pyqtSignal()  # 絵・レイヤー構造が実際に変更されたとき（未保存マーク用）
+    grid_visibility_changed = pyqtSignal(bool)  # 方眼の表示・非表示が変わったとき（メニューのチェックを合わせるため）
 
     # テキスト入力ダイアログをキャンバス内で閉じるため、main から注入する
     ask_text_fn: object = None  # type: ignore  # Callable[[Canvas], None] | None
@@ -699,9 +700,31 @@ class Canvas(QWidget):
         self._flip_h = not self._flip_h
         self.update()
 
+    def is_locked(self, layer) -> bool:
+        """ロックしたレイヤーかどうか。親グループがロックされていれば中身もロック扱い。
+
+        描画・消しゴム・塗りつぶし・移動・変形はすべてこの先を通るので、
+        ここで止めればすべて守れる。
+        """
+        if layer is None:
+            return False
+        if getattr(layer, "locked", False):
+            return True
+        path = self.layer_stack.path_of(layer)
+        if not path:
+            return False
+        items = self.layer_stack.layers
+        for idx in path[:-1]:
+            if idx >= len(items):
+                return False
+            parent = items[idx]
+            if getattr(parent, "locked", False):
+                return True
+            items = parent.children
+        return False
+
     def toggle_grid(self):
-        self._show_grid = not self._show_grid
-        self.update()
+        self.set_grid_visible(not self._show_grid)
 
     def set_grid_size(self, size: int):
         self._grid_size = max(1, size)  # 0除算・無限ループ防止
@@ -713,7 +736,11 @@ class Canvas(QWidget):
         self.update()
 
     def set_grid_visible(self, visible: bool):
-        self._show_grid = bool(visible)
+        visible = bool(visible)
+        if visible == self._show_grid:
+            return
+        self._show_grid = visible
+        self.grid_visibility_changed.emit(visible)
         self.update()
 
     # ── coordinate conversion ────────────────────────────────────────────────
@@ -890,14 +917,16 @@ class Canvas(QWidget):
             return {
                 "type": "group", "name": lyr.name, "visible": lyr.visible,
                 "opacity": lyr.opacity, "clipping": lyr.clipping,
-                "reference": lyr.reference, "collapsed": lyr.collapsed,
+                "reference": lyr.reference, "locked": lyr.locked,
+                "collapsed": lyr.collapsed,
                 "children": [self._snapshot_layer(c) for c in lyr.children],
                 "_w": lyr._w, "_h": lyr._h,
             }
         return {
             "type": "layer", "name": lyr.name, "visible": lyr.visible,
             "opacity": lyr.opacity, "clipping": lyr.clipping,
-            "reference": lyr.reference, "image": lyr.image.copy(),
+            "reference": lyr.reference, "locked": lyr.locked,
+            "image": lyr.image.copy(),
             "blend_mode": lyr.blend_mode,
             "offset_x": lyr.offset_x, "offset_y": lyr.offset_y,
             "border_enabled": lyr.border_enabled, "border_size": lyr.border_size,
@@ -919,12 +948,13 @@ class Canvas(QWidget):
             g = GroupLayer(snap["name"], snap["_w"], snap["_h"])
             g.visible = snap["visible"]; g.opacity = snap["opacity"]
             g.clipping = snap["clipping"]; g.reference = snap["reference"]
+            g.locked = snap.get("locked", False)
             g.collapsed = snap["collapsed"]
             g.children = [self._restore_layer(c) for c in snap["children"]]
             return g
         lyr = Layer(snap["name"], snap["image"].width(), snap["image"].height())
         lyr.image = snap["image"].copy()
-        for k in ("visible", "opacity", "clipping", "reference", "blend_mode",
+        for k in ("visible", "opacity", "clipping", "reference", "locked", "blend_mode",
                   "offset_x", "offset_y",
                   "border_enabled", "border_size", "border_color",
                   "shadow_enabled", "shadow_color", "shadow_offset_x", "shadow_offset_y",
@@ -1714,6 +1744,10 @@ class Canvas(QWidget):
             return
 
         if self.tool == Tool.MOVE:
+            # ロック中は移動ツールでも動かせない。
+            if self.is_locked(layer):
+                self.status_message.emit("このレイヤーはロックされています。レイヤーパネルの錠マークを解除してください。")
+                return
             if layer and layer.is_group:
                 children = self._collect_leaf_layers(layer)
                 if children:
@@ -1750,6 +1784,12 @@ class Canvas(QWidget):
         if not layer or layer.is_group:
             if layer and layer.is_group and self.tool in (Tool.PEN, Tool.ERASER, Tool.FILL, Tool.BLUR, Tool.LASSO_FILL):
                 self.status_message.emit("グループレイヤーには描画できません。子レイヤーを選択してください。")
+            return
+
+        # ロックしたレイヤーは描画も移動もさせない。選択中なのに黙って
+        # 何も起きないと戸惑うので、理由を必ず出す。
+        if self.is_locked(layer):
+            self.status_message.emit("このレイヤーはロックされています。レイヤーパネルの錠マークを解除してください。")
             return
 
         # 見えていないレイヤーに描けてしまうと、画面に何も出ないまま筆跡だけが

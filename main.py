@@ -296,7 +296,10 @@ class GridSettingsDialog(QDialog):
         root = QVBoxLayout(self)
 
         self._show = QCheckBox("方眼を表示する")
-        self._show.setChecked(True)
+        # 今の状態をそのまま映す。ここを常に True にしていると、
+        # 方眼を消したくて開いただけで逆に表示が入り、
+        # キャンセルしても元の表示に戻って消せなくなる。
+        self._show.setChecked(canvas._show_grid)
         root.addWidget(self._show)
 
         form = QFormLayout()
@@ -1475,7 +1478,15 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         self._add_action(view_menu, "左右反転表示", self.canvas.toggle_flip_h, "Ctrl+Shift+H")
         view_menu.addSeparator()
-        self._add_action(view_menu, "グリッド表示切替", self.canvas.toggle_grid, "Ctrl+G")
+        # チェック式にして、今方眼が出ているのかメニューで見て分かるようにする。
+        # ダイアログ側で切り替えたときもチェックがずれないよう信号で合わせる。
+        self._grid_action = QAction("方眼を表示", self)
+        self._grid_action.setCheckable(True)
+        self._grid_action.setChecked(self.canvas._show_grid)
+        self._grid_action.setShortcut(QKeySequence("Ctrl+G"))
+        self._grid_action.triggered.connect(self.canvas.set_grid_visible)
+        self.canvas.grid_visibility_changed.connect(self._grid_action.setChecked)
+        view_menu.addAction(self._grid_action)
 
         mode_menu = mb.addMenu("モード")
         self._anim_mode_action = QAction("アニメーションモード", self)
@@ -1636,10 +1647,12 @@ class MainWindow(QMainWindow):
                         info["collapsed"] = lyr.collapsed
                         info["clipping"] = lyr.clipping
                         info["reference"] = lyr.reference
+                        info["locked"] = lyr.locked
                         info["children"] = [_write_layer(c) for c in lyr.children]
                     else:
                         info["clipping"] = lyr.clipping
                         info["reference"] = lyr.reference
+                        info["locked"] = lyr.locked
                         info["blend_mode"] = lyr.blend_mode
                         info["offset_x"] = lyr.offset_x
                         info["offset_y"] = lyr.offset_y
@@ -1763,6 +1776,7 @@ class MainWindow(QMainWindow):
                         grp.collapsed = bool(info.get("collapsed", False))
                         grp.clipping = bool(info.get("clipping", False))
                         grp.reference = bool(info.get("reference", False))
+                        grp.locked = bool(info.get("locked", False))
                         children = info.get("children", [])
                         if isinstance(children, list):
                             grp.children = [_read_layer(c) for c in children]
@@ -1773,6 +1787,7 @@ class MainWindow(QMainWindow):
                         lyr.opacity = self._clamp(info.get("opacity", 255), 0, 255, 255)
                         lyr.clipping = bool(info.get("clipping", False))
                         lyr.reference = bool(info.get("reference", False))
+                        lyr.locked = bool(info.get("locked", False))
                         bm = info.get("blend_mode", "normal")
                         from layer import BLEND_KEYS
                         lyr.blend_mode = bm if bm in BLEND_KEYS else "normal"

@@ -970,3 +970,120 @@ class TestHiddenLayerIsNotDrawable:
         before = self._arr(ls.active.image)
         self._press(c, 50, 50)
         assert not np.array_equal(self._arr(ls.active.image), before)
+
+
+class TestLayerLock:
+    """ロックしたレイヤーが守られているか。"""
+
+    def _arr(self, im):
+        import numpy as np
+        im = im.convertToFormat(QImage.Format.Format_ARGB32)
+        b = im.constBits()
+        b.setsize(im.height() * im.width() * 4)
+        return np.frombuffer(b, dtype=np.uint8).reshape(im.height(), im.width(), 4).copy()
+
+    def _press(self, c, x, y):
+        from PyQt6.QtCore import QPointF, QEvent
+        pt = c._c2w().map(QPointF(x, y))
+        c.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, pt, pt,
+                                      Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                                      Qt.KeyboardModifier.NoModifier))
+        c.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, pt, pt,
+                                        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+                                        Qt.KeyboardModifier.NoModifier))
+
+    def _canvas(self):
+        ls = LayerStack(100, 100)
+        ls.add("L")
+        c = Canvas(ls)
+        c.resize(100, 100)
+        c.tool = Tool.PEN
+        c.pen_size = 10
+        c.pen_color = QColor(0, 255, 0)
+        return ls, c
+
+    def test_locked_layer_is_not_drawable(self):
+        import numpy as np
+        ls, c = self._canvas()
+        ls.active.locked = True
+        before = self._arr(ls.active.image)
+        self._press(c, 50, 50)
+        assert np.array_equal(self._arr(ls.active.image), before)
+
+    def test_unlocked_layer_still_draws(self):
+        import numpy as np
+        ls, c = self._canvas()
+        before = self._arr(ls.active.image)
+        self._press(c, 50, 50)
+        assert not np.array_equal(self._arr(ls.active.image), before)
+
+    def test_locked_layer_is_not_movable(self):
+        ls, c = self._canvas()
+        ls.active.locked = True
+        c.tool = Tool.MOVE
+        from PyQt6.QtCore import QPointF, QEvent
+        pt = c._c2w().map(QPointF(50, 50))
+        c.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, pt, pt,
+                                      Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                                      Qt.KeyboardModifier.NoModifier))
+        assert c._drawing is False
+
+    def test_lock_on_group_covers_children(self):
+        from layer import Layer as L, GroupLayer
+        ls = LayerStack(100, 100)
+        ls.add("base")
+        g = GroupLayer("g", 100, 100)
+        child = L("child", 100, 100)
+        g.children = [child]
+        ls.layers.append(g)
+        c = Canvas(ls)
+        g.locked = True
+        assert c.is_locked(child) is True
+        g.locked = False
+        assert c.is_locked(child) is False
+
+    def test_lock_survives_undo_redo(self):
+        ls, c = self._canvas()
+        ls.active.locked = True
+        c.save_structure_history()
+        c.undo()
+        c.redo()
+        assert ls.active.locked is True
+
+
+class TestGridVisibility:
+    """方眼の表示を確実に消せるか。"""
+
+    def test_dialog_reflects_current_state_instead_of_forcing_on(self):
+        import main
+        w = main.MainWindow()
+        assert w.canvas._show_grid is False
+        d = main.GridSettingsDialog(w.canvas, w)
+        assert d._show.isChecked() is False
+        assert w.canvas._show_grid is False
+
+    def test_dialog_can_turn_grid_off(self):
+        import main
+        w = main.MainWindow()
+        w.canvas.set_grid_visible(True)
+        d = main.GridSettingsDialog(w.canvas, w)
+        assert d._show.isChecked() is True
+        d._show.setChecked(False)
+        d.accept()
+        assert w.canvas._show_grid is False
+
+    def test_menu_check_follows_canvas(self):
+        import main
+        w = main.MainWindow()
+        assert w._grid_action.isChecked() is False
+        w.canvas.set_grid_visible(True)
+        assert w._grid_action.isChecked() is True
+        w.canvas.toggle_grid()
+        assert w._grid_action.isChecked() is False
+
+    def test_menu_action_toggles_grid_off(self):
+        import main
+        w = main.MainWindow()
+        w.canvas.set_grid_visible(True)
+        w._grid_action.trigger()
+        assert w.canvas._show_grid is False
