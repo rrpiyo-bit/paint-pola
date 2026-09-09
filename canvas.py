@@ -529,6 +529,10 @@ class Canvas(QWidget):
 
         # selection
         self._selection_rect: QRect | None = None
+        # 選択範囲による描画クリップ用（描画前の画像を控えておく）
+        self._clip_base_image: QImage | None = None
+        self._clip_layer = None
+        self._clip_mask: QImage | None = None
         self._lasso_points: list[QPoint] = []
         self._lasso_mask: QImage | None = None
         self._lasso_path_points: list[QPoint] = []  # 確定後の投げ縄パス（表示用）
@@ -764,6 +768,85 @@ class Canvas(QWidget):
     def _end_stroke_cache(self) -> None:
         self._stroke_layer = None
         self._stroke_bg_cache = None
+
+    # ── 選択範囲による描画のマスク ────────────────────────────────────────────
+
+    def _begin_clip_to_selection(self, layer) -> None:
+        """選択範囲があるとき、描画前のレイヤー画像を控えておく。
+
+        ペン・消しゴム・バケツ塗りは選択範囲を見ずにレイヤー全体へ描いてしまう。
+        ツールごとに描画処理へマスクを渡すのは経路が多く漏れやすいので、
+        「描いた後で選択範囲の外を元に戻す」方式で一律にクリップする。
+        """
+        self._clip_base_image = None
+        self._clip_layer = None
+        if not self._selection_rect or layer is None or layer.is_group:
+            return
+        self._clip_layer = layer
+        self._clip_base_image = layer.image.copy()
+
+    def _apply_clip_to_selection(self) -> None:
+        """選択範囲の外を、描画前の状態に戻す。"""
+        layer = self._clip_layer
+        base = self._clip_base_image
+        if layer is None or base is None:
+            return
+        sel = self._clip_sel_rect_local(layer)
+        if sel is None:
+            return
+        # 「元画像を全面に描き戻し、そこへ選択範囲の中だけ新しい絵を戻す」。
+        # 選択範囲が矩形でない（投げなわ）場合もマスクで同じように扱える。
+        restored = base.copy()
+        p = QPainter(restored)
+        if self._clip_mask is not None:
+            region = QImage(layer.image.size(), QImage.Format.Format_ARGB32)
+            region.fill(Qt.GlobalColor.transparent)
+            rp = QPainter(region)
+            rp.drawImage(0, 0, layer.image)
+            rp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            rp.drawImage(-getattr(layer, 'offset_x', 0),
+                         -getattr(layer, 'offset_y', 0), self._clip_mask)
+            rp.end()
+            # 投げなわの中は「消しゴムで透明になった」場合も反映する必要が
+            # あるので、いったんマスク内を空にしてから描き戻す。
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
+            p.drawImage(-getattr(layer, 'offset_x', 0),
+                        -getattr(layer, 'offset_y', 0), self._clip_mask)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            p.drawImage(0, 0, region)
+        else:
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.drawImage(sel, layer.image, sel)
+        p.end()
+        layer.image = restored
+
+    def _clip_sel_rect_local(self, layer) -> QRect | None:
+        """選択範囲をレイヤーのローカル座標へ直し、画像内に収めて返す。"""
+        if not self._selection_rect:
+            return None
+        r = self._selection_rect.translated(-getattr(layer, 'offset_x', 0),
+                                            -getattr(layer, 'offset_y', 0))
+        r = r.intersected(QRect(0, 0, layer.image.width(), layer.image.height()))
+        return r if not r.isEmpty() else None
+
+    def _shift_clip_base(self, layer, shift) -> None:
+        """ストローク中にレイヤーが広がったとき、控えた画像も同じだけずらす。
+
+        これをしないと元画像とレイヤー画像の座標がずれ、範囲外を戻すときに
+        絵が飛んだ位置に貼り付いてしまう。
+        """
+        if self._clip_base_image is None:
+            return
+        grown = QImage(layer.image.size(), QImage.Format.Format_ARGB32)
+        grown.fill(Qt.GlobalColor.transparent)
+        p = QPainter(grown)
+        p.drawImage(shift.x(), shift.y(), self._clip_base_image)
+        p.end()
+        self._clip_base_image = grown
+
+    def _clear_clip_to_selection(self) -> None:
+        self._clip_base_image = None
+        self._clip_layer = None
 
     @staticmethod
     def _entry_bytes(entry) -> int:
@@ -1668,6 +1751,11 @@ class Canvas(QWidget):
         if self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
             self._grow_for_draw(layer, cp, self._draw_margin())
 
+        # 選択範囲があるときは、描いた後で範囲外を元に戻せるよう控えておく。
+        # ここは描画系ツールすべてが通るので、1か所で漏れなくクリップできる。
+        self._clip_mask = self._lasso_mask
+        self._begin_clip_to_selection(layer)
+
         lox = getattr(layer, 'offset_x', 0)
         loy = getattr(layer, 'offset_y', 0)
         lp = QPoint(cp.x() - lox, cp.y() - loy)
@@ -1679,6 +1767,7 @@ class Canvas(QWidget):
             smooth_pt = self._stabilizer.push(lp).toPoint()
             self._last_pos = smooth_pt
             self._brush_stamp(layer.image, smooth_pt)  # type: ignore
+            self._apply_clip_to_selection()
             self.update()
 
         elif self.tool == Tool.ERASER:
@@ -1687,6 +1776,7 @@ class Canvas(QWidget):
             self._stabilizer.reset()
             self._last_pos = lp
             self._erase_point(layer.image, lp)  # type: ignore
+            self._apply_clip_to_selection()
             self.update()
 
         elif self.tool == Tool.FILL:
@@ -1698,6 +1788,7 @@ class Canvas(QWidget):
             _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img,  # type: ignore
                                  self.fill_expand, self.fill_close_gap, thr,
                                  self.fill_reference_mode == "ref_self")
+            self._apply_clip_to_selection()
             self.update()
 
         elif self.tool == Tool.BLUR:
@@ -1910,6 +2001,7 @@ class Canvas(QWidget):
                 if self._last_pos is not None:
                     self._last_pos = self._last_pos + shift
                 self._stabilizer.translate(shift)
+                self._shift_clip_base(layer, shift)
 
         lox = getattr(layer, 'offset_x', 0)
         loy = getattr(layer, 'offset_y', 0)
@@ -1919,16 +2011,19 @@ class Canvas(QWidget):
             smooth_pt = self._stabilizer.push(lp).toPoint()
             self._brush_stroke(layer.image, self._last_pos, smooth_pt)  # type: ignore
             self._last_pos = smooth_pt
+            self._apply_clip_to_selection()
             self.update()
 
         elif self.tool == Tool.ERASER and self._last_pos:
             self._erase_line(layer.image, self._last_pos, lp)  # type: ignore
             self._last_pos = lp
+            self._apply_clip_to_selection()
             self.update()
 
         elif self.tool == Tool.BLUR and self._last_pos:
             self._blur_brush.stroke_to(layer.image, self._last_pos, lp, self.pen_color, self.blur_size)
             self._last_pos = lp
+            self._apply_clip_to_selection()
             self.update()
 
         elif self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.SELECT_RECT):
@@ -1995,6 +2090,8 @@ class Canvas(QWidget):
                 sa = QPoint(self._preview_start.x() - lox, self._preview_start.y() - loy)
                 sb = QPoint(cp.x() - lox, cp.y() - loy)
                 self._commit_shape(layer.image, sa, sb)  # type: ignore
+                # 図形は離した時点で確定するので、ここでクリップする
+                self._apply_clip_to_selection()
             self._preview_start = None
             self._preview_end = None
             self.update()

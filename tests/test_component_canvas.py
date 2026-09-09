@@ -294,6 +294,88 @@ class TestSelectRect:
             assert sel.width() > 0 and sel.height() > 0
 
 
+# ── 選択範囲による描画のクリップ ──────────────────────────────────────────────
+
+class TestSelectionClipsDrawing:
+    """選択範囲があるとき、描画は範囲の中だけに効く。
+
+    ここが効かないと「範囲を選んでからその中だけ塗る」ができず、
+    とくにバケツ塗りはキャンバス全面が塗られてしまう。
+    """
+
+    def _arr(self, img):
+        ptr = img.constBits()
+        ptr.setsize(img.height() * img.width() * 4)
+        return np.frombuffer(ptr, dtype=np.uint8).reshape(
+            img.height(), img.width(), 4).copy()
+
+    def _stroke(self, canvas, tool, cx1, cy1, cx2, cy2):
+        from PyQt6.QtGui import QPainter
+        layer = canvas.layer_stack.active
+        p = QPainter(layer.image)
+        p.fillRect(0, 0, W, H, QColor(0, 0, 255, 255))
+        p.end()
+        before = self._arr(layer.image)
+        canvas.tool = tool
+        canvas.pen_size = 10
+        canvas.pen_color = QColor(255, 0, 0)
+        t = canvas._c2w()
+        a = t.map(QPointF(cx1, cy1))
+        b = t.map(QPointF(cx2, cy2))
+        _press(canvas, a.x(), a.y())
+        _move(canvas, b.x(), b.y())
+        _release(canvas, b.x(), b.y())
+        return (self._arr(layer.image) != before).any(axis=2)
+
+    @pytest.mark.parametrize("tool", [
+        Tool.PEN, Tool.ERASER, Tool.FILL, Tool.LINE, Tool.RECT,
+    ])
+    def test_drawing_outside_selection_does_nothing(self, canvas, tool):
+        from PyQt6.QtCore import QRect
+        canvas._selection_rect = QRect(20, 20, 60, 60)
+        changed = self._stroke(canvas, tool, 150, 150, 200, 200)
+        outside = changed.copy()
+        outside[20:80, 20:80] = False
+        assert outside.sum() == 0
+
+    @pytest.mark.parametrize("tool", [Tool.PEN, Tool.ERASER, Tool.FILL])
+    def test_drawing_inside_selection_stays_inside(self, canvas, tool):
+        from PyQt6.QtCore import QRect
+        canvas._selection_rect = QRect(20, 20, 60, 60)
+        changed = self._stroke(canvas, tool, 30, 30, 60, 60)
+        assert changed[20:80, 20:80].sum() > 0   # 中には効いている
+        outside = changed.copy()
+        outside[20:80, 20:80] = False
+        assert outside.sum() == 0                # 外へは漏れない
+
+    def test_lasso_selection_clips_to_shape(self, canvas):
+        """投げなわ選択では、矩形ではなくその形でクリップされる。"""
+        from PyQt6.QtCore import QRect, QPoint
+        from canvas import _mask_from_polygon
+        tri = [QPoint(20, 20), QPoint(100, 20), QPoint(20, 100)]
+        canvas._lasso_mask = _mask_from_polygon(tri, W, H)
+        canvas._selection_rect = QRect(20, 20, 80, 80)
+        canvas.tool = Tool.PEN
+        canvas.pen_size = 8
+        canvas.pen_color = QColor(255, 0, 0)
+        t = canvas._c2w()
+        a = t.map(QPointF(30, 30))
+        b = t.map(QPointF(95, 95))
+        _press(canvas, a.x(), a.y())
+        _move(canvas, b.x(), b.y())
+        _release(canvas, b.x(), b.y())
+        drawn = self._arr(canvas.layer_stack.active.image)[..., 3] > 0
+        mask = self._arr(canvas._lasso_mask)[..., 3] > 0
+        assert drawn.sum() > 0
+        assert (drawn & ~mask).sum() == 0
+
+    def test_no_selection_draws_normally(self, canvas):
+        """選択が無ければ従来どおりどこでも描ける（回帰防止）。"""
+        canvas._selection_rect = None
+        changed = self._stroke(canvas, Tool.PEN, 100, 100, 150, 150)
+        assert changed.sum() > 0
+
+
 # ── 移動ツールと選択範囲 ──────────────────────────────────────────────────────
 
 class TestMoveToolWithSelection:
