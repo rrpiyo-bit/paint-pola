@@ -939,6 +939,9 @@ class Canvas(QWidget):
         snap = {
             "layers": [self._snapshot_layer(l) for l in ls.layers],
             "active_path": list(ls.active_path),
+            # キャンバスサイズも一緒に控える。サイズ変更を元に戻したとき、
+            # 画像だけ旧サイズに戻ってキャンバスと食い違うのを防ぐ。
+            "canvas_size": (ls.width, ls.height),
         }
         self._history.append(("structure", snap))
         self._redo_stack.clear()
@@ -947,6 +950,10 @@ class Canvas(QWidget):
 
     def _apply_structure_snapshot(self, snap: dict):
         ls = self.layer_stack
+        size = snap.get("canvas_size")
+        if size and (ls.width, ls.height) != tuple(size):
+            ls.width, ls.height = int(size[0]), int(size[1])
+            self._update_size()
         ls.layers = [self._restore_layer(s) for s in snap["layers"]]
         path = list(snap.get("active_path") or [snap.get("active_index", 0)])
         if path:
@@ -1010,6 +1017,7 @@ class Canvas(QWidget):
             current_snap = {
                 "layers": [self._snapshot_layer(l) for l in self.layer_stack.layers],
                 "active_path": list(self.layer_stack.active_path),
+                "canvas_size": (self.layer_stack.width, self.layer_stack.height),
             }
             self._redo_stack.append(("structure", current_snap))
             self._apply_structure_snapshot(snap)
@@ -1041,6 +1049,7 @@ class Canvas(QWidget):
             current_snap = {
                 "layers": [self._snapshot_layer(l) for l in self.layer_stack.layers],
                 "active_path": list(self.layer_stack.active_path),
+                "canvas_size": (self.layer_stack.width, self.layer_stack.height),
             }
             self._history.append(("structure", current_snap))
             self._apply_structure_snapshot(snap)

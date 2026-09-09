@@ -291,7 +291,7 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-**615テスト** / 7ファイル / 全テストPASS
+**619テスト** / 7ファイル / 全テストPASS
 
 テスト中のウィンドウは既定でオフスクリーン描画され、実画面には表示されない。
 目視確認したいときだけ `PAINTPOLA_TEST_GUI=1` を付けて実行する。
@@ -305,7 +305,7 @@ python -m pytest tests/ -v
 | test_unit_layer.py | 78 | Layer / GroupLayer / LayerStack のデータ操作 |
 | test_unit_canvas_logic.py | 73 | フラッドフィル（バケツ塗り）・隙間閉じ・薄い線判定・白背景の地色判別・囲み内塗りつぶしアルゴリズム |
 | test_rasterize.py | 7 | レイヤーラスタライズ・統合時のエフェクト焼き込み |
-| test_component_canvas.py | 85 | Canvas ウィジェットの操作・状態管理・履歴メモリ上限 |
+| test_component_canvas.py | 89 | Canvas ウィジェットの操作・状態管理・履歴メモリ上限 |
 | test_animation.py | 24 | AnimationPanel のフレーム管理・再生・GIF出力 |
 | test_e2e.py | 121 | MainWindow を通じた実際のユーザー操作フロー・線画抽出・ズームの中心維持・方眼・テーマ分離 |
 | test_actions.py | 227 | 全アクション+アクションガチャ全機能の検証 |
@@ -461,7 +461,7 @@ paint_pola/
 ├── generate_samples.py   # サンプル画像生成 (370行)
 ├── start.bat             # 起動スクリプト
 ├── images/               # アイコン・サンプル出力先
-└── tests/                # テスト (615件, 8091行)
+└── tests/                # テスト (619件, 8148行)
 ```
 
 合計: 約 15,000 行（プロダクション） + 5,950 行（テスト）

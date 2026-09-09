@@ -1968,6 +1968,12 @@ class MainWindow(QMainWindow):
         if new_w == self.layer_stack.width and new_h == self.layer_stack.height:
             return
 
+        # 変形や選択範囲を抱えたままサイズを変えると、古い座標のまま残って
+        # 見えない位置に選択範囲が残るので、先に片付ける。
+        self.canvas.reset_state()
+        # サイズ変更を元に戻せるようにしておく。
+        self.canvas.save_structure_history()
+
         old_w, old_h = self.layer_stack.width, self.layer_stack.height
         ax, ay = anchor
 
@@ -2013,15 +2019,18 @@ class MainWindow(QMainWindow):
                 lyr.offset_x = 0
                 lyr.offset_y = 0
 
-        for layer in self.layer_stack.layers:
-            if layer.is_group:
-                layer._w = new_w  # type: ignore
-                layer._h = new_h  # type: ignore
-                for child in layer.children:  # type: ignore
-                    if not child.is_group:
-                        _resize_layer_image(child, new_w, new_h, mode == "scale")
-            else:
-                _resize_layer_image(layer, new_w, new_h, mode == "scale")
+        def _resize_items(items):
+            for layer in items:
+                if layer.is_group:
+                    layer._w = new_w  # type: ignore
+                    layer._h = new_h  # type: ignore
+                    # 子グループの中のレイヤーも再帰してリサイズする。抜けると
+                    # そのレイヤーだけ旧サイズのままになる。
+                    _resize_items(layer.children)  # type: ignore
+                else:
+                    _resize_layer_image(layer, new_w, new_h, mode == "scale")
+
+        _resize_items(self.layer_stack.layers)
 
         self.layer_stack.width = new_w
         self.layer_stack.height = new_h

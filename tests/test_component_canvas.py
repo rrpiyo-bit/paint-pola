@@ -835,3 +835,60 @@ class TestFillReference:
         c = Canvas(ls)
         c.resize(100, 100)
         assert c._build_fill_reference(other) is None
+
+
+class TestResizeCanvas:
+    """キャンバスサイズ変更が他の機能とかみ合っているか。"""
+
+    def _setup(self, monkeypatch):
+        import main
+        from PyQt6.QtWidgets import QDialog
+        from PyQt6.QtGui import QImage
+        w = main.MainWindow()
+        ls = w.layer_stack
+        ls.width = ls.height = 100
+        w.canvas._update_size()
+        for lyr in ls.layers:
+            lyr.image = QImage(100, 100, QImage.Format.Format_ARGB32)
+            lyr.image.fill(Qt.GlobalColor.transparent)
+        monkeypatch.setattr(main.ResizeCanvasDialog, "exec",
+                            lambda self: QDialog.DialogCode.Accepted)
+        monkeypatch.setattr(main.ResizeCanvasDialog, "values",
+                            lambda self: (200, 200, "crop", (0, 0)))
+        return w, ls
+
+    def test_nested_group_layers_are_resized(self, monkeypatch):
+        from PyQt6.QtCore import QSize
+        from layer import Layer, GroupLayer
+        w, ls = self._setup(monkeypatch)
+        outer = GroupLayer("outer", 100, 100)
+        inner_group = GroupLayer("inner", 100, 100)
+        leaf = Layer("leaf", 100, 100)
+        inner_group.children = [leaf]
+        outer.children = [inner_group]
+        ls.layers.append(outer)
+        w._resize_canvas()
+        assert leaf.image.size() == QSize(200, 200)
+
+    def test_selection_is_cleared(self, monkeypatch):
+        from PyQt6.QtCore import QRect
+        w, ls = self._setup(monkeypatch)
+        w.canvas._selection_rect = QRect(10, 10, 30, 30)
+        w._resize_canvas()
+        assert w.canvas._selection_rect is None
+
+    def test_undo_restores_canvas_size_and_images(self, monkeypatch):
+        w, ls = self._setup(monkeypatch)
+        w._resize_canvas()
+        assert (ls.width, ls.height) == (200, 200)
+        w.canvas.undo()
+        assert (ls.width, ls.height) == (100, 100)
+        assert ls.active.image.width() == ls.width
+
+    def test_redo_returns_to_new_size(self, monkeypatch):
+        w, ls = self._setup(monkeypatch)
+        w._resize_canvas()
+        w.canvas.undo()
+        w.canvas.redo()
+        assert (ls.width, ls.height) == (200, 200)
+        assert ls.active.image.width() == ls.width
