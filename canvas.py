@@ -1638,6 +1638,15 @@ class Canvas(QWidget):
                     self._move_base_pos = cp
                     self._drawing = True
             elif layer and not layer.is_group:
+                if self._selection_rect and self._selection_rect.contains(cp):
+                    # 選択範囲の中を掴んだら、レイヤー全体ではなく選択部分だけを
+                    # 動かす。ここを見ていないと「選択したのに選択外も一緒に
+                    # 動く」ことになる（選択ツール側と同じ挙動に合わせる）。
+                    self._save_history()
+                    self._lift_selection(layer)  # type: ignore
+                    self._begin_transform_drag('move', wp)
+                    self._drawing = True
+                    return
                 self._save_history()
                 self._move_base_image = layer.image  # type: ignore
                 self._move_base_offset = (layer.offset_x, layer.offset_y)  # type: ignore

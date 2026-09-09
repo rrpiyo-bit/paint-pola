@@ -1246,6 +1246,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.layer_structure_changed.connect(self.canvas.purge_orphan_history)
         self.layer_panel.structure_will_change.connect(self.canvas.save_structure_history)
         self.layer_panel.merge_down_requested.connect(self._merge_down)
+        self.layer_panel.merge_marked_requested.connect(self._merge_marked_layers)
         self.layer_panel.merge_all_requested.connect(self._merge_all_visible)
         self.layer_panel.merge_folder_requested.connect(self._merge_selected)
         self.layer_panel.select_alpha_requested.connect(self.canvas.select_layer_alpha)
@@ -2141,6 +2142,30 @@ class MainWindow(QMainWindow):
         else:
             self._history_pop_last_structure()
             self.statusBar().showMessage("下に統合できません（グループと通常レイヤーは統合不可）", 3000)
+
+    def _merge_marked_layers(self):
+        """レイヤーパネルで ⛓ を付けたレイヤーだけを統合する。"""
+        targets = self.layer_panel._collect_marked()
+        if len(targets) < 2:
+            self.statusBar().showMessage(
+                "統合するレイヤーに ⛓ を2枚以上付けてください", 3000)
+            return
+        self.canvas.reset_state()
+        self.canvas.save_structure_history()
+        if self.layer_stack.merge_marked(targets):
+            # 統合後に残ったレイヤーへ印が残らないようにする
+            for lyr in targets:
+                lyr.merge_marked = False
+            active = self.layer_stack.active
+            if active:
+                active.merge_marked = False
+            self.layer_panel.refresh()
+            self.canvas.update()
+            self.navigator.refresh()
+        else:
+            self._history_pop_last_structure()
+            self.statusBar().showMessage(
+                "統合できません（同じ階層で連続した通常レイヤーを選んでください）", 3000)
 
     def _merge_all_visible(self):
         self.canvas.reset_state()

@@ -315,6 +315,78 @@ class TestLayerStack:
         assert ls.merge_down() is True
         assert px(ls.layers[0].image, 50, 50).red() > 200
 
+    def test_merge_marked_two_layers(self):
+        ls = LayerStack(W, H)
+        a = ls.add("A")
+        b = ls.add("B")   # index0（上）
+        assert ls.merge_marked([a, b]) is True
+        assert len(ls.layers) == 1
+
+    def test_merge_marked_keeps_clipping_mask(self):
+        """クリッピングして一部だけ色を変えた状態が統合後も保たれる。"""
+        from PyQt6.QtGui import QPainter
+        ls = LayerStack(W, H)
+        base = ls.add("base")
+        top = ls.add("top")
+        top.clipping = True
+        p = QPainter(base.image)
+        p.fillRect(0, 0, 20, 20, QColor(0, 0, 255, 255))
+        p.end()
+        p = QPainter(top.image)
+        p.fillRect(0, 0, 80, 80, QColor(255, 0, 0, 255))
+        p.end()
+        assert ls.merge_marked([base, top]) is True
+        merged = ls.layers[0]
+        assert px(merged.image, 5, 5).red() > 200      # 下の絵の上は赤
+        assert px(merged.image, 50, 50).alpha() == 0   # はみ出しは残らない
+
+    def test_merge_marked_three_contiguous(self):
+        ls = LayerStack(W, H)
+        a = ls.add("A")
+        b = ls.add("B")
+        c = ls.add("C")   # 上から C, B, A
+        assert ls.merge_marked([a, b, c]) is True
+        assert len(ls.layers) == 1
+
+    def test_merge_marked_rejects_non_contiguous(self):
+        """間に対象外を挟むと重なり順が壊れるので拒否する。"""
+        ls = LayerStack(W, H)
+        a = ls.add("A")
+        b = ls.add("B")
+        c = ls.add("C")
+        assert ls.merge_marked([a, c]) is False
+        assert len(ls.layers) == 3
+
+    def test_merge_marked_rejects_single(self):
+        ls = LayerStack(W, H)
+        a = ls.add("A")
+        ls.add("B")
+        assert ls.merge_marked([a]) is False
+
+    def test_merge_marked_rejects_group(self):
+        ls = LayerStack(W, H)
+        g = ls.add_group("G")
+        a = ls.add("A")
+        assert ls.merge_marked([a, g]) is False
+
+    def test_merge_marked_rejects_across_containers(self):
+        """フォルダの中と外にまたがる場合は拒否する。"""
+        ls = LayerStack(W, H)
+        g = ls.add_group("G")
+        inner = Layer("inner", W, H)
+        g.children.append(inner)
+        outer = ls.add("outer")
+        assert ls.merge_marked([inner, outer]) is False
+
+    def test_merge_marked_inside_group(self):
+        ls = LayerStack(W, H)
+        g = ls.add_group("G")
+        c1 = Layer("c1", W, H)
+        c2 = Layer("c2", W, H)
+        g.children.extend([c1, c2])
+        assert ls.merge_marked([c1, c2]) is True
+        assert len(g.children) == 1
+
     def test_merge_down_fails_at_bottom(self):
         ls = LayerStack(W, H)
         ls.add("A")

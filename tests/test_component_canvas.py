@@ -294,6 +294,57 @@ class TestSelectRect:
             assert sel.width() > 0 and sel.height() > 0
 
 
+# ── 移動ツールと選択範囲 ──────────────────────────────────────────────────────
+
+class TestMoveToolWithSelection:
+    """移動ツールで選択範囲の中を掴んだら、選択部分だけが動く。
+
+    ここが効かないと、選択したのにレイヤー全体（＝選択外も）が動いてしまう。
+    """
+
+    def _wp(self, canvas, cx, cy):
+        """キャンバス座標 → ウィジェット座標（拡大・スクロールを考慮）。"""
+        return canvas._c2w().map(QPointF(cx, cy))
+
+    def _setup(self, canvas, sel_rect):
+        from PyQt6.QtGui import QPainter
+        layer = canvas.layer_stack.active
+        p = QPainter(layer.image)
+        p.fillRect(0, 0, 200, 200, QColor(255, 0, 0, 255))
+        p.end()
+        canvas._selection_rect = sel_rect
+        canvas.tool = Tool.MOVE
+        return layer
+
+    def test_drag_inside_selection_lifts_only_selection(self, canvas):
+        from PyQt6.QtCore import QRect
+        self._setup(canvas, QRect(20, 20, 40, 40))
+        w = self._wp(canvas, 30, 30)
+        _press(canvas, w.x(), w.y())
+        # 選択範囲だけが持ち上がり、レイヤー全体の移動は始まっていない
+        assert canvas._transform_image is not None
+        assert canvas._move_base_image is None
+        # 持ち上がった画像は選択範囲のサイズ
+        assert canvas._transform_image.width() == 40
+        assert canvas._transform_image.height() == 40
+
+    def test_drag_outside_selection_moves_whole_layer(self, canvas):
+        """選択範囲の外を掴んだ場合は従来どおりレイヤー全体が動く（回帰防止）。"""
+        from PyQt6.QtCore import QRect
+        self._setup(canvas, QRect(150, 150, 40, 40))
+        w = self._wp(canvas, 30, 30)
+        _press(canvas, w.x(), w.y())
+        assert canvas._transform_image is None
+        assert canvas._move_base_image is not None
+
+    def test_no_selection_moves_whole_layer(self, canvas):
+        """選択が無ければ従来どおりレイヤー全体が動く（回帰防止）。"""
+        self._setup(canvas, None)
+        w = self._wp(canvas, 30, 30)
+        _press(canvas, w.x(), w.y())
+        assert canvas._move_base_image is not None
+
+
 # ── グループ描画禁止メッセージ ────────────────────────────────────────────────
 
 class TestGroupLayerDrawBlocked:

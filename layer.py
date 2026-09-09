@@ -30,6 +30,8 @@ class Layer:
         self.opacity = 255
         self.clipping = False
         self.reference = False
+        # レイヤーパネルの「統合対象」チェック。ファイルには保存しない一時的な印。
+        self.merge_marked = False
         self.offset_x: int = 0
         self.offset_y: int = 0
         self.image = QImage(w, h, QImage.Format.Format_ARGB32)
@@ -604,6 +606,57 @@ class LayerStack:
             new_idx = idx - 1 if idx > 0 else 0
             self.active_path = parent_path + [new_idx]
         return True
+
+    def merge_marked(self, targets: list) -> bool:
+        """指定したレイヤーだけを1枚に統合する。成功すれば True。
+
+        条件: 2枚以上あり、すべて同じ親の中で連続していて、グループを含まないこと。
+        （離れたレイヤーを統合すると間に挟まれたレイヤーの重なり順が壊れるため、
+        他のお絵かきソフトと同じく連続したものだけを対象にする。）
+
+        統合は下から順に merge_down を繰り返すだけなので、クリッピングの
+        マスク処理や効果の焼き込みはそのまま引き継がれる。参照レイヤーに
+        クリッピングして一部だけ色を変えている場合も、その見た目が保たれる。
+        """
+        if len(targets) < 2:
+            return False
+        if any(t.is_group for t in targets):
+            return False
+
+        # 全員が同じ親の中にいて、連続しているか確認する
+        paths = [self.path_of(t) for t in targets]
+        if any(p is None for p in paths):
+            return False
+        parents = {tuple(p[:-1]) for p in paths}  # type: ignore
+        if len(parents) != 1:
+            return False
+        idxs = sorted(p[-1] for p in paths)  # type: ignore
+        if idxs != list(range(idxs[0], idxs[0] + len(idxs))):
+            return False
+
+        parent_path = list(parents.pop())
+        # 上から順に「下に統合」を繰り返す。1回統合するたびに下側へ詰まるので、
+        # 常に同じ添字（一番上の対象）を指定すればよい。
+        top = idxs[0]
+        for _ in range(len(idxs) - 1):
+            self.active_path = parent_path + [top]
+            if not self.merge_down():
+                return False
+        self.active_path = parent_path + [top]
+        return True
+
+    def path_of(self, target) -> list | None:
+        """レイヤーの位置（インデックスの並び）を返す。見つからなければ None。"""
+        def _walk(items: list, prefix: list) -> list | None:
+            for i, lyr in enumerate(items):
+                if lyr is target:
+                    return prefix + [i]
+                if lyr.is_group:
+                    found = _walk(lyr.children, prefix + [i])  # type: ignore
+                    if found is not None:
+                        return found
+            return None
+        return _walk(self.layers, [])
 
     def merge_all_visible(self) -> bool:
         """表示中のレイヤーを1枚に統合する。非表示レイヤーは破棄せず下に残す。

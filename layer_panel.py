@@ -51,6 +51,7 @@ class LayerRow(QWidget):
     visibility_changed = pyqtSignal(object, bool)        # (layer, visible)
     clipping_changed   = pyqtSignal(object, bool)
     reference_changed  = pyqtSignal(object, bool)
+    marked_changed     = pyqtSignal(object, bool)        # (layer,) 統合対象チェック
     rename_requested   = pyqtSignal(object)              # (layer,)
     select_requested   = pyqtSignal(object)              # (layer,)
     select_alpha_requested = pyqtSignal(object)           # (layer,) サムネイルCtrlクリック
@@ -146,6 +147,19 @@ class LayerRow(QWidget):
         self._ref.toggled.connect(
             lambda s: self.reference_changed.emit(self._layer, s))
         icon_row.addWidget(self._ref)
+
+        # 統合対象マーク（複数選んで「選択レイヤーを統合」で使う）。
+        # グループは統合対象外なので出さない。
+        if not self._layer.is_group:
+            self._mark = QPushButton("⛓")
+            self._mark.setCheckable(True)
+            self._mark.setChecked(getattr(self._layer, 'merge_marked', False))
+            self._mark.setToolTip("統合対象にする（複数選んで「⛓ 選択レイヤーを統合」）")
+            self._mark.setStyleSheet(_ICON_BTN_CSS)
+            self._mark.toggled.connect(
+                lambda s: self.marked_changed.emit(self._layer, s))
+            icon_row.addWidget(self._mark)
+
         icon_row.addStretch()
         right.addLayout(icon_row)
 
@@ -221,6 +235,7 @@ class LayerPanel(QWidget):
     layer_structure_changed = pyqtSignal()  # 削除・統合など構造変化時のみ
     structure_will_change = pyqtSignal()    # 構造変更直前（undo用スナップショット）
     merge_down_requested = pyqtSignal()
+    merge_marked_requested = pyqtSignal()  # ⛓ を付けたレイヤーだけ統合
     merge_all_requested = pyqtSignal()
     merge_folder_requested = pyqtSignal()
     select_alpha_requested = pyqtSignal(object)          # (layer,) サムネイルCtrlクリック
@@ -277,6 +292,7 @@ class LayerPanel(QWidget):
             ("⏬", self._merge_down, "下に統合"),
             ("👁", self._merge_all_visible, "表示統合"),
             ("🗂", self._merge_folder, "フォルダ統合"),
+            ("⛓", self._merge_marked, "選択レイヤーを統合（⛓ を付けた2枚以上）"),
         ]:
             b = QPushButton(icon)
             b.setFixedSize(22, 18)
@@ -542,6 +558,7 @@ class LayerPanel(QWidget):
         row.visibility_changed.connect(self._on_visibility)
         row.clipping_changed.connect(self._on_clipping)
         row.reference_changed.connect(self._on_reference)
+        row.marked_changed.connect(self._on_marked)
         row.rename_requested.connect(self._on_rename)
         row.select_requested.connect(self._on_select)
         row.select_alpha_requested.connect(self.select_alpha_requested)
@@ -827,6 +844,25 @@ class LayerPanel(QWidget):
     def _on_reference(self, layer: Layer | GroupLayer, reference: bool):
         layer.reference = reference
         self.layers_changed.emit()
+
+    def _on_marked(self, layer: Layer | GroupLayer, marked: bool):
+        layer.merge_marked = marked
+
+    def _collect_marked(self) -> list:
+        """統合対象マークが付いた通常レイヤーを、表示順に集める。"""
+        found = []
+
+        def _walk(items: list):
+            for lyr in items:
+                if lyr.is_group:
+                    _walk(lyr.children)
+                elif getattr(lyr, 'merge_marked', False):
+                    found.append(lyr)
+        _walk(self.layer_stack.layers)
+        return found
+
+    def _merge_marked(self):
+        self.merge_marked_requested.emit()
 
     def _on_opacity(self, value: int):
         active = self.layer_stack.active
