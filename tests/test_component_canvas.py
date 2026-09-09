@@ -924,3 +924,49 @@ class TestResizeCanvas:
             for i in range(im.n_frames):
                 im.seek(i)
                 assert im.size == (100, 100)
+
+
+class TestHiddenLayerIsNotDrawable:
+    """非表示のレイヤーに描けてしまわないか。"""
+
+    def _press(self, c, x, y):
+        from PyQt6.QtCore import QPointF, QEvent
+        pt = c._c2w().map(QPointF(x, y))
+        c.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, pt, pt,
+                                      Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                                      Qt.KeyboardModifier.NoModifier))
+        c.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, pt, pt,
+                                        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+                                        Qt.KeyboardModifier.NoModifier))
+
+    def _arr(self, im):
+        import numpy as np
+        im = im.convertToFormat(QImage.Format.Format_ARGB32)
+        b = im.constBits()
+        b.setsize(im.height() * im.width() * 4)
+        return np.frombuffer(b, dtype=np.uint8).reshape(im.height(), im.width(), 4).copy()
+
+    def _canvas(self):
+        ls = LayerStack(100, 100)
+        ls.add("L")
+        c = Canvas(ls)
+        c.resize(100, 100)
+        c.tool = Tool.PEN
+        c.pen_size = 10
+        c.pen_color = QColor(0, 255, 0)
+        return ls, c
+
+    def test_hidden_layer_is_untouched(self):
+        import numpy as np
+        ls, c = self._canvas()
+        ls.active.visible = False
+        before = self._arr(ls.active.image)
+        self._press(c, 50, 50)
+        assert np.array_equal(self._arr(ls.active.image), before)
+
+    def test_visible_layer_still_draws(self):
+        import numpy as np
+        ls, c = self._canvas()
+        before = self._arr(ls.active.image)
+        self._press(c, 50, 50)
+        assert not np.array_equal(self._arr(ls.active.image), before)

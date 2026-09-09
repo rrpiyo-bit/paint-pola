@@ -1752,6 +1752,12 @@ class Canvas(QWidget):
                 self.status_message.emit("グループレイヤーには描画できません。子レイヤーを選択してください。")
             return
 
+        # 見えていないレイヤーに描けてしまうと、画面に何も出ないまま筆跡だけが
+        # 残り、後で表示に戻したときに覚えのない線が現れる。他のソフトと同じく止める。
+        if not layer.visible:
+            self.status_message.emit("非表示のレイヤーには描画できません。目マークを押して表示してください。")
+            return
+
         self._drawing = True
 
         # 描く前にレイヤー画像を必要なだけ広げる（移動後などで筆跡が
