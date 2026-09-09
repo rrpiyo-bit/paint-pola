@@ -2032,6 +2032,24 @@ class MainWindow(QMainWindow):
 
         _resize_items(self.layer_stack.layers)
 
+        # アニメのコマもレイヤーと同じように新サイズへ合わせる。
+        # 旧サイズのコマが混ざると、GIF書き出しでコマが黙って落ちたり
+        # オニオンスキンがずれた位置に出たりする。
+        for i, frame in enumerate(self.anim_panel.frames):
+            buf = QImage(new_w, new_h, QImage.Format.Format_ARGB32_Premultiplied)
+            buf.fill(Qt.GlobalColor.transparent)
+            fp = QPainter(buf)
+            if mode == "scale":
+                fp.drawImage(0, 0, frame.scaled(
+                    new_w, new_h,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+            else:
+                fp.drawImage(offset_x, offset_y, frame)
+            fp.end()
+            self.anim_panel.frames[i] = buf.convertToFormat(QImage.Format.Format_ARGB32)
+        self.anim_panel._rebuild_thumbs()
+
         self.layer_stack.width = new_w
         self.layer_stack.height = new_h
         self.canvas._update_size()

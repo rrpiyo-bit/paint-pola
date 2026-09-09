@@ -401,8 +401,16 @@ class AnimationPanel(QWidget):
             QMessageBox.warning(self, "エラー",
                                 "GIF書き出しには Pillow が必要です。\npip install Pillow")
             return
+        # GIFは全コマが同じ大きさでないといけない。サイズ違いのコマが
+        # 混ざると Pillow が黙って落とし、1コマだけのGIFになってしまうので、
+        # 先頭のコマの大きさに揃えておく。
+        base_size = self.frames[0].size()
         pil_frames: list[Image.Image] = []
         for qimg in self.frames:
+            if qimg.size() != base_size:
+                qimg = qimg.scaled(base_size,
+                                   Qt.AspectRatioMode.IgnoreAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
             img = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
             w, h = img.width(), img.height()
             ptr = img.bits()

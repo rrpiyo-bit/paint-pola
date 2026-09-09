@@ -892,3 +892,35 @@ class TestResizeCanvas:
         w.canvas.redo()
         assert (ls.width, ls.height) == (200, 200)
         assert ls.active.image.width() == ls.width
+
+    def test_animation_frames_follow_canvas_resize(self, monkeypatch):
+        from PyQt6.QtCore import QSize
+        w, ls = self._setup(monkeypatch)
+        w.anim_panel._on_add_frame()
+        w.anim_panel._on_add_frame()
+        assert [f.size() for f in w.anim_panel.frames] == [QSize(100, 100)] * 2
+        w._resize_canvas()
+        assert [f.size() for f in w.anim_panel.frames] == [QSize(200, 200)] * 2
+
+    def test_gif_export_normalizes_mismatched_frames(self, monkeypatch, tmp_path):
+        pytest.importorskip("PIL")
+        from PyQt6.QtWidgets import QMessageBox
+        from PyQt6.QtGui import QImage
+        from PyQt6.QtCore import Qt
+        monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+        w, ls = self._setup(monkeypatch)
+        ap = w.anim_panel
+        for col, size in ((Qt.GlobalColor.red, 100), (Qt.GlobalColor.green, 200),
+                          (Qt.GlobalColor.blue, 100)):
+            img = QImage(size, size, QImage.Format.Format_ARGB32)
+            img.fill(col)
+            ap.frames.append(img)
+        path = str(tmp_path / "a.gif")
+        ap._export_gif_to(path)
+        from PIL import Image
+        with Image.open(path) as im:
+            assert im.n_frames == 3
+            for i in range(im.n_frames):
+                im.seek(i)
+                assert im.size == (100, 100)
