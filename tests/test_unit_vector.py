@@ -419,6 +419,56 @@ class TestCanvasIntegration:
         c.apply_color_to_selected_stroke()
         assert lyr.strokes[0].color == (255, 0, 0, 255)
 
+    def test_delpoint_mode_deletes_on_plain_click(self):
+        """「制御点を削除」の役割なら、Alt を押さなくても点が消える。"""
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        self.press_mod(c, 50, 50)          # 線を選ぶ
+        c.set_vector_pen_mode("delpoint")
+        self.press_mod(c, 50, 50)          # 真ん中の点をただクリック
+        assert len(s.points) == 2
+        assert len(s.handles) == 2
+
+    def test_delpoint_mode_refuses_below_two_points(self):
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        del s.points[2]
+        del s.handles[2]
+        self.press_mod(c, 50, 50)
+        c.set_vector_pen_mode("delpoint")
+        self.press_mod(c, 50, 50)
+        assert len(s.points) == 2
+
+    def test_delpoint_mode_does_not_drag_points(self):
+        """消す役割のときに点を掴んでしまうと、消すつもりが動いてしまう。"""
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        self.press_mod(c, 50, 50)
+        c.set_vector_pen_mode("delpoint")
+        self.press_mod(c, 20, 50)          # 端の点（消すと2点になる）
+        assert c._vector_drag is None
+
+    def test_delpoint_mode_keeps_selection_visible(self):
+        """役割を変えただけでは選択は外れない（続けて点を消せるように）。"""
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        self.press_mod(c, 50, 50)
+        c.set_vector_pen_mode("delpoint")
+        assert c._vector_selected is s
+
+    def test_delpoint_mode_can_still_select_another_line(self):
+        c, lyr = self.select_setup()
+        other = VectorStroke(points=[(20.0, 20.0), (80.0, 20.0)], width=6.0)
+        lyr.add_stroke(other)
+        c.set_vector_pen_mode("delpoint")
+        self.press_mod(c, 50, 20)
+        assert c._vector_selected is other
+
+    def test_unknown_mode_falls_back_to_draw(self):
+        c, lyr = self.select_setup()
+        c.set_vector_pen_mode("なにこれ")
+        assert c.vector_pen_mode == "draw"
+
     def test_switching_to_draw_mode_clears_selection(self):
         c, lyr = self.select_setup()
         self.press_mod(c, 50, 50)

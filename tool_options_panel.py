@@ -446,21 +446,26 @@ class ToolOptionsPanel(QWidget):
     def _build_vector_pen(self, pen_size: int, mode: str, selected):
         """ベクターレイヤー選択中のペンの設定。
 
-        描くモードと選ぶモードを切り替えて使う。選ぶモードでは、
+        描く・選ぶ・制御点を削除する の3つを切り替えて使う。選ぶモードでは、
         選んでいる線の太さ・色・形をここから直せる。
         """
+        modes = [("描く", "draw"),
+                 ("線を選んで直す", "select"),
+                 ("制御点を削除", "delpoint")]
         cb = QComboBox()
-        cb.addItem("描く", "draw")
-        cb.addItem("線を選んで直す", "select")
-        cb.setCurrentIndex(1 if mode == "select" else 0)
+        for label, key in modes:
+            cb.addItem(label, key)
+        keys = [k for _, k in modes]
+        cb.setCurrentIndex(keys.index(mode) if mode in keys else 0)
         cb.currentIndexChanged.connect(
             lambda i: self.vector_pen_mode_changed.emit(
                 cb.itemData(i)))
         self._add_row("ペンの役割", cb,
                       tooltip="「描く」で新しい線を引き、\n"
-                              "「線を選んで直す」で引いた線を編集します。")
+                              "「線を選んで直す」で引いた線を編集し、\n"
+                              "「制御点を削除」で点をクリックして減らします。")
 
-        if mode != "select":
+        if mode == "draw":
             self._add_spinbox("ブラシサイズ", pen_size, 1, 200,
                               lambda v: self.pen_size_changed.emit(v))
             self._add_label("ベクターレイヤーです。引いた線は\n"
@@ -468,6 +473,17 @@ class ToolOptionsPanel(QWidget):
             return
 
         self._add_separator()
+
+        if mode == "delpoint":
+            if selected is None:
+                self._add_label("線をクリックして選んでから、\n"
+                                "消したい制御点（□）をクリックします。")
+            else:
+                self._add_label(
+                    "制御点（□）をクリックすると消えます。\n"
+                    "点が2つになったら、それ以上は減りません。\n"
+                    "別の線に移るときは、その線をクリックします。")
+            return
 
         if selected is None:
             self._add_label("線をクリックすると選べます。\n"
@@ -496,6 +512,7 @@ class ToolOptionsPanel(QWidget):
             "制御点（□）をドラッグ＝形を変える\n"
             "Alt+Shift+クリック＝ハンドルの出し入れ\n"
             "Alt+クリック＝その点を削除\n"
+            "　（「制御点を削除」に切り替えても消せます）\n"
             "Shift+線の上をクリック＝点を追加\n"
             "ハンドル（○）をドラッグ＝曲がり具合\n"
             "　Alt を押しながらで片側だけ動く（角）")

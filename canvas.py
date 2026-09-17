@@ -1771,6 +1771,10 @@ class Canvas(QWidget):
 
     # ── ベクター編集（選択モード） ───────────────────────────────────────────
 
+    def _vector_editing(self) -> bool:
+        """ペンが「描く」ではなく線をいじる役割になっているか。"""
+        return self.vector_pen_mode in ("select", "delpoint")
+
     def _vector_tol(self) -> float:
         """掴む判定の許容量（キャンバス座標）。
 
@@ -1790,12 +1794,18 @@ class Canvas(QWidget):
         tol = self._vector_tol()
         alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
         shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        # 「制御点を削除」モードは、ずっと Alt を押しているのと同じ扱いにする。
+        # キーを押さえたまま何度もクリックするのは疲れるので、役割で選べるようにした。
+        delpoint = self.vector_pen_mode == "delpoint"
+        if delpoint:
+            alt, shift = True, False
         sel = self._vector_selected
 
         if sel is not None and sel in layer.strokes:
             # 1. ハンドルを掴む。ただし Alt+Shift は出し入れの合図なので、
             #    ハンドルが点の近くにあっても掴まずに 2. へ流す。
-            hit = None if (alt and shift) else nearest_handle(sel, x, y, tol)
+            #    点を消す役割のときは、ハンドルも掴まない（消すのが目的なので）。
+            hit = None if (alt and shift) or delpoint else nearest_handle(sel, x, y, tol)
             if hit is not None:
                 self._save_history()
                 self._vector_drag = ("handle", hit[0], hit[1])
@@ -1953,8 +1963,12 @@ class Canvas(QWidget):
         return layer
 
     def set_vector_pen_mode(self, mode: str):
-        """ベクターレイヤーでのペンの役割を切り替える（描く / 線を選ぶ）。"""
-        mode = "select" if mode == "select" else "draw"
+        """ベクターレイヤーでのペンの役割を切り替える。
+
+        描く / 線を選んで直す / 制御点を削除 の3つ。
+        """
+        if mode not in ("draw", "select", "delpoint"):
+            mode = "draw"
         if mode == self.vector_pen_mode:
             return
         self.vector_pen_mode = mode
@@ -2175,7 +2189,7 @@ class Canvas(QWidget):
         loy = getattr(layer, 'offset_y', 0)
         lp = QPoint(cp.x() - lox, cp.y() - loy)
 
-        if self.tool == Tool.PEN and layer.is_vector and self.vector_pen_mode == "select":
+        if self.tool == Tool.PEN and layer.is_vector and self._vector_editing():
             self._vector_select_press(layer, cp, event)
 
         elif self.tool == Tool.PEN and layer.is_vector:
@@ -2418,7 +2432,7 @@ class Canvas(QWidget):
             return
 
         if self.tool == Tool.PEN and layer.is_vector:
-            if self.vector_pen_mode == "select":
+            if self._vector_editing():
                 self._vector_corner_drag = bool(
                     event.modifiers() & Qt.KeyboardModifier.AltModifier)
                 self._vector_drag_move(layer, cp)
@@ -2503,7 +2517,7 @@ class Canvas(QWidget):
         if not layer or layer.is_group:
             return
 
-        if self.tool == Tool.PEN and layer.is_vector and self.vector_pen_mode == "select":
+        if self.tool == Tool.PEN and layer.is_vector and self._vector_editing():
             self._end_vector_drag()
             return
 
