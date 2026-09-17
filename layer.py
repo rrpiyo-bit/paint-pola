@@ -265,6 +265,11 @@ class Layer:
     def is_group(self) -> bool:
         return False
 
+    @property
+    def is_vector(self) -> bool:
+        """ベクターレイヤーかどうか。is_group と同じように分岐に使う。"""
+        return False
+
 
 class GroupLayer:
     def __init__(self, name: str, w: int = CANVAS_W, h: int = CANVAS_H):
@@ -284,12 +289,20 @@ class GroupLayer:
     def is_group(self) -> bool:
         return True
 
+    @property
+    def is_vector(self) -> bool:
+        return False
+
     def resize(self, w: int, h: int):
         self._w = w
         self._h = h
         for child in self.children:
             if child.is_group:
                 child.resize(w, h)  # type: ignore
+            elif child.is_vector:
+                # ベクターは絵を差し替えても線から描き直されて元に戻るので、
+                # 新しいキャンバスの大きさを教えて描き直させる。
+                child.set_canvas_size(w, h)  # type: ignore
             else:
                 # 通常レイヤーの子も新サイズの画像に差し替える（crop モード）
                 new_img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)

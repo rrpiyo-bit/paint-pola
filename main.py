@@ -2,6 +2,7 @@ import sys
 import os
 import io
 import json
+import math
 import zipfile
 import cv2
 import numpy as np
@@ -18,6 +19,7 @@ from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
                           QFont, QPainter, QIcon, QImageReader)
 
 from layer import LayerStack, Layer, GroupLayer, CANVAS_W, CANVAS_H
+from vector import VectorLayer
 from animation_panel import AnimationPanel
 from canvas import Canvas
 from toolbar import Toolbar
@@ -1719,6 +1721,16 @@ class MainWindow(QMainWindow):
                         zf.writestr(fname, bytes(buf))
                         info["image"] = fname
                         img_index += 1
+                        if lyr.is_vector:
+                            # PNG も従来どおり書いてあるので、旧ビルドは
+                            # ラスター化された見た目で普通に開ける。
+                            info["is_vector"] = True
+                            info["strokes"] = [
+                                {"points": [[float(x), float(y)] for x, y in s.points],
+                                 "width": float(s.width),
+                                 "color": list(s.color),
+                                 "smooth": bool(s.smooth)}
+                                for s in lyr.strokes]
                     return info
 
                 meta["layers"] = [_write_layer(lyr) for lyr in ls.layers]
@@ -1755,6 +1767,56 @@ class MainWindow(QMainWindow):
         if not isinstance(name, str):
             name = "レイヤー"
         return name[:max_len]
+
+    @staticmethod
+    def _safe_strokes(raw) -> list:
+        """meta.json の strokes を安全に VectorStroke のリストへ変換する。
+        壊れた JSON でクラッシュさせないよう、型と個数と範囲をすべて見る。"""
+        from vector import VectorStroke
+        MAX_STROKES = 20000
+        MAX_POINTS = 20000
+        LIM = 100000.0
+        out: list[VectorStroke] = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw[:MAX_STROKES]:
+            if not isinstance(item, dict):
+                continue
+            pts_raw = item.get("points")
+            if not isinstance(pts_raw, list):
+                continue
+            pts: list[tuple[float, float]] = []
+            for pt in pts_raw[:MAX_POINTS]:
+                if not (isinstance(pt, (list, tuple)) and len(pt) >= 2):
+                    continue
+                try:
+                    x, y = float(pt[0]), float(pt[1])
+                except (TypeError, ValueError):
+                    continue
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+                pts.append((max(-LIM, min(LIM, x)), max(-LIM, min(LIM, y))))
+            if not pts:
+                continue
+            try:
+                width = float(item.get("width", 5.0))
+            except (TypeError, ValueError):
+                width = 5.0
+            if not math.isfinite(width):
+                width = 5.0
+            width = max(0.1, min(1000.0, width))
+            c = item.get("color")
+            if not (isinstance(c, (list, tuple)) and len(c) >= 3):
+                c = [0, 0, 0, 255]
+            try:
+                rgba = tuple(max(0, min(255, int(v))) for v in list(c[:4]))
+            except (TypeError, ValueError):
+                rgba = (0, 0, 0, 255)
+            if len(rgba) == 3:
+                rgba = rgba + (255,)
+            out.append(VectorStroke(points=pts, width=width, color=rgba,
+                                    smooth=bool(item.get("smooth", True))))
+        return out
 
     def _load_pola(self, path: str):
         """`.pola` ファイルを読み込んでレイヤースタックを再構築する。"""
@@ -1809,7 +1871,8 @@ class MainWindow(QMainWindow):
                             grp.children = [_read_layer(c) for c in children]
                         return grp
                     else:
-                        lyr = Layer(name, w, h)
+                        is_vec = bool(info.get("is_vector", False))
+                        lyr = VectorLayer(name, w, h) if is_vec else Layer(name, w, h)
                         lyr.visible = bool(info.get("visible", True))
                         lyr.opacity = self._clamp(info.get("opacity", 255), 0, 255, 255)
                         lyr.clipping = bool(info.get("clipping", False))
@@ -1864,6 +1927,13 @@ class MainWindow(QMainWindow):
                         if img.isNull():
                             raise ValueError(f"画像の読み込みに失敗: {safe_name}")
                         lyr.image = img.convertToFormat(QImage.Format.Format_ARGB32)
+                        if is_vec:
+                            # 線を優先する。PNG は trim で offset がずれていることがあり、
+                            # 座標系が食い違うので、必ず線から描き直させる。
+                            lyr.strokes = self._safe_strokes(info.get("strokes"))
+                            lyr.offset_x = 0
+                            lyr.offset_y = 0
+                            lyr.mark_dirty()
                         return lyr
 
                 raw_layers = meta.get("layers", [])
@@ -2033,6 +2103,22 @@ class MainWindow(QMainWindow):
         offset_y = _calc_offset(old_h, new_h, ay)
 
         def _resize_layer_image(lyr, nw: int, nh: int, scale_mode: bool):
+            if lyr.is_vector:
+                # 絵を差し替えても線から描き直されて元に戻るので、点のほうを動かす。
+                lox = getattr(lyr, 'offset_x', 0)
+                loy = getattr(lyr, 'offset_y', 0)
+                if scale_mode:
+                    sx = nw / old_w if old_w else 1.0
+                    sy = nh / old_h if old_h else 1.0
+                    if lox or loy:
+                        lyr.translate_strokes(lox, loy)
+                    lyr.scale_strokes(sx, sy)
+                else:
+                    lyr.translate_strokes(offset_x + lox, offset_y + loy)
+                lyr.offset_x = 0
+                lyr.offset_y = 0
+                lyr.set_canvas_size(nw, nh)
+                return
             new_img = QImage(nw, nh, QImage.Format.Format_ARGB32_Premultiplied)
             new_img.fill(Qt.GlobalColor.transparent)
             p = QPainter(new_img)

@@ -538,6 +538,12 @@ class Canvas(QWidget):
         self._path_pick_points: list[QPoint] = []
         self._path_pick_callback = None  # confirmed_points を受け取るコールバック
 
+        # ベクター描画中の点（キャンバス座標）。離すまでは image に描かず、
+        # ここに溜めてプレビュー表示する。None のときは描いていない。
+        self._vector_points: list[tuple[float, float]] | None = None
+        # 選んでいる線（オブジェクト参照で持つ。分割や削除で番号がずれるため）
+        self._vector_selected = None
+
         # transform (floating image)
         self._transform_image: QImage | None = None
         self._transform_rect: QRectF | None = None   # キャンバス座標系での AABB（回転前基準）
@@ -572,6 +578,8 @@ class Canvas(QWidget):
 
         # 移動ツール用：ドラッグ開始時の元画像とキャンバス座標での開始位置
         self._move_base_image: QImage | None = None
+        # 移動を始めた時点のベクター線（ベクターレイヤーのときだけ）
+        self._move_base_strokes = None
         self._move_base_pos: QPoint | None = None
         # グループ移動用：子レイヤー全員の元画像リスト
         self._move_group_bases: list[tuple[Layer, QImage, int, int]] | None = None
@@ -872,6 +880,10 @@ class Canvas(QWidget):
             img = entry[2]
             return img.sizeInBytes() if hasattr(img, "sizeInBytes") else 0
 
+        if entry[0] == "vector":
+            # 線は点の並びなので画像よりずっと軽い。1点あたり 24 バイト見当。
+            return sum(len(s.points) * 24 for s in entry[2])
+
         def _snap_bytes(snap) -> int:
             if snap.get("type") == "group":
                 return sum(_snap_bytes(c) for c in snap.get("children", []))
@@ -897,7 +909,12 @@ class Canvas(QWidget):
             return
         ox = getattr(layer, 'offset_x', 0)
         oy = getattr(layer, 'offset_y', 0)
-        self._history.append(("pixel", lid, layer.image.copy(), ox, oy))  # type: ignore
+        if layer.is_vector:
+            # ベクターは絵ではなく線を控える。絵は線から作り直せるので、
+            # こちらのほうが軽く、太さや形の変更も正しく戻せる。
+            self._history.append(("vector", lid, layer.copy_strokes(), ox, oy))  # type: ignore
+        else:
+            self._history.append(("pixel", lid, layer.image.copy(), ox, oy))  # type: ignore
         self._redo_stack.clear()
         self._trim_history()
         self.edited.emit()
@@ -913,7 +930,13 @@ class Canvas(QWidget):
                 "_w": lyr._w, "_h": lyr._h,
             }
         return {
-            "type": "layer", "name": lyr.name, "visible": lyr.visible,
+            "type": "vector" if lyr.is_vector else "layer",
+            # ベクターは線そのものを控える。絵だけ戻しても、次の描き直しで
+            # 元の線から作り直されてしまい、元に戻したことにならない。
+            "strokes": lyr.copy_strokes() if lyr.is_vector else None,
+            "canvas_size": ((lyr._canvas_w, lyr._canvas_h)
+                            if lyr.is_vector else None),
+            "name": lyr.name, "visible": lyr.visible,
             "opacity": lyr.opacity, "clipping": lyr.clipping,
             "reference": lyr.reference, "locked": lyr.locked,
             "image": lyr.image.copy(),
@@ -942,8 +965,16 @@ class Canvas(QWidget):
             g.collapsed = snap["collapsed"]
             g.children = [self._restore_layer(c) for c in snap["children"]]
             return g
-        lyr = Layer(snap["name"], snap["image"].width(), snap["image"].height())
-        lyr.image = snap["image"].copy()
+        if snap.get("type") == "vector":
+            from vector import VectorLayer
+            cw, ch = snap.get("canvas_size") or (snap["image"].width(),
+                                                 snap["image"].height())
+            lyr = VectorLayer(snap["name"], cw, ch)
+            lyr.strokes = [s.copy() for s in (snap.get("strokes") or [])]
+            lyr.mark_dirty()
+        else:
+            lyr = Layer(snap["name"], snap["image"].width(), snap["image"].height())
+            lyr.image = snap["image"].copy()
         for k in ("visible", "opacity", "clipping", "reference", "locked", "blend_mode",
                   "offset_x", "offset_y",
                   "border_enabled", "border_size", "border_color",
@@ -992,8 +1023,16 @@ class Canvas(QWidget):
 
     def purge_orphan_history(self):
         live = self._all_layer_ids()
-        self._history = [e for e in self._history if e[0] == "structure" or (e[0] == "pixel" and e[1] in live)]
-        self._redo_stack = [e for e in self._redo_stack if e[0] == "structure" or (e[0] == "pixel" and e[1] in live)]
+
+        def _alive(e) -> bool:
+            if e[0] == "structure":
+                return True
+            # pixel と vector はどちらもレイヤーに結びついているので、
+            # そのレイヤーが残っているものだけ残す。
+            return e[1] in live
+
+        self._history = [e for e in self._history if _alive(e)]
+        self._redo_stack = [e for e in self._redo_stack if _alive(e)]
 
     def _find_layer_by_id(self, layer_id: int) -> Layer | None:
         def _search(items):
@@ -1007,6 +1046,23 @@ class Canvas(QWidget):
             return None
         return _search(self.layer_stack.layers)
 
+    def _swap_vector_entry(self, entry, opposite: list) -> None:
+        """ベクター履歴を1件適用し、今の線を反対側のスタックへ積む。
+
+        undo と redo で向きが違うだけなので、ここにまとめておく。
+        """
+        _, lid, strokes, old_ox, old_oy = entry
+        layer = self._find_layer_by_id(lid)
+        if layer is None or not layer.is_vector:
+            return
+        opposite.append(("vector", lid, layer.copy_strokes(),
+                         getattr(layer, 'offset_x', 0),
+                         getattr(layer, 'offset_y', 0)))
+        layer.strokes = strokes  # type: ignore
+        layer.mark_dirty()  # type: ignore
+        # 選択していた線が消えた可能性があるので、掴んだままにしない。
+        self._vector_selected = None
+
     def undo(self):
         if self._transform_image:
             self.cancel_transform()
@@ -1014,7 +1070,9 @@ class Canvas(QWidget):
         if not self._history:
             return
         entry = self._history.pop()
-        if entry[0] == "pixel":
+        if entry[0] == "vector":
+            self._swap_vector_entry(entry, self._redo_stack)
+        elif entry[0] == "pixel":
             lid = entry[1]
             img = entry[2]
             old_ox = entry[3] if len(entry) > 3 else 0
@@ -1046,7 +1104,9 @@ class Canvas(QWidget):
         if not self._redo_stack:
             return
         entry = self._redo_stack.pop()
-        if entry[0] == "pixel":
+        if entry[0] == "vector":
+            self._swap_vector_entry(entry, self._history)
+        elif entry[0] == "pixel":
             lid = entry[1]
             img = entry[2]
             old_ox = entry[3] if len(entry) > 3 else 0
@@ -1138,6 +1198,9 @@ class Canvas(QWidget):
             p.setBrush(QColor(255, 120, 0, 220))
             for pt in self._path_pick_points:
                 p.drawEllipse(QPointF(pt), 4, 4)
+
+        # 確定前のベクター線
+        self._draw_vector_preview(p)
 
         p.restore()
 
@@ -1623,6 +1686,50 @@ class Canvas(QWidget):
         p.drawEllipse(pos, radius_w, radius_w)
         p.restore()
 
+    # ── ベクター描画 ──────────────────────────────────────────────────────────
+
+    def _draw_vector_preview(self, p: QPainter):
+        """確定前の線を描く。キャンバス座標系の painter に描くこと。
+
+        溜めている点をそのまま結ぶ。確定時は間引いてなめらかにするので
+        見た目は少し変わるが、描いている最中の手応えはこちらが素直。
+        """
+        if not self._vector_points:
+            return
+        from vector import VectorStroke, stroke_to_path, _pen_for
+        stroke = VectorStroke(points=list(self._vector_points),
+                              width=float(self.pen_size),
+                              color=(self.pen_color.red(), self.pen_color.green(),
+                                     self.pen_color.blue(), self.pen_color.alpha()))
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.strokePath(stroke_to_path(stroke), _pen_for(stroke))
+        p.restore()
+
+    def _commit_vector_stroke(self, layer):
+        """溜めた点を1本の線として確定する。"""
+        from vector import VectorStroke, simplify_input
+        pts = self._vector_points or []
+        self._vector_points = None
+        if not pts:
+            self.update()
+            return
+
+        width = float(self.pen_size)
+        points = simplify_input(pts, width)
+        if len(points) < 1:
+            self.update()
+            return
+
+        # 変更前の線を控えてから足す（履歴は変更前に積む決まり）。
+        self._save_history()
+        layer.add_stroke(VectorStroke(
+            points=points,
+            width=width,
+            color=(self.pen_color.red(), self.pen_color.green(),
+                   self.pen_color.blue(), self.pen_color.alpha())))
+        self.update()
+
     def _rotation_handle_canvas(self) -> QPointF | None:
         """上辺中点から回転方向に 30px 離れた回転ハンドル位置（キャンバス座標系）。"""
         if not self._transform_rect:
@@ -1726,6 +1833,9 @@ class Canvas(QWidget):
                     return
                 self._save_history()
                 self._move_base_image = layer.image  # type: ignore
+                # ベクターは点を動かすので、掴んだ時点の線を控えておく。
+                self._move_base_strokes = (
+                    layer.copy_strokes() if layer.is_vector else None)  # type: ignore
                 self._move_base_offset = (layer.offset_x, layer.offset_y)  # type: ignore
                 self._move_base_pos = cp
                 self._last_pos = cp
@@ -1749,6 +1859,17 @@ class Canvas(QWidget):
             self.status_message.emit("非表示のレイヤーには描画できません。目マークを押して表示してください。")
             return
 
+        # ベクターレイヤーは線から絵を描き直すので、画像に直接描く道具は
+        # 次の描き直しで消えてしまう。黙って消えると原因が分からないため
+        # ここで止めて理由を伝える。
+        if layer.is_vector and self.tool in (
+                Tool.FILL, Tool.BLUR, Tool.LINE, Tool.RECT, Tool.ELLIPSE,
+                Tool.TEXT, Tool.LASSO_FILL, Tool.ERASER):
+            self.status_message.emit(
+                "ベクターレイヤーにはこの道具はまだ使えません。ペンを使うか、"
+                "レイヤーをラスタライズしてください。")
+            return
+
         self._drawing = True
 
         # 描く前にレイヤー画像を必要なだけ広げる（移動後などで筆跡が
@@ -1766,7 +1887,13 @@ class Canvas(QWidget):
         loy = getattr(layer, 'offset_y', 0)
         lp = QPoint(cp.x() - lox, cp.y() - loy)
 
-        if self.tool == Tool.PEN:
+        if self.tool == Tool.PEN and layer.is_vector:
+            # ベクターは確定するまで image に描かない。点を溜めておき、
+            # 表示はプレビューで見せて、離したときに1本の線にする。
+            self._vector_points = [(float(cp.x()), float(cp.y()))]
+            self.update()
+
+        elif self.tool == Tool.PEN:
             self._save_history()
             self._begin_stroke_cache(layer)
             self._stabilizer.reset()
@@ -1999,6 +2126,12 @@ class Canvas(QWidget):
         if layer.is_group:
             return
 
+        if self.tool == Tool.PEN and layer.is_vector:
+            if self._vector_points is not None:
+                self._vector_points.append((float(cp.x()), float(cp.y())))
+                self.update()
+            return
+
         if self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
             shift = self._grow_for_draw(layer, cp, self._draw_margin())
             if not shift.isNull():
@@ -2056,6 +2189,7 @@ class Canvas(QWidget):
         layer = self.layer_stack.active
         self._drawing = False
         self._move_base_image = None
+        self._move_base_strokes = None
         self._move_group_bases = None
         self._move_base_pos = None
 
@@ -2071,6 +2205,10 @@ class Canvas(QWidget):
             return
 
         if not layer or layer.is_group:
+            return
+
+        if self.tool == Tool.PEN and layer.is_vector and self._vector_points is not None:
+            self._commit_vector_stroke(layer)
             return
 
         if self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start:
@@ -2295,6 +2433,13 @@ class Canvas(QWidget):
         """レイヤーをオフセットで移動する。画像データはそのまま保持されるため、
         キャンバス外にはみ出た部分も失われない。"""
         if self._move_base_image is None:
+            return
+        if layer.is_vector:
+            # ベクターは点がキャンバス座標なので、オフセットを動かしても
+            # 描き直しで元の位置に戻ってしまう。点そのものを動かす。
+            # 毎回「掴んだ時点の線」から作り直すことで誤差が積もらない。
+            layer.strokes = [s.copy() for s in (self._move_base_strokes or [])]  # type: ignore
+            layer.translate_strokes(dx, dy)  # type: ignore
             return
         layer.offset_x = self._move_base_offset[0] + dx
         layer.offset_y = self._move_base_offset[1] + dy
@@ -3051,6 +3196,9 @@ class Canvas(QWidget):
         """新規/開くなどでキャンバスを差し替える前に一切の作業状態を破棄する。"""
         self._end_stroke_cache()
         self._move_base_image = None
+        self._move_base_strokes = None
+        self._vector_points = None
+        self._vector_selected = None
         self._move_base_pos = None
         self._move_group_bases = None
         self._transform_image = None
@@ -3161,17 +3309,29 @@ class Canvas(QWidget):
                         for child in children:
                             ox = getattr(child, 'offset_x', 0)
                             oy = getattr(child, 'offset_y', 0)
-                            self._history.append(("pixel", id(child), child.image.copy(), ox, oy))  # type: ignore
+                            if child.is_vector:
+                                self._history.append(
+                                    ("vector", id(child), child.copy_strokes(), ox, oy))  # type: ignore
+                            else:
+                                self._history.append(("pixel", id(child), child.image.copy(), ox, oy))  # type: ignore
                         self._redo_stack.clear()
                         self._trim_history()
                         self.edited.emit()
                         for child in children:
-                            child.offset_x += ddx * step  # type: ignore
-                            child.offset_y += ddy * step  # type: ignore
+                            if child.is_vector:
+                                child.translate_strokes(ddx * step, ddy * step)  # type: ignore
+                            else:
+                                child.offset_x += ddx * step  # type: ignore
+                                child.offset_y += ddy * step  # type: ignore
                 elif layer and not layer.is_group:
                     self._save_history()
-                    layer.offset_x += ddx * step  # type: ignore
-                    layer.offset_y += ddy * step  # type: ignore
+                    if layer.is_vector:
+                        # 点がキャンバス座標なので、offset を動かしても
+                        # 再レンダーで元の位置に戻ってしまう。点そのものを動かす。
+                        layer.translate_strokes(ddx * step, ddy * step)  # type: ignore
+                    else:
+                        layer.offset_x += ddx * step  # type: ignore
+                        layer.offset_y += ddy * step  # type: ignore
                     self.update()
                 event.accept()
                 return

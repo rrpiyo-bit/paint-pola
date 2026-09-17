@@ -8,6 +8,7 @@ from PyQt6.QtGui import QColor, QPainter, QPen, QImage, QPixmap, QDrag
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QMimeData, QPoint
 
 from layer import LayerStack, Layer, GroupLayer, BLEND_MODES, BLEND_KEYS, BLEND_LABELS
+from vector import VectorLayer
 from actions import ActionPanel
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
@@ -171,6 +172,12 @@ class LayerRow(QWidget):
                 lambda s: self.marked_changed.emit(self._layer, s))
             icon_row.addWidget(self._mark)
 
+        # ベクターレイヤーは見た目が同じなので、種別が一目で分かるよう印を出す。
+        if self._layer.is_vector:
+            badge = QLabel("📐")
+            badge.setToolTip("ベクターレイヤー（線を後から編集できる）")
+            icon_row.addWidget(badge)
+
         icon_row.addStretch()
         right.addLayout(icon_row)
 
@@ -280,6 +287,7 @@ class LayerPanel(QWidget):
         tb1.setContentsMargins(0, 0, 0, 0)
         for icon, slot, tip in [
             ("➕", self._add, "新規レイヤー"),
+            ("📐", self._add_vector, "新規ベクターレイヤー（線を後から編集できる）"),
             ("📁", self._add_group, "新規グループ"),
             ("📋", self._duplicate, "複製"),
             ("🗑", self._remove, "削除"),
@@ -908,6 +916,19 @@ class LayerPanel(QWidget):
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
         new_layer = Layer(f"レイヤー {len(container) + 1}", ls.width, ls.height)
+        insert_at = min(idx, len(container))
+        container.insert(insert_at, new_layer)
+        new_path = path[:-1] + [insert_at]
+        ls.set_active_path(new_path)
+        self.refresh()
+        self.layers_changed.emit()
+
+    def _add_vector(self):
+        self.structure_will_change.emit()
+        ls = self.layer_stack
+        path = self._current_path()
+        container, idx = self._get_container_and_index(path)
+        new_layer = VectorLayer(f"ベクター {len(container) + 1}", ls.width, ls.height)
         insert_at = min(idx, len(container))
         container.insert(insert_at, new_layer)
         new_path = path[:-1] + [insert_at]
