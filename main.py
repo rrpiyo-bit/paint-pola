@@ -118,6 +118,14 @@ class LineExtractionDialog(QDialog):
         ptr = source.bits()
         ptr.setsize(sh * sw * 4)
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape(sh, sw, 4).copy()
+        # 透明な部分は「まだ何も描かれていない紙」として白で埋める。
+        # alpha を捨てるだけだと透明画素は RGB(0,0,0) のまま残り、
+        # 背景レイヤーが無い絵では紙全体が真っ黒な線として拾われてしまう。
+        alpha = arr[:, :, 3].astype(np.float32) / 255.0
+        rgb = arr[:, :, :3].astype(np.float32)
+        arr[:, :, :3] = np.clip(
+            rgb * alpha[:, :, None] + 255.0 * (1.0 - alpha[:, :, None]),
+            0, 255).astype(np.uint8)
         self._bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
 
         # プレビュー用縮小スケール
@@ -1205,9 +1213,15 @@ class MainWindow(QMainWindow):
 
         self.resize(1200, 800)
 
+        # QSettings は保存した型のまま返らないことがある。環境によっては
+        # 文字列がリストで戻り、そのままでは「知らないテーマ」になって
+        # 選んだデザインが再起動のたびに消えていた。str に均してから照合する。
         saved_theme = self._settings.value("theme", "default")
-        if saved_theme in self._theme_actions:
-            self._apply_theme(saved_theme)
+        if isinstance(saved_theme, (list, tuple)):
+            saved_theme = saved_theme[0] if saved_theme else "default"
+        saved_theme = str(saved_theme or "default")
+        self._apply_theme(saved_theme if saved_theme in self._theme_actions
+                          else "default")
         # ウィンドウ表示・レイアウト確定後でないと表示領域が0のままフィットできない
         QTimer.singleShot(0, lambda: self.navigator._fit_view())
 
@@ -2099,6 +2113,9 @@ class MainWindow(QMainWindow):
             action.setChecked(k == key)
         self._current_theme = key
         self._settings.setValue("theme", key)
+        # 書き込みは遅延されるので、終了の仕方によっては失われる。
+        # 選んだ時点で確実にディスクへ落としておく。
+        self._settings.sync()
 
     def _toggle_anim_mode(self, enabled: bool):
         self._anim_mode = enabled

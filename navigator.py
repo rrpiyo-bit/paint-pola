@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QScrollArea
-from PyQt6.QtGui import QPainter, QColor, QPen, QImage, QTransform
+from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QTransform, QPixmap,
+                         QBrush)
 from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, QSize, pyqtSignal
 
 from layer import LayerStack
@@ -10,6 +11,23 @@ _NAV_SIZE = 150
 _FRAME_COLOR = QColor(220, 60, 60, 200)
 _FRAME_FILL = QColor(220, 60, 60, 30)
 _BG_COLOR = QColor(50, 50, 50)
+
+_CHECKER_TILE: QPixmap | None = None
+
+
+def _checker_tile() -> QPixmap:
+    """透明を示す市松模様のタイル。キャンバスと同じ配色・小さめの目。"""
+    global _CHECKER_TILE
+    if _CHECKER_TILE is None:
+        sz = 5
+        tile = QPixmap(sz * 2, sz * 2)
+        tp = QPainter(tile)
+        tp.fillRect(0, 0, sz * 2, sz * 2, QColor(255, 255, 255))
+        tp.fillRect(0, 0, sz, sz, QColor(204, 204, 204))
+        tp.fillRect(sz, sz, sz, sz, QColor(204, 204, 204))
+        tp.end()
+        _CHECKER_TILE = tile
+    return _CHECKER_TILE
 
 
 class NavigatorView(QWidget):
@@ -87,7 +105,11 @@ class NavigatorView(QWidget):
         p.fillRect(self.rect(), _BG_COLOR)
 
         if self._preview and not self._preview.isNull():
-            p.drawImage(self._preview_rect(), self._preview)
+            # 背景レイヤーが無いと絵は透明のまま。そのまま描くとパネルの
+            # 暗い地色が透けて真っ黒に見えるので、キャンバスと同じ市松を敷く。
+            r = self._preview_rect()
+            p.fillRect(r, QBrush(_checker_tile()))
+            p.drawImage(r, self._preview)
 
         fr = self._frame_rect_widget()
         p.setPen(QPen(_FRAME_COLOR, 1.5))

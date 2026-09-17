@@ -3335,3 +3335,142 @@ class TestMenuLayout:
                     keys.append(k)
         dupes = {k: c for k, c in Counter(keys).items() if c > 1}
         assert not dupes, f"衝突しているショートカット: {dupes}"
+
+
+# ── 透明背景まわりのバグ ─────────────────────────────────────────────────────
+
+class TestTransparentBackground:
+    """背景レイヤーが無い（＝絵が透明）ときに黒く潰れないこと。
+
+    透明は RGB(0,0,0)・alpha 0 なので、alpha を捨てると真っ黒になる。
+    紙として扱うべき場所が線や地色として拾われると見た目が壊れる。
+    """
+
+    def test_line_extraction_ignores_transparent_area(self):
+        """背景レイヤーが無い絵の線画抽出で、何も無い所が線にならないこと。"""
+        import numpy as np
+        from PyQt6.QtGui import QImage, QPainter, QColor
+        from PyQt6.QtCore import Qt
+        from main import LineExtractionDialog
+        # 透明なキャンバスの中央にだけ黒い四角を描く
+        src = QImage(100, 100, QImage.Format.Format_ARGB32)
+        src.fill(Qt.GlobalColor.transparent)
+        p = QPainter(src)
+        p.fillRect(40, 40, 20, 20, QColor(0, 0, 0))
+        p.end()
+
+        dlg = LineExtractionDialog(src)
+        dlg._mode_adaptive.setChecked(False)
+        out = dlg.extract()
+
+        ptr = out.bits()
+        ptr.setsize(out.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(100, 100, 4)
+        opaque = arr[:, :, 3] > 0
+        # 四隅（もともと透明だった所）が線として拾われていないこと
+        for y, x in ((2, 2), (2, 97), (97, 2), (97, 97)):
+            assert not opaque[y, x], "透明だった部分が線になっている"
+        # 描いた四角はちゃんと線として残ること
+        assert opaque[50, 50]
+
+    def test_navigator_draws_checker_behind_preview(self):
+        """ナビゲータが透明部分に市松を敷くこと。
+
+        敷かないとパネルの暗い地色が透けて、背景レイヤーが無い絵では
+        ナビゲータ全体が真っ黒に見える。
+        """
+        from PyQt6.QtGui import QImage, QColor
+        from PyQt6.QtCore import Qt
+        from navigator import NavigatorView
+        view = NavigatorView()
+        preview = QImage(100, 100, QImage.Format.Format_ARGB32)
+        preview.fill(Qt.GlobalColor.transparent)
+        view.update_preview(preview)
+
+        shot = QImage(150, 150, QImage.Format.Format_ARGB32)
+        shot.fill(Qt.GlobalColor.transparent)
+        view.render(shot)
+
+        r = view._preview_rect()
+        cx, cy = r.x() + r.width() // 2, r.y() + r.height() // 2
+        c = QColor.fromRgba(shot.pixel(cx, cy))
+        # 市松は白(255)と灰(204)。暗い地色(50)が出ていたら失敗。
+        assert c.red() > 150, f"透明部分が暗い ({c.red()})"
+
+
+class TestThemePersistence:
+    """デザイン（テーマ）が再起動後も保たれること。"""
+
+    def test_saved_theme_is_restored(self):
+        from PyQt6.QtCore import QSettings
+        from main import MainWindow
+        s = QSettings("PaintPola", "PaintPola")
+        before = s.value("theme")
+        try:
+            s.setValue("theme", "win95")
+            s.sync()
+            w = MainWindow()                 # 再起動に相当
+            assert w._current_theme == "win95"
+            assert len(w.styleSheet()) > 0
+        finally:
+            if before is None:
+                s.remove("theme")
+            else:
+                s.setValue("theme", before)
+            s.sync()
+
+    def test_unknown_theme_falls_back_to_default(self):
+        """壊れた値が入っていても起動できること。"""
+        from PyQt6.QtCore import QSettings
+        from main import MainWindow
+        s = QSettings("PaintPola", "PaintPola")
+        before = s.value("theme")
+        try:
+            s.setValue("theme", "存在しないテーマ")
+            s.sync()
+            w = MainWindow()
+            assert w._current_theme == "default"
+        finally:
+            if before is None:
+                s.remove("theme")
+            else:
+                s.setValue("theme", before)
+            s.sync()
+
+    def test_list_valued_setting_is_recovered(self):
+        """QSettings が文字列をリストで返す環境でも、テーマが復元されること。
+
+        ここを str と決めつけていたため、選んだデザインが再起動のたびに
+        既定へ戻っていた。
+        """
+        from PyQt6.QtCore import QSettings
+        from main import MainWindow
+        s = QSettings("PaintPola", "PaintPola")
+        before = s.value("theme")
+        try:
+            s.setValue("theme", ["win95"])
+            s.sync()
+            w = MainWindow()
+            assert w._current_theme == "win95"
+        finally:
+            if before is None:
+                s.remove("theme")
+            else:
+                s.setValue("theme", before)
+            s.sync()
+
+    def test_apply_theme_writes_setting(self):
+        from PyQt6.QtCore import QSettings
+        from main import MainWindow
+        s = QSettings("PaintPola", "PaintPola")
+        before = s.value("theme")
+        try:
+            w = MainWindow()
+            w._theme_actions["pastel"].trigger()
+            assert QSettings("PaintPola", "PaintPola").value("theme") == "pastel"
+        finally:
+            if before is None:
+                s.remove("theme")
+            else:
+                s.setValue("theme", before)
+            s.sync()
