@@ -311,23 +311,224 @@ def insert_index_for(stroke: VectorStroke, x: float, y: float) -> int:
     return best_i + 1
 
 
+# ── 消去 ─────────────────────────────────────────────────────────────────────
+#
+# 「交点まで消す」は、曲線のままでは扱いにくい。曲線どうしの交点は
+# 解析的に解くと式が重く、しかも自己交差まで見る必要がある。
+# そこで一度折れ線に落としてから交点を探し、残った区間を新しい線として
+# 組み直す。制御点の並びは変わるが、見た目の形はそのまま残る。
+
+FLATTEN_STEP = 2.0   # 折れ線に落とすときの刻み（キャンバス座標）
+
+
+def flatten_stroke(stroke: VectorStroke,
+                   step: float = FLATTEN_STEP) -> list[tuple[float, float]]:
+    """線を折れ線に落とす。曲線の交点計算と部分削除に使う。
+
+    QPainterPath の弧長を一定間隔で拾う。曲率の高いところで粗くなるが、
+    消去の当たり判定に使うぶんには十分な精度が出る。
+    """
+    if len(stroke.points) < 2:
+        return list(stroke.points)
+    path = stroke_to_path(stroke)
+    length = path.length()
+    if length <= 0:
+        return list(stroke.points)
+    n = max(2, int(length / max(0.5, step)) + 1)
+    out = []
+    for i in range(n):
+        p = path.pointAtPercent(i / (n - 1))
+        out.append((p.x(), p.y()))
+    return out
+
+
+def _segment_intersection(a1, a2, b1, b2):
+    """線分どうしの交点。交わらなければ None。
+
+    戻り値は (交点, a 上の位置 0..1)。a 側の位置だけ返すのは、
+    消す線の上のどこで切るかしか要らないため。
+    """
+    ax, ay = a1
+    bx, by = a2
+    cx, cy = b1
+    dx, dy = b2
+    r_x, r_y = bx - ax, by - ay
+    s_x, s_y = dx - cx, dy - cy
+    denom = r_x * s_y - r_y * s_x
+    if abs(denom) < 1e-12:
+        return None          # 平行または重なり。重なりは交点とみなさない
+    t = ((cx - ax) * s_y - (cy - ay) * s_x) / denom
+    u = ((cx - ax) * r_y - (cy - ay) * r_x) / denom
+    if not (0.0 <= t <= 1.0 and 0.0 <= u <= 1.0):
+        return None
+    return ((ax + t * r_x, ay + t * r_y), t)
+
+
+def _cumulative_lengths(poly: list[tuple[float, float]]) -> list[float]:
+    """折れ線の各点までの累積距離。"""
+    out = [0.0]
+    for a, b in zip(poly, poly[1:]):
+        out.append(out[-1] + ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5)
+    return out
+
+
+def _position_on(poly: list[tuple[float, float]], seg_i: int,
+                 t: float, cum: list[float]) -> float:
+    """折れ線の seg_i 番の線分を t だけ進んだ位置を、始点からの距離で返す。"""
+    a, b = poly[seg_i], poly[seg_i + 1]
+    seg_len = ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5
+    return cum[seg_i] + seg_len * t
+
+
+def cut_positions(target: VectorStroke, others: list[VectorStroke],
+                  poly: list[tuple[float, float]] | None = None) -> list[float]:
+    """target が他の線と交わる位置を、線の始点からの距離で返す。
+
+    自己交差も含める。折り返して自分と重なる線を、その折り返しで
+    切りたいことがあるため。
+    """
+    if poly is None:
+        poly = flatten_stroke(target)
+    if len(poly) < 2:
+        return []
+    cum = _cumulative_lengths(poly)
+    tb = target.bounds()
+
+    cuts: list[float] = []
+    for other in others:
+        same = other is target
+        # bbox が重ならない相手は交点を持ちえない。線が増えたときに効く。
+        if not same and not tb.intersects(other.bounds()):
+            continue
+        o_poly = poly if same else flatten_stroke(other)
+        if len(o_poly) < 2:
+            continue
+        for i in range(len(poly) - 1):
+            for j in range(len(o_poly) - 1):
+                if same and abs(i - j) <= 1:
+                    continue      # 隣り合う線分は必ず端点を共有する
+                hit = _segment_intersection(poly[i], poly[i + 1],
+                                            o_poly[j], o_poly[j + 1])
+                if hit is None:
+                    continue
+                cuts.append(_position_on(poly, i, hit[1], cum))
+    # 交点がちょうど折れ線の角に乗ると、隣り合う2つの線分が同じ点を返す。
+    # 同じ場所は1つにまとめる。
+    out: list[float] = []
+    for c in sorted(cuts):
+        if not out or c - out[-1] > 1e-6:
+            out.append(c)
+    return out
+
+
+def _nearest_position(poly: list[tuple[float, float]], x: float, y: float,
+                      cum: list[float]) -> tuple[float, float]:
+    """(x,y) に最も近い線上の位置（始点からの距離）と、その距離を返す。"""
+    best_pos, best_d = 0.0, float("inf")
+    for i in range(len(poly) - 1):
+        a, b = poly[i], poly[i + 1]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        seg2 = dx * dx + dy * dy
+        if seg2 <= 1e-12:
+            t = 0.0
+        else:
+            t = max(0.0, min(1.0, ((x - a[0]) * dx + (y - a[1]) * dy) / seg2))
+        cxx, cyy = a[0] + t * dx, a[1] + t * dy
+        d = ((x - cxx) ** 2 + (y - cyy) ** 2) ** 0.5
+        if d < best_d:
+            best_d = d
+            best_pos = _position_on(poly, i, t, cum)
+    return best_pos, best_d
+
+
+def _slice_polyline(poly: list[tuple[float, float]], cum: list[float],
+                    lo: float, hi: float) -> list[tuple[float, float]]:
+    """折れ線の lo〜hi（始点からの距離）の区間を切り出す。"""
+    if hi - lo < 1e-9:
+        return []
+    out: list[tuple[float, float]] = []
+
+    def at(pos: float) -> tuple[float, float]:
+        for i in range(len(poly) - 1):
+            if cum[i] <= pos <= cum[i + 1]:
+                span = cum[i + 1] - cum[i]
+                t = 0.0 if span <= 1e-12 else (pos - cum[i]) / span
+                a, b = poly[i], poly[i + 1]
+                return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+        return poly[-1]
+
+    out.append(at(lo))
+    for i, c in enumerate(cum):
+        if lo < c < hi:
+            out.append(poly[i])
+    out.append(at(hi))
+    return drop_near_duplicates(out, 0.5)
+
+
+def erase_between_cuts(stroke: VectorStroke, x: float, y: float,
+                       others: list[VectorStroke],
+                       reach: float) -> list[VectorStroke] | None:
+    """クリック点を含む区間を、前後の交点まで消す。
+
+    戻り値は置き換え後の線のリスト。0本（線ごと消えた）/ 1本（端を消した）/
+    2本（真ん中を消して分かれた）のいずれか。線に当たっていなければ None。
+
+    区間の表現は「点列を分ける」で通す。部分レンジを持たせると、保存・
+    undo・ハンドル・描画のすべてがその概念を知る必要が出てしまう。
+    """
+    poly = flatten_stroke(stroke)
+    if len(poly) < 2:
+        return None
+    cum = _cumulative_lengths(poly)
+    total = cum[-1]
+
+    pos, dist = _nearest_position(poly, x, y, cum)
+    if dist > reach:
+        return None
+
+    cuts = cut_positions(stroke, others, poly)
+    # クリック位置を挟む交点を探す。無ければ線の端まで。
+    lo = max([c for c in cuts if c <= pos], default=0.0)
+    hi = min([c for c in cuts if c >= pos], default=total)
+
+    pieces = []
+    for a, b in ((0.0, lo), (hi, total)):
+        seg = _slice_polyline(poly, cum, a, b)
+        if len(seg) >= 2:
+            pieces.append(seg)
+
+    out = []
+    for seg in pieces:
+        # 折れ線のままだと点が多すぎるので、元と同じ基準で間引く。
+        pts = simplify_input(seg, stroke.width)
+        if len(pts) < 2:
+            continue
+        out.append(VectorStroke(points=pts, width=stroke.width,
+                                color=stroke.color, smooth=stroke.smooth))
+    return out
+
+
 def drop_near_duplicates(points: list[tuple[float, float]],
                          min_dist: float = 2.0) -> list[tuple[float, float]]:
     """近すぎる連続点を落とす。
 
     ほぼ同じ場所に点が重なっていると Catmull-Rom が大きく振れて
     線がループしてしまうので、間引きの前に均しておく。
+
+    終点は必ず残す。落としてしまうと線が最大 min_dist だけ短くなり、
+    交点まで消したときに反対の端が縮む・描いた線の先が欠けるといった
+    形で表に出る。
     """
     if not points:
         return []
+    if len(points) == 1:
+        return [points[0]]
     out = [points[0]]
-    for p in points[1:]:
+    for p in points[1:-1]:
         lx, ly = out[-1]
         if ((p[0] - lx) ** 2 + (p[1] - ly) ** 2) ** 0.5 >= min_dist:
             out.append(p)
-    if len(out) == 1 and len(points) > 1:
-        # 全部が近接していた場合でも、始点と終点は残す。
-        out.append(points[-1])
+    out.append(points[-1])
     return out
 
 

@@ -243,7 +243,7 @@ class TestCanvasIntegration:
         次の描き直しで消えるという、原因の分からないバグになる。"""
         from tools import Tool
         for tool in (Tool.FILL, Tool.BLUR, Tool.LINE, Tool.RECT, Tool.ELLIPSE,
-                     Tool.TEXT, Tool.LASSO_FILL, Tool.ERASER):
+                     Tool.TEXT, Tool.LASSO_FILL):
             c, lyr = self.make()
             msgs = []
             c.status_message.connect(msgs.append)
@@ -591,3 +591,126 @@ class TestSafeStrokes:
         assert out[0].width == 7.5
         assert out[0].color == (1, 2, 3, 4)
         assert out[0].smooth is False
+
+
+# ── 消去 ─────────────────────────────────────────────────────────────────────
+
+class TestEraseGeometry:
+    """交点まで消す計算。線の形はそのままに、区間だけ落ちること。"""
+
+    @staticmethod
+    def cross():
+        """横線1本を縦線2本が x=30 と x=70 で横切る形。"""
+        h = VectorStroke(points=[(0.0, 50.0), (100.0, 50.0)], width=4.0)
+        v1 = VectorStroke(points=[(30.0, 0.0), (30.0, 100.0)], width=4.0)
+        v2 = VectorStroke(points=[(70.0, 0.0), (70.0, 100.0)], width=4.0)
+        return h, [h, v1, v2]
+
+    def test_cut_positions_finds_both_crossings(self):
+        from vector import cut_positions
+        h, all_ = self.cross()
+        cuts = cut_positions(h, all_)
+        assert len(cuts) == 2
+        assert cuts[0] == pytest.approx(30.0, abs=1.0)
+        assert cuts[1] == pytest.approx(70.0, abs=1.0)
+
+    def test_middle_click_splits_into_two(self):
+        from vector import erase_between_cuts
+        h, all_ = self.cross()
+        out = erase_between_cuts(h, 50.0, 50.0, all_, 6.0)
+        assert len(out) == 2
+        assert out[0].points[0][0] == pytest.approx(0.0, abs=1.0)
+        assert out[0].points[-1][0] == pytest.approx(30.0, abs=1.0)
+        assert out[1].points[0][0] == pytest.approx(70.0, abs=1.0)
+        assert out[1].points[-1][0] == pytest.approx(100.0, abs=1.0)
+
+    def test_end_click_leaves_one_piece(self):
+        from vector import erase_between_cuts
+        h, all_ = self.cross()
+        out = erase_between_cuts(h, 10.0, 50.0, all_, 6.0)
+        assert len(out) == 1
+        assert out[0].points[0][0] == pytest.approx(30.0, abs=1.0)
+        assert out[0].points[-1][0] == pytest.approx(100.0, abs=1.0)
+
+    def test_no_intersection_removes_whole_line(self):
+        from vector import erase_between_cuts
+        lone = VectorStroke(points=[(0.0, 10.0), (100.0, 10.0)], width=4.0)
+        assert erase_between_cuts(lone, 50.0, 10.0, [lone], 6.0) == []
+
+    def test_far_click_is_a_miss(self):
+        from vector import erase_between_cuts
+        h, all_ = self.cross()
+        assert erase_between_cuts(h, 50.0, 90.0, all_, 6.0) is None
+
+    def test_erase_keeps_the_far_end(self):
+        """drop_near_duplicates が終点を落とすと、消した反対側が縮む。"""
+        from vector import erase_between_cuts
+        h, all_ = self.cross()
+        out = erase_between_cuts(h, 50.0, 50.0, all_, 6.0)
+        assert out[1].points[-1][0] == pytest.approx(100.0, abs=0.2)
+
+    def test_drop_near_duplicates_keeps_endpoint(self):
+        from vector import drop_near_duplicates
+        pts = [(0.0, 0.0), (10.0, 0.0), (10.5, 0.0)]
+        assert drop_near_duplicates(pts, 2.0)[-1] == (10.5, 0.0)
+
+
+class TestEraseOnCanvas(TestCanvasIntegration):
+    """消しゴムが実際にキャンバスで効くこと。"""
+
+    def setup_strokes(self, lyr):
+        lyr.strokes = [
+            VectorStroke(points=[(0.0, 50.0), (100.0, 50.0)], width=4.0),
+            VectorStroke(points=[(30.0, 0.0), (30.0, 100.0)], width=4.0),
+            VectorStroke(points=[(70.0, 0.0), (70.0, 100.0)], width=4.0),
+        ]
+
+    def erase(self, c, x, y):
+        from PyQt6.QtGui import QMouseEvent
+        self.press(c, x, y)
+        wp = c._c2w().map(QPointF(x, y))
+        c.mouseReleaseEvent(QMouseEvent(
+            QEvent.Type.MouseButtonRelease, wp, Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+
+    def test_cut_mode_splits_the_line(self):
+        from tools import Tool
+        c, lyr = self.make()
+        self.setup_strokes(lyr)
+        c.tool = Tool.ERASER
+        self.erase(c, 50.0, 50.0)
+        assert len(lyr.strokes) == 4      # 横線が2本に割れた
+
+    def test_whole_mode_removes_the_line(self):
+        from tools import Tool
+        c, lyr = self.make()
+        self.setup_strokes(lyr)
+        c.tool = Tool.ERASER
+        c.set_vector_erase_mode("whole")
+        self.erase(c, 50.0, 50.0)
+        assert len(lyr.strokes) == 2
+
+    def test_miss_leaves_no_history(self):
+        from tools import Tool
+        c, lyr = self.make()
+        self.setup_strokes(lyr)
+        c.tool = Tool.ERASER
+        c.zoom = 1.0
+        before = len(c._history)
+        self.erase(c, 50.0, 95.0)
+        assert len(lyr.strokes) == 3
+        assert len(c._history) == before
+
+    def test_undo_restores_the_line(self):
+        from tools import Tool
+        c, lyr = self.make()
+        self.setup_strokes(lyr)
+        c.tool = Tool.ERASER
+        self.erase(c, 50.0, 50.0)
+        c.undo()
+        assert len(lyr.strokes) == 3
+        assert lyr.strokes[0].points[-1][0] == pytest.approx(100.0)
+
+    def test_erase_mode_default_is_cut(self):
+        c, lyr = self.make()
+        assert c.vector_erase_mode == "cut"

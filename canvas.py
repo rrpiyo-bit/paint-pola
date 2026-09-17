@@ -552,6 +552,10 @@ class Canvas(QWidget):
         self._vector_corner_drag = False
         # ドラッグで実際に動かしたか（動かしていなければ履歴を戻す）
         self._vector_drag_moved = False
+        # ベクターの消しゴムの効き方: "cut"=交点まで消す / "whole"=線ごと消す
+        self.vector_erase_mode = "cut"
+        # 1回のドラッグで履歴を積むのは最初の1回だけにするための印
+        self._vector_erasing = False
 
         # transform (floating image)
         self._transform_image: QImage | None = None
@@ -1782,6 +1786,52 @@ class Canvas(QWidget):
         """
         return 8.0 / max(0.05, self.zoom)
 
+    def _vector_erase_press(self, layer, cp) -> bool:
+        """ベクターレイヤーで消しゴムを当てる。
+
+        ピクセルを削るのではなく線そのものを削る。消し方は2つあり、
+        「線ごと消す」は当たった線を丸ごと、「交点まで消す」は
+        クリックした位置から前後の交点までを消す（CLIP STUDIO と同じ考え方）。
+
+        戻り値は実際に消せたかどうか。ドラッグ中の連続呼び出しで使う。
+        """
+        from vector import stroke_hit, erase_between_cuts
+        x, y = float(cp.x()), float(cp.y())
+        # 消しゴムの太さを当たり判定の広さに使う。細くしすぎると狙えないので
+        # 拡大率から決まる最低限の許容量と大きいほうを取る。
+        reach = max(self._vector_tol(), self.eraser_size / 2.0)
+
+        # 手前の線から順に見る。重なっていたら上にあるものを消す。
+        target = None
+        index = -1
+        for i in range(len(layer.strokes) - 1, -1, -1):
+            if stroke_hit(layer.strokes[i], x, y, reach):
+                target, index = layer.strokes[i], i
+                break
+        if target is None:
+            return False
+
+        if self.vector_erase_mode == "whole":
+            pieces = []
+        else:
+            pieces = erase_between_cuts(target, x, y, layer.strokes, reach)
+            if pieces is None:
+                return False
+
+        # 1回のドラッグで履歴は1つ。押した最初だけ積む。
+        if not self._vector_erasing:
+            self._save_history()
+            self._vector_erasing = True
+
+        layer.strokes[index:index + 1] = pieces
+        if self._vector_selected is target:
+            self._vector_selected = None
+            self.vector_selection_changed.emit()
+        layer.mark_dirty()
+        self.edited.emit()
+        self.update()
+        return True
+
     def _vector_select_press(self, layer, cp, event):
         """選択モードでの押下。ハンドル → 制御点 → 線 の順に掴む。
 
@@ -1979,6 +2029,13 @@ class Canvas(QWidget):
         self.vector_selection_changed.emit()
         self.update()
 
+    def set_vector_erase_mode(self, mode: str):
+        """ベクターレイヤーでの消しゴムの効き方を切り替える。
+
+        交点まで消す / 線ごと消す の2つ。
+        """
+        self.vector_erase_mode = mode if mode in ("cut", "whole") else "cut"
+
     def set_selected_stroke_width(self, width: float):
         layer = self._vector_active_layer()
         if layer is None:
@@ -2166,10 +2223,18 @@ class Canvas(QWidget):
         # ここで止めて理由を伝える。
         if layer.is_vector and self.tool in (
                 Tool.FILL, Tool.BLUR, Tool.LINE, Tool.RECT, Tool.ELLIPSE,
-                Tool.TEXT, Tool.LASSO_FILL, Tool.ERASER):
+                Tool.TEXT, Tool.LASSO_FILL):
             self.status_message.emit(
                 "ベクターレイヤーにはこの道具はまだ使えません。ペンを使うか、"
                 "レイヤーをラスタライズしてください。")
+            return
+
+        # 消しゴムはピクセルではなく線そのものを消す。
+        # ドラッグでなぞれるよう _drawing は立てるが、画像には触らない。
+        if layer.is_vector and self.tool == Tool.ERASER:
+            self._vector_erasing = False
+            self._drawing = True
+            self._vector_erase_press(layer, cp)
             return
 
         self._drawing = True
@@ -2431,6 +2496,11 @@ class Canvas(QWidget):
         if layer.is_group:
             return
 
+        if self.tool == Tool.ERASER and layer.is_vector:
+            # なぞったところの線を続けて消す。履歴は押下時の1つだけ。
+            self._vector_erase_press(layer, cp)
+            return
+
         if self.tool == Tool.PEN and layer.is_vector:
             if self._vector_editing():
                 self._vector_corner_drag = bool(
@@ -2515,6 +2585,10 @@ class Canvas(QWidget):
             return
 
         if not layer or layer.is_group:
+            return
+
+        if self.tool == Tool.ERASER and layer.is_vector:
+            self._vector_erasing = False
             return
 
         if self.tool == Tool.PEN and layer.is_vector and self._vector_editing():

@@ -103,6 +103,7 @@ class ToolOptionsPanel(QWidget):
     vector_apply_color_requested = pyqtSignal()     # 今の色を選択中の線に塗る
     vector_delete_requested = pyqtSignal()          # 選択中の線を消す
     vector_smooth_toggled = pyqtSignal(bool)        # なめらか / 直線つなぎ
+    vector_erase_mode_changed = pyqtSignal(str)     # "cut" | "whole"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -170,7 +171,8 @@ class ToolOptionsPanel(QWidget):
                  mesh_div: int = 3,
                  is_vector: bool = False,
                  vector_pen_mode: str = "draw",
-                 vector_selected=None):
+                 vector_selected=None,
+                 vector_erase_mode: str = "cut"):
         self._current_tool = tool
         self._clear()
 
@@ -201,6 +203,9 @@ class ToolOptionsPanel(QWidget):
             self._add_brush_combo(brush_key)
             self._add_toggle("対称定規", symmetry,
                              lambda v: self.symmetry_toggled.emit(v))
+
+        elif tool == Tool.ERASER and is_vector:
+            self._build_vector_eraser(eraser_size, vector_erase_mode)
 
         elif tool == Tool.ERASER:
             self._add_spinbox("消しゴムサイズ", eraser_size, 1, 300,
@@ -442,6 +447,32 @@ class ToolOptionsPanel(QWidget):
             self.pivot_mode_changed.emit(mode)
 
         mode_cb.currentIndexChanged.connect(on_mode_change)
+
+    def _build_vector_eraser(self, eraser_size: int, mode: str):
+        """ベクターレイヤー選択中の消しゴムの設定。
+
+        ピクセルを削るのではなく線を削るので、サイズは太さではなく
+        「どこまで近ければ当たったとみなすか」の広さとして効く。
+        """
+        modes = [("交点まで消す", "cut"),
+                 ("線ごと消す", "whole")]
+        cb = QComboBox()
+        for label, key in modes:
+            cb.addItem(label, key)
+        keys = [k for _, k in modes]
+        cb.setCurrentIndex(keys.index(mode) if mode in keys else 0)
+        cb.currentIndexChanged.connect(
+            lambda i: self.vector_erase_mode_changed.emit(cb.itemData(i)))
+        self._add_row("消去方法", cb,
+                      tooltip="「交点まで消す」はクリックした所から\n"
+                              "他の線とぶつかる所までを消します。\n"
+                              "「線ごと消す」は当たった線を丸ごと消します。")
+
+        self._add_spinbox("消しゴムサイズ", eraser_size, 1, 300,
+                          lambda v: self.eraser_size_changed.emit(v),
+                          tooltip="線に当たったとみなす広さです。")
+        self._add_label("ベクターレイヤーです。消しゴムは\n"
+                        "線そのものを消します。なぞると続けて消せます。")
 
     def _build_vector_pen(self, pen_size: int, mode: str, selected):
         """ベクターレイヤー選択中のペンの設定。

@@ -1302,6 +1302,8 @@ class MainWindow(QMainWindow):
         self.tool_options.vector_delete_requested.connect(
             self._on_vector_delete)
         self.tool_options.vector_smooth_toggled.connect(self._on_vector_smooth)
+        self.tool_options.vector_erase_mode_changed.connect(
+            self._on_vector_erase_mode_change)
         # 線の選択が変わったらオプションの行を出し直す
         self.canvas.vector_selection_changed.connect(self._refresh_tool_options)
         # レイヤーを切り替えたときも、ベクターかどうかで出す行が変わる
@@ -1366,6 +1368,7 @@ class MainWindow(QMainWindow):
             is_vector=is_vector,
             vector_pen_mode=self.canvas.vector_pen_mode,
             vector_selected=self.canvas._vector_selected if is_vector else None,
+            vector_erase_mode=self.canvas.vector_erase_mode,
         )
 
     def _refresh_tool_options_if_kind_changed(self):
@@ -1382,6 +1385,9 @@ class MainWindow(QMainWindow):
         # 別の種類のレイヤーに移ったら、前のレイヤーの線の選択は捨てる
         self.canvas._vector_selected = None
         self._refresh_tool_options()
+
+    def _on_vector_erase_mode_change(self, mode: str):
+        self.canvas.set_vector_erase_mode(mode)
 
     def _on_vector_pen_mode_change(self, mode: str):
         self.canvas.set_vector_pen_mode(mode)
