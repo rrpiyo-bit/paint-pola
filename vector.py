@@ -26,15 +26,70 @@ class VectorStroke:
 
     points はキャンバス座標で持つ。レイヤーローカルにすると、
     移動のたびに全点を書き換える必要が出てしまう。
+
+    handles は points と同じ長さの並びで、その点のベジェハンドルを持つ。
+    既定はすべて None で、そのときは前後の点から自動で曲がり具合が決まる
+    （Catmull-Rom）。手描きの線は点が数十個できるので、全部にハンドルを
+    生やすと画面が埋まって触れなくなる。必要な点だけ出す。
+
+    ハンドルは「その点からの相対位置」で持つ。点を動かしたときに
+    ハンドルが付いてくるようにするため（絶対座標だと毎回引き算が要る）。
     """
     points: list[tuple[float, float]] = field(default_factory=list)
+    # 各点のハンドル。None=自動、(in_dx,in_dy,out_dx,out_dy)=手動
+    handles: list[tuple[float, float, float, float] | None] = field(default_factory=list)
     width: float = 5.0
     color: tuple[int, int, int, int] = (0, 0, 0, 255)
     smooth: bool = True
 
+    def __post_init__(self):
+        # handles は points と必ず同じ長さにしておく。ここを揃えておかないと
+        # 添字でずれて、別の点のハンドルを掴むことになる。
+        self._sync_handles()
+
+    def _sync_handles(self) -> None:
+        n = len(self.points)
+        if len(self.handles) < n:
+            self.handles.extend([None] * (n - len(self.handles)))
+        elif len(self.handles) > n:
+            del self.handles[n:]
+
     def copy(self) -> "VectorStroke":
-        """履歴用の複製。points はタプルのリストなので浅い複製で足りる。"""
-        return replace(self, points=list(self.points))
+        """履歴用の複製。points も handles もタプルなので浅い複製で足りる。"""
+        return replace(self, points=list(self.points), handles=list(self.handles))
+
+    def has_handles(self, i: int) -> bool:
+        return 0 <= i < len(self.handles) and self.handles[i] is not None
+
+    def auto_handles(self, i: int) -> tuple[float, float, float, float]:
+        """その点の「自動で決まっている」ハンドルを相対座標で返す。
+
+        ハンドルを出すとき、いきなり変な形にならないよう、まずは
+        今の曲線と同じ形になる値を入れるために使う。
+        """
+        pts = self.points
+        n = len(pts)
+        if n < 2 or not (0 <= i < n):
+            return (0.0, 0.0, 0.0, 0.0)
+        prev = pts[i - 1] if i > 0 else pts[i]
+        nxt = pts[i + 1] if i < n - 1 else pts[i]
+        # Catmull-Rom と同じ式（前後の点の差の 1/6）
+        dx = (nxt[0] - prev[0]) / 6.0
+        dy = (nxt[1] - prev[1]) / 6.0
+        return (-dx, -dy, dx, dy)
+
+    def set_handles(self, i: int, value) -> None:
+        self._sync_handles()
+        if 0 <= i < len(self.handles):
+            self.handles[i] = value
+
+    def handle_points(self, i: int) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """i 番の点のハンドル位置をキャンバス座標で返す（入る側, 出る側）。"""
+        if not self.has_handles(i):
+            return None
+        px, py = self.points[i]
+        ix, iy, ox, oy = self.handles[i]  # type: ignore
+        return ((px + ix, py + iy), (px + ox, py + oy))
 
     def bounds(self) -> QRectF:
         """線幅を含めた外接矩形。当たり判定の足切りと再描画範囲に使う。"""
@@ -42,6 +97,14 @@ class VectorStroke:
             return QRectF()
         xs = [p[0] for p in self.points]
         ys = [p[1] for p in self.points]
+        # ハンドルを引っぱると曲線が点の外側までふくらむので、
+        # ハンドルの先も含めて測る。含めないと端が欠けて描かれる。
+        for i, h in enumerate(self.handles):
+            if h is None or i >= len(self.points):
+                continue
+            px, py = self.points[i]
+            xs.extend((px + h[0], px + h[2]))
+            ys.extend((py + h[1], py + h[3]))
         pad = self.width / 2.0 + 1.0
         return QRectF(min(xs) - pad, min(ys) - pad,
                       max(xs) - min(xs) + pad * 2,
@@ -49,12 +112,17 @@ class VectorStroke:
 
 
 def catmull_rom_to_path(points: list[tuple[float, float]],
-                        smooth: bool = True) -> QPainterPath:
+                        smooth: bool = True,
+                        handles: list | None = None) -> QPainterPath:
     """点列を通るなめらかな曲線を QPainterPath にする。
 
-    Catmull-Rom スプラインを三次ベジェに変換している。この曲線は
+    既定は Catmull-Rom スプラインを三次ベジェに変換したもの。この曲線は
     制御点を必ず通るので、「点を動かした場所を線が通る」という
-    直感どおりの編集ができる（ベジェのハンドル操作は要らない）。
+    直感どおりの編集ができる。
+
+    handles に (in_dx,in_dy,out_dx,out_dy) が入っている点では、
+    自動で決まるハンドルの代わりにその値を使う。こうすると、普段は
+    点だけを触り、こだわりたい点だけハンドルで曲がり具合を作り込める。
     """
     path = QPainterPath()
     if not points:
@@ -68,23 +136,45 @@ def catmull_rom_to_path(points: list[tuple[float, float]],
         return path
 
     path.moveTo(*points[0])
-    if not smooth or len(points) == 2:
+    if not smooth:
         for x, y in points[1:]:
             path.lineTo(x, y)
         return path
 
-    # 端点を複製して、最初と最後の区間にも前後の点を用意する。
-    pts = [points[0]] + list(points) + [points[-1]]
-    for i in range(1, len(pts) - 2):
-        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
-        b1 = (p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0)
-        b2 = (p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0)
+    n = len(points)
+
+    def _h(i: int):
+        if handles is None or not (0 <= i < len(handles)):
+            return None
+        return handles[i]
+
+    for i in range(n - 1):
+        p1 = points[i]
+        p2 = points[i + 1]
+        h1 = _h(i)
+        h2 = _h(i + 1)
+
+        if h1 is not None:
+            # 出る側のハンドル
+            b1 = (p1[0] + h1[2], p1[1] + h1[3])
+        else:
+            # 自動：前の点との関係から決める（端は自分自身を前の点とみなす）
+            p0 = points[i - 1] if i > 0 else p1
+            b1 = (p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0)
+
+        if h2 is not None:
+            # 入る側のハンドル
+            b2 = (p2[0] + h2[0], p2[1] + h2[1])
+        else:
+            p3 = points[i + 2] if i + 2 < n else p2
+            b2 = (p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0)
+
         path.cubicTo(b1[0], b1[1], b2[0], b2[1], p2[0], p2[1])
     return path
 
 
 def stroke_to_path(stroke: VectorStroke) -> QPainterPath:
-    return catmull_rom_to_path(stroke.points, stroke.smooth)
+    return catmull_rom_to_path(stroke.points, stroke.smooth, stroke.handles)
 
 
 def _perp_distance(pt: tuple[float, float],
@@ -131,6 +221,94 @@ def rdp_simplify(points: list[tuple[float, float]],
             stack.append((start, idx))
             stack.append((idx, end))
     return [p for p, k in zip(points, keep) if k]
+
+
+def stroke_hit(stroke: VectorStroke, x: float, y: float,
+               tolerance: float = 4.0) -> bool:
+    """(x,y) が線の上かどうか。線を選ぶときの当たり判定。
+
+    線幅の半分に許容量を足した太さに膨らませて、その内側に入るかで見る。
+    細い線でも掴めるよう、最低限の太さを確保する。
+    """
+    if not stroke.points:
+        return False
+    if not stroke.bounds().adjusted(-tolerance, -tolerance,
+                                    tolerance, tolerance).contains(QPointF(x, y)):
+        return False
+    reach = max(stroke.width / 2.0, 1.0) + tolerance
+    # 曲線を折れ線に落として、各線分との距離で見る。
+    # QPainterPathStroker + contains でも判定できるが、細い線や
+    # 開いたパスで取りこぼすことがあるので距離で見るほうが確実。
+    for poly in stroke_to_path(stroke).toSubpathPolygons():
+        pts = [(p.x(), p.y()) for p in poly]
+        if len(pts) == 1:
+            px, py = pts[0]
+            if (px - x) ** 2 + (py - y) ** 2 <= reach ** 2:
+                return True
+            continue
+        for a, b in zip(pts, pts[1:]):
+            if _point_segment_distance((x, y), a, b) <= reach:
+                return True
+    return False
+
+
+def _point_segment_distance(pt: tuple[float, float],
+                            a: tuple[float, float],
+                            b: tuple[float, float]) -> float:
+    """点から線分までの距離。線分の外側なら端点までの距離になる。"""
+    px, py = pt
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 <= 1e-12:
+        return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+    t = ((px - ax) * dx + (py - ay) * dy) / seg2
+    t = max(0.0, min(1.0, t))
+    cx, cy = ax + t * dx, ay + t * dy
+    return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+
+
+def nearest_point_index(stroke: VectorStroke, x: float, y: float,
+                        tolerance: float) -> int | None:
+    """(x,y) に最も近い制御点の番号。許容量より遠ければ None。"""
+    best, best_d = None, tolerance
+    for i, (px, py) in enumerate(stroke.points):
+        d = ((px - x) ** 2 + (py - y) ** 2) ** 0.5
+        if d <= best_d:
+            best, best_d = i, d
+    return best
+
+
+def nearest_handle(stroke: VectorStroke, x: float, y: float,
+                   tolerance: float):
+    """(x,y) に最も近いハンドル。(点の番号, "in"|"out") か None。"""
+    best, best_d = None, tolerance
+    for i in range(len(stroke.points)):
+        hp = stroke.handle_points(i)
+        if hp is None:
+            continue
+        for side, (hx, hy) in (("in", hp[0]), ("out", hp[1])):
+            d = ((hx - x) ** 2 + (hy - y) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = (i, side), d
+    return best
+
+
+def insert_index_for(stroke: VectorStroke, x: float, y: float) -> int:
+    """(x,y) に点を足すとしたら何番目かを返す。
+
+    一番近い線分を探し、その後ろに挟む。
+    """
+    pts = stroke.points
+    if len(pts) < 2:
+        return len(pts)
+    best_i, best_d = len(pts) - 1, float("inf")
+    for i in range(len(pts) - 1):
+        d = _point_segment_distance((x, y), pts[i], pts[i + 1])
+        if d < best_d:
+            best_i, best_d = i, d
+    return best_i + 1
 
 
 def drop_near_duplicates(points: list[tuple[float, float]],
@@ -288,6 +466,11 @@ class VectorLayer(Layer):
         """線をまとめて拡大縮小する。キャンバスのサイズ変更用。"""
         for stroke in self.strokes:
             stroke.points = [(x * sx, y * sy) for x, y in stroke.points]
+            # ハンドルは点からの相対位置なので、移動では触らなくてよいが
+            # 拡大縮小では一緒に伸ばさないと曲がり具合が変わってしまう。
+            stroke.handles = [None if h is None
+                              else (h[0] * sx, h[1] * sy, h[2] * sx, h[3] * sy)
+                              for h in stroke.handles]
             stroke.width = max(0.1, stroke.width * (abs(sx) + abs(sy)) / 2.0)
         self.mark_dirty()
 

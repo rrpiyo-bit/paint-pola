@@ -39,8 +39,15 @@ class TestCurve:
         assert catmull_rom_to_path([]).isEmpty()
 
     def test_two_points_is_straight(self):
+        # 2点はベジェ1本で表されるが、形は完全な直線でなければならない
         path = catmull_rom_to_path([(0.0, 0.0), (10.0, 0.0)], smooth=True)
-        assert path.elementCount() == 2
+        xs = []
+        for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+            pt = path.pointAtPercent(t)
+            assert abs(pt.y()) < 1e-6, "2点の線が曲がっている"
+            xs.append(pt.x())
+        assert xs == sorted(xs)
+        assert abs(xs[0]) < 1e-6 and abs(xs[-1] - 10.0) < 1e-6
 
 
 # ── 間引き ───────────────────────────────────────────────────────────────────
@@ -262,6 +269,218 @@ class TestCanvasIntegration:
         c.tool = Tool.RECT
         self.press(c, 50, 50)
         assert not msgs
+
+    # ── 選択モード ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def press_mod(c, x, y, mods=Qt.KeyboardModifier.NoModifier):
+        wp = c._c2w().map(QPointF(x, y))
+        c.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, wp, Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, mods))
+
+    @staticmethod
+    def move_to(c, x, y, mods=Qt.KeyboardModifier.NoModifier):
+        wp = c._c2w().map(QPointF(x, y))
+        c.mouseMoveEvent(QMouseEvent(
+            QEvent.Type.MouseMove, wp, Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, mods))
+
+    @staticmethod
+    def release(c, x, y):
+        wp = c._c2w().map(QPointF(x, y))
+        c.mouseReleaseEvent(QMouseEvent(
+            QEvent.Type.MouseButtonRelease, wp, Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+
+    def select_setup(self):
+        """線が1本あるベクターレイヤーを選択モードで用意する。"""
+        from tools import Tool
+        c, lyr = self.make()
+        c.tool = Tool.PEN
+        lyr.add_stroke(VectorStroke(
+            points=[(20.0, 50.0), (50.0, 50.0), (80.0, 50.0)], width=6.0))
+        c.vector_pen_mode = "select"
+        return c, lyr
+
+    def test_click_selects_line(self):
+        c, lyr = self.select_setup()
+        self.press_mod(c, 50, 50)
+        assert c._vector_selected is lyr.strokes[0]
+
+    def test_click_empty_deselects(self):
+        c, lyr = self.select_setup()
+        self.press_mod(c, 50, 50)
+        self.press_mod(c, 10, 10)
+        assert c._vector_selected is None
+
+    def test_drag_point_moves_it(self):
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        self.press_mod(c, 50, 50)          # 選ぶ
+        self.press_mod(c, 50, 50)          # 真ん中の点を掴む
+        assert c._vector_drag == ("point", 1)
+        self.move_to(c, 50, 70)
+        self.release(c, 50, 70)
+        assert s.points[1] == (50.0, 70.0)
+        assert c._vector_drag is None
+
+    def test_click_without_drag_leaves_no_history(self):
+        """掴んだだけで動かさなかったら、元に戻すが空振りしないよう履歴を戻す。"""
+        c, lyr = self.select_setup()
+        self.press_mod(c, 50, 50)
+        before = len(c._history)
+        self.press_mod(c, 50, 50)
+        self.release(c, 50, 50)
+        assert len(c._history) == before
+
+    def test_alt_shift_click_toggles_handles(self):
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        mods = (Qt.KeyboardModifier.AltModifier
+                | Qt.KeyboardModifier.ShiftModifier)
+        self.press_mod(c, 50, 50)
+        self.press_mod(c, 50, 50, mods)
+        assert s.has_handles(1)
+        self.press_mod(c, 50, 50, mods)
+        assert not s.has_handles(1)
+
+    def test_handles_do_not_change_shape(self):
+        """ハンドルを出しただけでは線の形が変わってはいけない。"""
+        from vector import stroke_to_path
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        before = [stroke_to_path(s).pointAtPercent(t / 10.0)
+                  for t in range(11)]
+        s.set_handles(1, s.auto_handles(1))
+        after = [stroke_to_path(s).pointAtPercent(t / 10.0)
+                 for t in range(11)]
+        for a, b in zip(before, after):
+            assert abs(a.x() - b.x()) < 1e-6
+            assert abs(a.y() - b.y()) < 1e-6
+
+    def test_alt_click_deletes_point(self):
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        self.press_mod(c, 50, 50)
+        self.press_mod(c, 50, 50, Qt.KeyboardModifier.AltModifier)
+        assert len(s.points) == 2
+        assert len(s.handles) == 2
+
+    def test_alt_click_refuses_below_two_points(self):
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        del s.points[2]
+        del s.handles[2]
+        self.press_mod(c, 50, 50)
+        self.press_mod(c, 50, 50, Qt.KeyboardModifier.AltModifier)
+        assert len(s.points) == 2
+
+    def test_shift_click_inserts_point(self):
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        self.press_mod(c, 50, 50)
+        self.press_mod(c, 35, 50, Qt.KeyboardModifier.ShiftModifier)
+        assert len(s.points) == 4
+        assert len(s.handles) == 4
+
+    def test_delete_key_removes_selected_line(self):
+        from PyQt6.QtGui import QKeyEvent
+        c, lyr = self.select_setup()
+        self.press_mod(c, 50, 50)
+        c.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete,
+                                  Qt.KeyboardModifier.NoModifier))
+        assert lyr.strokes == []
+        assert c._vector_selected is None
+
+    def test_escape_deselects(self):
+        from PyQt6.QtGui import QKeyEvent
+        c, lyr = self.select_setup()
+        self.press_mod(c, 50, 50)
+        c.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                                  Qt.KeyboardModifier.NoModifier))
+        assert c._vector_selected is None
+        assert len(lyr.strokes) == 1
+
+    def test_width_change_and_undo(self):
+        c, lyr = self.select_setup()
+        s = lyr.strokes[0]
+        self.press_mod(c, 50, 50)
+        c.set_selected_stroke_width(20)
+        assert lyr.strokes[0].width == 20.0
+        c.undo()
+        assert lyr.strokes[0].width == 6.0
+
+    def test_apply_color(self):
+        from PyQt6.QtGui import QColor as QC
+        c, lyr = self.select_setup()
+        c.pen_color = QC(255, 0, 0, 255)
+        self.press_mod(c, 50, 50)
+        c.apply_color_to_selected_stroke()
+        assert lyr.strokes[0].color == (255, 0, 0, 255)
+
+    def test_switching_to_draw_mode_clears_selection(self):
+        c, lyr = self.select_setup()
+        self.press_mod(c, 50, 50)
+        c.set_vector_pen_mode("draw")
+        assert c._vector_selected is None
+
+
+# ── ハンドル（Option C） ─────────────────────────────────────────────────────
+
+class TestHandles:
+    def test_new_stroke_has_none_handles(self):
+        s = VectorStroke(points=[(0.0, 0.0), (1.0, 1.0)])
+        assert s.handles == [None, None]
+
+    def test_handles_stay_in_sync_with_points(self):
+        s = VectorStroke(points=[(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)])
+        assert len(s.handles) == 3
+
+    def test_copy_is_independent(self):
+        s = VectorStroke(points=[(0.0, 0.0), (1.0, 1.0)])
+        s.set_handles(0, (1.0, 2.0, 3.0, 4.0))
+        t = s.copy()
+        t.set_handles(0, None)
+        assert s.handles[0] == (1.0, 2.0, 3.0, 4.0)
+
+    def test_handle_points_are_absolute(self):
+        s = VectorStroke(points=[(10.0, 10.0), (20.0, 10.0)])
+        s.set_handles(0, (-2.0, 0.0, 2.0, 0.0))
+        assert s.handle_points(0) == ((8.0, 10.0), (12.0, 10.0))
+        assert s.handle_points(1) is None
+
+    def test_bounds_include_handle_tips(self):
+        s = VectorStroke(points=[(10.0, 10.0), (20.0, 10.0)], width=1.0)
+        plain = s.bounds()
+        s.set_handles(0, (0.0, -50.0, 0.0, 50.0))
+        assert s.bounds().top() < plain.top()
+
+    def test_scale_scales_handles(self):
+        lyr = VectorLayer("v", W, H)
+        s = VectorStroke(points=[(10.0, 10.0), (20.0, 10.0)])
+        s.set_handles(0, (-2.0, -4.0, 2.0, 4.0))
+        lyr.add_stroke(s)
+        lyr.scale_strokes(2.0, 3.0)
+        assert s.handles[0] == (-4.0, -12.0, 4.0, 12.0)
+
+    def test_translate_leaves_handles_alone(self):
+        lyr = VectorLayer("v", W, H)
+        s = VectorStroke(points=[(10.0, 10.0), (20.0, 10.0)])
+        s.set_handles(0, (-2.0, -4.0, 2.0, 4.0))
+        lyr.add_stroke(s)
+        lyr.translate_strokes(5.0, 5.0)
+        assert s.handles[0] == (-2.0, -4.0, 2.0, 4.0)
+        assert s.points[0] == (15.0, 15.0)
+
+    def test_manual_handle_changes_curve(self):
+        from vector import stroke_to_path
+        s = VectorStroke(points=[(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)])
+        # t=0.5 は制御点そのものなので動かない。その手前で測る。
+        mid_before = stroke_to_path(s).pointAtPercent(0.25)
+        s.set_handles(1, (-20.0, -30.0, 20.0, 30.0))
+        mid_after = stroke_to_path(s).pointAtPercent(0.25)
+        assert abs(mid_before.y() - mid_after.y()) > 1e-3
 
 
 # ── 保存データのサニタイズ ───────────────────────────────────────────────────

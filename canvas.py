@@ -454,6 +454,7 @@ class Canvas(QWidget):
     tool_shortcut_pressed = pyqtSignal(object)  # Tool — キーボードショートカットでツール切替
     edited = pyqtSignal()  # 絵・レイヤー構造が実際に変更されたとき（未保存マーク用）
     grid_visibility_changed = pyqtSignal(bool)  # 方眼の表示・非表示が変わったとき（メニューのチェックを合わせるため）
+    vector_selection_changed = pyqtSignal()  # 選んでいるベクター線が変わったとき（ツールオプションを出し直す）
 
     # テキスト入力ダイアログをキャンバス内で閉じるため、main から注入する
     ask_text_fn: object = None  # type: ignore  # Callable[[Canvas], None] | None
@@ -543,6 +544,14 @@ class Canvas(QWidget):
         self._vector_points: list[tuple[float, float]] | None = None
         # 選んでいる線（オブジェクト参照で持つ。分割や削除で番号がずれるため）
         self._vector_selected = None
+        # ベクターレイヤーでのペンの役割: "draw"=描く / "select"=線を選んで直す
+        self.vector_pen_mode = "draw"
+        # 掴んでいるもの: None / ("point", i) / ("handle", i, "in"|"out")
+        self._vector_drag = None
+        # ハンドルを片側だけ動かすか（Alt 中）。角を作りたいときに使う。
+        self._vector_corner_drag = False
+        # ドラッグで実際に動かしたか（動かしていなければ履歴を戻す）
+        self._vector_drag_moved = False
 
         # transform (floating image)
         self._transform_image: QImage | None = None
@@ -1061,7 +1070,10 @@ class Canvas(QWidget):
         layer.strokes = strokes  # type: ignore
         layer.mark_dirty()  # type: ignore
         # 選択していた線が消えた可能性があるので、掴んだままにしない。
-        self._vector_selected = None
+        if self._vector_selected is not None:
+            self._vector_selected = None
+            self._vector_drag = None
+            self.vector_selection_changed.emit()
 
     def undo(self):
         if self._transform_image:
@@ -1223,6 +1235,9 @@ class Canvas(QWidget):
         # ハンドルはウィジェット座標で描く
         if self._transform_image and self._transform_rect:
             self._draw_transform_handles(p)
+
+        # ベクターの制御点も同じくウィジェット座標で（拡大しても同じ大きさ）
+        self._draw_vector_handles(p)
 
         # ブラシカーソル円
         if self._cursor_widget_pos and self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
@@ -1706,6 +1721,200 @@ class Canvas(QWidget):
         p.strokePath(stroke_to_path(stroke), _pen_for(stroke))
         p.restore()
 
+    def _draw_vector_handles(self, p: QPainter):
+        """選んでいる線の制御点とハンドルを描く。
+
+        ウィジェット座標で描くので、拡大しても点の大きさは変わらない。
+        点は四角、ハンドルは丸にして、掴む前に見分けられるようにする。
+        """
+        sel = self._vector_selected
+        if sel is None or not sel.points:
+            return
+        layer = self.layer_stack.active
+        if layer is None or not layer.is_vector or sel not in layer.strokes:
+            return
+
+        c2w = self._c2w()
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # 線そのものを青でなぞって、選択中だと分かるようにする。
+        from vector import stroke_to_path
+        outline = c2w.map(stroke_to_path(sel))
+        p.setPen(QPen(QColor(74, 144, 217, 200), 1.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(outline)
+
+        for i, (cx, cy) in enumerate(sel.points):
+            wp = c2w.map(QPointF(cx, cy))
+
+            hp = sel.handle_points(i)
+            if hp is not None:
+                # ハンドルは点から伸びる棒と丸で描く
+                p.setPen(QPen(QColor(120, 120, 120, 200), 1.0))
+                for hx, hy in hp:
+                    whp = c2w.map(QPointF(hx, hy))
+                    p.drawLine(wp, whp)
+                p.setPen(QPen(QColor(60, 60, 60), 1.0))
+                p.setBrush(QColor(255, 255, 255))
+                for hx, hy in hp:
+                    whp = c2w.map(QPointF(hx, hy))
+                    p.drawEllipse(whp, 4.0, 4.0)
+
+            # 制御点は四角。ハンドルを出している点は色を変える。
+            p.setPen(QPen(QColor(30, 30, 30), 1.0))
+            p.setBrush(QColor(74, 144, 217) if sel.has_handles(i)
+                       else QColor(255, 255, 255))
+            p.drawRect(QRectF(wp.x() - 3.5, wp.y() - 3.5, 7.0, 7.0))
+
+        p.restore()
+
+    # ── ベクター編集（選択モード） ───────────────────────────────────────────
+
+    def _vector_tol(self) -> float:
+        """掴む判定の許容量（キャンバス座標）。
+
+        拡大率で割るので、画面上では拡大しても同じ大きさに感じられる。
+        """
+        return 8.0 / max(0.05, self.zoom)
+
+    def _vector_select_press(self, layer, cp, event):
+        """選択モードでの押下。ハンドル → 制御点 → 線 の順に掴む。
+
+        奥のものから先に見るのは、ハンドルや点が線の上に重なっていても
+        手前にあるものを優先して掴めるようにするため。
+        """
+        from vector import (nearest_point_index, nearest_handle, stroke_hit,
+                            insert_index_for)
+        x, y = float(cp.x()), float(cp.y())
+        tol = self._vector_tol()
+        alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        sel = self._vector_selected
+
+        if sel is not None and sel in layer.strokes:
+            # 1. ハンドルを掴む。ただし Alt+Shift は出し入れの合図なので、
+            #    ハンドルが点の近くにあっても掴まずに 2. へ流す。
+            hit = None if (alt and shift) else nearest_handle(sel, x, y, tol)
+            if hit is not None:
+                self._save_history()
+                self._vector_drag = ("handle", hit[0], hit[1])
+                self._vector_drag_moved = False
+                return
+
+            # 2. 制御点を掴む。Shift 単独は「点を足す」の合図なので、
+            #    近くに点があっても掴まずに 3. へ流す。
+            idx = None if (shift and not alt) else nearest_point_index(sel, x, y, tol)
+            if idx is not None:
+                if alt and shift:
+                    # ハンドルの出し入れを切り替える
+                    self._save_history()
+                    if sel.has_handles(idx):
+                        sel.set_handles(idx, None)
+                        self.status_message.emit("ハンドルをしまいました。")
+                    else:
+                        sel.set_handles(idx, sel.auto_handles(idx))
+                        self.status_message.emit(
+                            "ハンドルを出しました。ドラッグで曲がり具合を変えられます。")
+                    layer.mark_dirty()
+                    self.edited.emit()
+                    self.update()
+                    return
+                if alt:
+                    # 点を消す。2点は線の最低限なので、それ以下にはしない。
+                    if len(sel.points) <= 2:
+                        self.status_message.emit("これ以上は点を減らせません。")
+                        return
+                    self._save_history()
+                    del sel.points[idx]
+                    del sel.handles[idx]
+                    layer.mark_dirty()
+                    self.edited.emit()
+                    self.update()
+                    return
+                self._save_history()
+                self._vector_drag = ("point", idx)
+                self._vector_drag_moved = False
+                return
+
+            # 3. 選択中の線の上なら点を足す
+            if shift and stroke_hit(sel, x, y, tol):
+                self._save_history()
+                at = insert_index_for(sel, x, y)
+                sel.points.insert(at, (x, y))
+                sel.handles.insert(at, None)
+                layer.mark_dirty()
+                self._vector_drag = ("point", at)
+                # 点を足した時点で変わっているので、履歴は残す
+                self._vector_drag_moved = True
+                self.update()
+                return
+
+        # 4. 線を選び直す（手前＝後に描いたものから探す）
+        for stroke in reversed(layer.strokes):
+            if stroke_hit(stroke, x, y, tol):
+                self._vector_selected = stroke
+                self.vector_selection_changed.emit()
+                self.update()
+                return
+
+        # 何も無いところ＝選択解除
+        if self._vector_selected is not None:
+            self._vector_selected = None
+            self.vector_selection_changed.emit()
+        self.update()
+
+    def _vector_drag_move(self, layer, cp) -> bool:
+        """選択モードでのドラッグ。掴んでいれば True。"""
+        if self._vector_drag is None:
+            return False
+        sel = self._vector_selected
+        if sel is None or sel not in layer.strokes:
+            self._vector_drag = None
+            return False
+        x, y = float(cp.x()), float(cp.y())
+
+        kind = self._vector_drag[0]
+        if kind == "point":
+            i = self._vector_drag[1]
+            if 0 <= i < len(sel.points):
+                sel.points[i] = (x, y)
+        else:
+            i, side = self._vector_drag[1], self._vector_drag[2]
+            if 0 <= i < len(sel.points) and sel.has_handles(i):
+                px, py = sel.points[i]
+                dx, dy = x - px, y - py
+                h = sel.handles[i]
+                if self._vector_corner_drag:
+                    # Alt 中は片側だけ動かす。角（とがった曲がり）を作れる。
+                    sel.handles[i] = ((dx, dy, h[2], h[3]) if side == "in"
+                                      else (h[0], h[1], dx, dy))
+                else:
+                    # 既定は反対側も対称に動かして、点のところを滑らかに保つ。
+                    sel.handles[i] = ((dx, dy, -dx, -dy) if side == "in"
+                                      else (-dx, -dy, dx, dy))
+        self._vector_drag_moved = True
+        layer.mark_dirty()
+        self.update()
+        return True
+
+    def _end_vector_drag(self):
+        """選択モードのドラッグ終わり。動かしていなければ履歴を戻す。
+
+        掴んだ時点で履歴を積んでいるので、ただクリックしただけのときに
+        「元に戻す」が空振りするのを防ぐ。
+        """
+        was = self._vector_drag
+        self._vector_drag = None
+        self._vector_corner_drag = False
+        if was is None:
+            return
+        if not self._vector_drag_moved and self._history:
+            self._history.pop()
+        else:
+            self.edited.emit()
+        self._vector_drag_moved = False
+
     def _commit_vector_stroke(self, layer):
         """溜めた点を1本の線として確定する。"""
         from vector import VectorStroke, simplify_input
@@ -1728,6 +1937,85 @@ class Canvas(QWidget):
             width=width,
             color=(self.pen_color.red(), self.pen_color.green(),
                    self.pen_color.blue(), self.pen_color.alpha())))
+        self.update()
+
+    def _vector_active_layer(self):
+        """選択中のベクター線を持っているレイヤーを返す（無ければ None）。"""
+        layer = self.layer_stack.active
+        if layer is None or not getattr(layer, "is_vector", False):
+            return None
+        if self._vector_selected is None:
+            return None
+        if self._vector_selected not in layer.strokes:
+            # レイヤーを切り替えた等で取り残された参照を掃除する
+            self._vector_selected = None
+            return None
+        return layer
+
+    def set_vector_pen_mode(self, mode: str):
+        """ベクターレイヤーでのペンの役割を切り替える（描く / 線を選ぶ）。"""
+        mode = "select" if mode == "select" else "draw"
+        if mode == self.vector_pen_mode:
+            return
+        self.vector_pen_mode = mode
+        if mode == "draw":
+            # 描くモードに戻ったら選択と制御点を消す（画面がうるさいので）
+            self._vector_selected = None
+            self._vector_drag = None
+        self.vector_selection_changed.emit()
+        self.update()
+
+    def set_selected_stroke_width(self, width: float):
+        layer = self._vector_active_layer()
+        if layer is None:
+            return
+        width = max(1.0, float(width))
+        if abs(self._vector_selected.width - width) < 1e-9:
+            return
+        self._save_history()
+        self._vector_selected.width = width
+        layer.mark_dirty()
+        self.edited.emit()
+        self.update()
+
+    def apply_color_to_selected_stroke(self):
+        layer = self._vector_active_layer()
+        if layer is None:
+            return
+        col = (self.pen_color.red(), self.pen_color.green(),
+               self.pen_color.blue(), self.pen_color.alpha())
+        if self._vector_selected.color == col:
+            return
+        self._save_history()
+        self._vector_selected.color = col
+        layer.mark_dirty()
+        self.edited.emit()
+        self.update()
+
+    def set_selected_stroke_smooth(self, smooth: bool):
+        layer = self._vector_active_layer()
+        if layer is None:
+            return
+        smooth = bool(smooth)
+        if self._vector_selected.smooth == smooth:
+            return
+        self._save_history()
+        self._vector_selected.smooth = smooth
+        layer.mark_dirty()
+        self.edited.emit()
+        self.update()
+
+    def delete_selected_stroke(self):
+        layer = self._vector_active_layer()
+        if layer is None:
+            return
+        self._save_history()
+        layer.strokes.remove(self._vector_selected)
+        self._vector_selected = None
+        self._vector_drag = None
+        layer.mark_dirty()
+        self.edited.emit()
+        self.vector_selection_changed.emit()
         self.update()
 
     def _rotation_handle_canvas(self) -> QPointF | None:
@@ -1887,7 +2175,10 @@ class Canvas(QWidget):
         loy = getattr(layer, 'offset_y', 0)
         lp = QPoint(cp.x() - lox, cp.y() - loy)
 
-        if self.tool == Tool.PEN and layer.is_vector:
+        if self.tool == Tool.PEN and layer.is_vector and self.vector_pen_mode == "select":
+            self._vector_select_press(layer, cp, event)
+
+        elif self.tool == Tool.PEN and layer.is_vector:
             # ベクターは確定するまで image に描かない。点を溜めておき、
             # 表示はプレビューで見せて、離したときに1本の線にする。
             self._vector_points = [(float(cp.x()), float(cp.y()))]
@@ -2127,6 +2418,11 @@ class Canvas(QWidget):
             return
 
         if self.tool == Tool.PEN and layer.is_vector:
+            if self.vector_pen_mode == "select":
+                self._vector_corner_drag = bool(
+                    event.modifiers() & Qt.KeyboardModifier.AltModifier)
+                self._vector_drag_move(layer, cp)
+                return
             if self._vector_points is not None:
                 self._vector_points.append((float(cp.x()), float(cp.y())))
                 self.update()
@@ -2205,6 +2501,10 @@ class Canvas(QWidget):
             return
 
         if not layer or layer.is_group:
+            return
+
+        if self.tool == Tool.PEN and layer.is_vector and self.vector_pen_mode == "select":
+            self._end_vector_drag()
             return
 
         if self.tool == Tool.PEN and layer.is_vector and self._vector_points is not None:
@@ -3256,6 +3556,20 @@ class Canvas(QWidget):
             if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete) and self._path_pick_points:
                 self._path_pick_points.pop()
                 self.update()
+                event.accept()
+                return
+
+        # ベクター線を選んでいるとき。変形より先に見る（変形中は線を選べない）
+        if self._vector_selected is not None:
+            if event.key() == Qt.Key.Key_Escape:
+                self._vector_selected = None
+                self._vector_drag = None
+                self.vector_selection_changed.emit()
+                self.update()
+                event.accept()
+                return
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                self.delete_selected_stroke()
                 event.accept()
                 return
 

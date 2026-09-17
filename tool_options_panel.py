@@ -97,6 +97,12 @@ class ToolOptionsPanel(QWidget):
     mesh_div_changed = pyqtSignal(int)              # メッシュ分割数
     blur_size_changed = pyqtSignal(int)
     blur_strength_changed = pyqtSignal(int)         # 0〜100 (%)
+    # ベクターレイヤー用（ペン選択時のみ出る）
+    vector_pen_mode_changed = pyqtSignal(str)       # "draw" | "select"
+    vector_width_changed = pyqtSignal(int)          # 選択中の線の太さ
+    vector_apply_color_requested = pyqtSignal()     # 今の色を選択中の線に塗る
+    vector_delete_requested = pyqtSignal()          # 選択中の線を消す
+    vector_smooth_toggled = pyqtSignal(bool)        # なめらか / 直線つなぎ
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,7 +167,10 @@ class ToolOptionsPanel(QWidget):
                  select_mode: str = "select",
                  transform_mode: str = "standard",
                  blur_size: int = 30, blur_strength: int = 50,
-                 mesh_div: int = 3):
+                 mesh_div: int = 3,
+                 is_vector: bool = False,
+                 vector_pen_mode: str = "draw",
+                 vector_selected=None):
         self._current_tool = tool
         self._clear()
 
@@ -183,7 +192,10 @@ class ToolOptionsPanel(QWidget):
         }
         self._title.setText(label_map.get(tool, "ツールオプション"))
 
-        if tool == Tool.PEN:
+        if tool == Tool.PEN and is_vector:
+            self._build_vector_pen(pen_size, vector_pen_mode, vector_selected)
+
+        elif tool == Tool.PEN:
             self._add_spinbox("ブラシサイズ", pen_size, 1, 200,
                               lambda v: self.pen_size_changed.emit(v))
             self._add_brush_combo(brush_key)
@@ -430,6 +442,63 @@ class ToolOptionsPanel(QWidget):
             self.pivot_mode_changed.emit(mode)
 
         mode_cb.currentIndexChanged.connect(on_mode_change)
+
+    def _build_vector_pen(self, pen_size: int, mode: str, selected):
+        """ベクターレイヤー選択中のペンの設定。
+
+        描くモードと選ぶモードを切り替えて使う。選ぶモードでは、
+        選んでいる線の太さ・色・形をここから直せる。
+        """
+        cb = QComboBox()
+        cb.addItem("描く", "draw")
+        cb.addItem("線を選んで直す", "select")
+        cb.setCurrentIndex(1 if mode == "select" else 0)
+        cb.currentIndexChanged.connect(
+            lambda i: self.vector_pen_mode_changed.emit(
+                cb.itemData(i)))
+        self._add_row("ペンの役割", cb,
+                      tooltip="「描く」で新しい線を引き、\n"
+                              "「線を選んで直す」で引いた線を編集します。")
+
+        if mode != "select":
+            self._add_spinbox("ブラシサイズ", pen_size, 1, 200,
+                              lambda v: self.pen_size_changed.emit(v))
+            self._add_label("ベクターレイヤーです。引いた線は\n"
+                            "あとから形も太さも色も変えられます。")
+            return
+
+        self._add_separator()
+
+        if selected is None:
+            self._add_label("線をクリックすると選べます。\n"
+                            "選ぶと制御点（□）が出ます。")
+            return
+
+        self._add_spinbox("選択中の線の太さ", max(1, int(round(selected.width))),
+                          1, 200, lambda v: self.vector_width_changed.emit(v),
+                          key="vector_width")
+        self._add_toggle("なめらかにつなぐ", bool(selected.smooth),
+                         lambda v: self.vector_smooth_toggled.emit(v))
+
+        btn = QPushButton("今の色を線に塗る")
+        btn.setToolTip("選んでいる線の色を、いま選んでいる描画色にします。")
+        btn.clicked.connect(lambda: self.vector_apply_color_requested.emit())
+        self._content_layout.insertWidget(self._content_layout.count() - 1, btn)
+        self._widgets.append(btn)
+
+        btn_del = QPushButton("この線を削除")
+        btn_del.clicked.connect(lambda: self.vector_delete_requested.emit())
+        self._content_layout.insertWidget(self._content_layout.count() - 1, btn_del)
+        self._widgets.append(btn_del)
+
+        self._add_separator()
+        self._add_label(
+            "制御点（□）をドラッグ＝形を変える\n"
+            "Alt+Shift+クリック＝ハンドルの出し入れ\n"
+            "Alt+クリック＝その点を削除\n"
+            "Shift+線の上をクリック＝点を追加\n"
+            "ハンドル（○）をドラッグ＝曲がり具合\n"
+            "　Alt を押しながらで片側だけ動く（角）")
 
     def _add_separator(self):
         """設定のまとまりを視覚的に区切る横線。"""

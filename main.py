@@ -1293,6 +1293,19 @@ class MainWindow(QMainWindow):
             lambda v: setattr(self.canvas, 'blur_strength', v / 100.0))
         # [ ] でペンサイズ変更 → オプションパネルも同期
         self.canvas.brush_size_changed.connect(self.tool_options.sync_pen_size)
+        # ベクター
+        self.tool_options.vector_pen_mode_changed.connect(
+            self._on_vector_pen_mode_change)
+        self.tool_options.vector_width_changed.connect(self._on_vector_width)
+        self.tool_options.vector_apply_color_requested.connect(
+            self._on_vector_apply_color)
+        self.tool_options.vector_delete_requested.connect(
+            self._on_vector_delete)
+        self.tool_options.vector_smooth_toggled.connect(self._on_vector_smooth)
+        # 線の選択が変わったらオプションの行を出し直す
+        self.canvas.vector_selection_changed.connect(self._refresh_tool_options)
+        # レイヤーを切り替えたときも、ベクターかどうかで出す行が変わる
+        self.layer_panel.layers_changed.connect(self._refresh_tool_options_if_kind_changed)
 
     def _connect_navigator(self):
         self.canvas.edited.connect(self._mark_dirty)
@@ -1321,8 +1334,21 @@ class MainWindow(QMainWindow):
         self.canvas._stabilizer.reset()
         self.canvas._cursor_widget_pos = None
         # ツールオプションパネルを更新
+        self._refresh_tool_options()
+        # ツールに応じたカーソル
+        self.canvas._tool_cursor = self._tool_cursors.get(tool)
+        self.canvas._restore_tool_cursor()
+
+    def _refresh_tool_options(self):
+        """ツールオプションの行を今の状態で作り直す。
+
+        ツールを変えたときだけでなく、ベクター線の選択が変わったときや
+        レイヤーを切り替えたときにも呼ぶ（出す行が変わるため）。
+        """
+        layer = self.canvas.layer_stack.active
+        is_vector = bool(layer is not None and getattr(layer, "is_vector", False))
         self.tool_options.set_tool(
-            tool,
+            self.canvas.tool,
             pen_size=self.canvas.pen_size,
             eraser_size=self.canvas.eraser_size,
             brush_key=self.canvas.brush_type,
@@ -1337,10 +1363,41 @@ class MainWindow(QMainWindow):
             blur_size=self.canvas.blur_size,
             blur_strength=int(round(self.canvas.blur_strength * 100)),
             mesh_div=self.canvas._mesh_div,
+            is_vector=is_vector,
+            vector_pen_mode=self.canvas.vector_pen_mode,
+            vector_selected=self.canvas._vector_selected if is_vector else None,
         )
-        # ツールに応じたカーソル
-        self.canvas._tool_cursor = self._tool_cursors.get(tool)
-        self.canvas._restore_tool_cursor()
+
+    def _refresh_tool_options_if_kind_changed(self):
+        """レイヤーの種類（ベクターかどうか）が変わったときだけ行を作り直す。
+
+        layers_changed は名前変更や不透明度でも飛んでくるので、
+        毎回作り直すと入力中のスピンボックスが消えてしまう。
+        """
+        layer = self.canvas.layer_stack.active
+        is_vector = bool(layer is not None and getattr(layer, "is_vector", False))
+        if is_vector == getattr(self, "_last_vector_kind", None):
+            return
+        self._last_vector_kind = is_vector
+        # 別の種類のレイヤーに移ったら、前のレイヤーの線の選択は捨てる
+        self.canvas._vector_selected = None
+        self._refresh_tool_options()
+
+    def _on_vector_pen_mode_change(self, mode: str):
+        self.canvas.set_vector_pen_mode(mode)
+        self._refresh_tool_options()
+
+    def _on_vector_width(self, v: int):
+        self.canvas.set_selected_stroke_width(float(v))
+
+    def _on_vector_apply_color(self):
+        self.canvas.apply_color_to_selected_stroke()
+
+    def _on_vector_delete(self):
+        self.canvas.delete_selected_stroke()
+
+    def _on_vector_smooth(self, on: bool):
+        self.canvas.set_selected_stroke_smooth(on)
 
     def _on_pen_size_change(self, v: int):
         self.canvas.pen_size = v
@@ -1727,6 +1784,8 @@ class MainWindow(QMainWindow):
                             info["is_vector"] = True
                             info["strokes"] = [
                                 {"points": [[float(x), float(y)] for x, y in s.points],
+                                 "handles": [None if h is None else [float(v) for v in h]
+                                             for h in s.handles],
                                  "width": float(s.width),
                                  "color": list(s.color),
                                  "smooth": bool(s.smooth)}
@@ -1814,7 +1873,29 @@ class MainWindow(QMainWindow):
                 rgba = (0, 0, 0, 255)
             if len(rgba) == 3:
                 rgba = rgba + (255,)
-            out.append(VectorStroke(points=pts, width=width, color=rgba,
+
+            # ハンドルは点と同じ数だけ並んでいる想定。壊れていたら
+            # その点だけ「自動」に落とす（線ごと捨てる必要はない）。
+            handles: list = []
+            h_raw = item.get("handles")
+            if isinstance(h_raw, list):
+                for h in h_raw[:len(pts)]:
+                    if not (isinstance(h, (list, tuple)) and len(h) >= 4):
+                        handles.append(None)
+                        continue
+                    try:
+                        vals = tuple(float(v) for v in h[:4])
+                    except (TypeError, ValueError):
+                        handles.append(None)
+                        continue
+                    if not all(math.isfinite(v) for v in vals):
+                        handles.append(None)
+                        continue
+                    handles.append(tuple(max(-LIM, min(LIM, v)) for v in vals))
+            handles.extend([None] * (len(pts) - len(handles)))
+
+            out.append(VectorStroke(points=pts, handles=handles, width=width,
+                                    color=rgba,
                                     smooth=bool(item.get("smooth", True))))
         return out
 
