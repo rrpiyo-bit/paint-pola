@@ -315,7 +315,7 @@ python main.py
 python -m pytest tests/ -v
 ```
 
-**738テスト** / 8ファイル / 全テストPASS
+**743テスト** / 8ファイル / 全テストPASS
 
 テスト中のウィンドウは既定でオフスクリーン描画され、実画面には表示されない。
 目視確認したいときだけ `PAINTPOLA_TEST_GUI=1` を付けて実行する。
@@ -333,7 +333,7 @@ python -m pytest tests/ -v
 | test_animation.py | 24 | AnimationPanel のフレーム管理・再生・GIF出力 |
 | test_e2e.py | 124 | MainWindow を通じた実際のユーザー操作フロー・線画抽出・ズームの中心維持・方眼・テーマ分離 |
 | test_actions.py | 227 | 全アクション+アクションガチャ全機能の検証 |
-| test_unit_vector.py | 103 | ベクター線の曲線・ハンドル・間引き・保存往復・消去（交点まで／線ごと） |
+| test_unit_vector.py | 108 | ベクター線の曲線・ハンドル・間引き・保存往復・消去（交点まで／線ごと）・複製 |
 
 <details>
 <summary>テスト詳細一覧（クリックで展開）</summary>

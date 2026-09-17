@@ -714,3 +714,87 @@ class TestEraseOnCanvas(TestCanvasIntegration):
     def test_erase_mode_default_is_cut(self):
         c, lyr = self.make()
         assert c.vector_erase_mode == "cut"
+
+
+class TestDuplicateKeepsVector:
+    """複製してもベクターのままであること。
+
+    ここが Layer を作ってしまうと、複製した瞬間に絵だけのラスターになり、
+    二度と線を編集できなくなる（見た目は同じなので気づきにくい）。
+    """
+
+    @staticmethod
+    def panel_with(layer):
+        from layer import LayerStack
+        from layer_panel import LayerPanel
+        ls = LayerStack(W, H)
+        ls.add("レイヤー1")
+        ls.layers.insert(0, layer)
+        ls.set_active_path([0])
+        panel = LayerPanel(ls)
+        return panel, ls
+
+    @staticmethod
+    def vector_layer():
+        lyr = VectorLayer("v", W, H)
+        lyr.add_stroke(VectorStroke(points=[(0.0, 50.0), (100.0, 50.0)],
+                                    width=7.0, color=(200, 10, 10, 255)))
+        return lyr
+
+    def test_duplicate_stays_vector(self):
+        src = self.vector_layer()
+        panel, ls = self.panel_with(src)
+        panel.refresh()
+        panel._duplicate()
+        copy = ls.layers[0]
+        assert isinstance(copy, VectorLayer)
+        assert copy.is_vector is True
+        assert len(copy.strokes) == 1
+        assert copy.strokes[0].points == [(0.0, 50.0), (100.0, 50.0)]
+        assert copy.strokes[0].width == 7.0
+        assert copy.strokes[0].color == (200, 10, 10, 255)
+
+    def test_duplicate_strokes_are_independent(self):
+        """片方を直してももう片方が変わらないこと。"""
+        src = self.vector_layer()
+        panel, ls = self.panel_with(src)
+        panel.refresh()
+        panel._duplicate()
+        copy = ls.layers[0]
+        copy.strokes[0].width = 30.0
+        assert src.strokes[0].width == 7.0
+
+    def test_duplicate_keeps_layer_props(self):
+        src = self.vector_layer()
+        src.opacity = 50
+        src.blend_mode = "multiply"
+        panel, ls = self.panel_with(src)
+        panel.refresh()
+        panel._duplicate()
+        copy = ls.layers[0]
+        assert copy.opacity == 50
+        assert copy.blend_mode == "multiply"
+
+    def test_duplicate_renders_from_its_own_strokes(self):
+        """複製直後に線を変えたら、絵もついてくること。"""
+        src = self.vector_layer()
+        panel, ls = self.panel_with(src)
+        panel.refresh()
+        panel._duplicate()
+        copy = ls.layers[0]
+        before = copy.image.cacheKey()
+        copy.strokes[0].width = 40.0
+        copy.mark_dirty()
+        assert copy.image.cacheKey() != before
+
+    def test_duplicate_group_keeps_vector_child(self):
+        """フォルダごと複製しても、中のベクターがラスターにならないこと。"""
+        from layer import GroupLayer
+        g = GroupLayer("g", W, H)
+        g.children.append(self.vector_layer())
+        panel, ls = self.panel_with(g)
+        panel.refresh()
+        panel._duplicate()
+        copy = ls.layers[0]
+        assert isinstance(copy.children[0], VectorLayer)
+        assert len(copy.children[0].strokes) == 1

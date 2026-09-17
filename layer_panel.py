@@ -994,6 +994,17 @@ class LayerPanel(QWidget):
             for child in src.children:
                 new_g.children.append(self._deep_copy_layer(child, ls, False))
             return new_g
+        elif getattr(src, "is_vector", False):
+            # ベクターレイヤーは線を持ったまま複製する。ここで Layer を作ると
+            # 複製した瞬間に絵だけのラスターになり、二度と編集できなくなる。
+            from vector import VectorLayer
+            c = VectorLayer(src.name + suffix, ls.width, ls.height)
+            c._canvas_w = src._canvas_w
+            c._canvas_h = src._canvas_h
+            c.strokes = src.copy_strokes()
+            self._copy_layer_props(src, c)
+            c.mark_dirty()
+            return c
         else:
             c = Layer(src.name + suffix, ls.width, ls.height)
             self._copy_layer_props(src, c)
