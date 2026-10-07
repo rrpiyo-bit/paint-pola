@@ -798,3 +798,214 @@ class TestDuplicateKeepsVector:
         copy = ls.layers[0]
         assert isinstance(copy.children[0], VectorLayer)
         assert len(copy.children[0].strokes) == 1
+
+
+def _alpha_count(img) -> int:
+    """不透明な画素の数。間引いて数える（全画素だと遅い）。"""
+    return sum(1 for y in range(0, img.height(), 3)
+               for x in range(0, img.width(), 3)
+               if img.pixelColor(x, y).alpha() > 0)
+
+
+class TestRasterizeAndMergeGuard:
+    """ベクターをラスタライズする操作と、統合でベクターを失う前の確認。
+
+    どちらも「黙って編集できなくなる」のを防ぐためのもの。見た目は
+    同じまま線だけが消えるので、気づかないまま作業が進むのが一番困る。
+    """
+
+    @staticmethod
+    def win_with_vector(strokes=1):
+        from main import MainWindow
+        w = MainWindow()
+        lyr = VectorLayer("ベク", w.layer_stack.width, w.layer_stack.height)
+        for i in range(strokes):
+            lyr.add_stroke(VectorStroke(
+                points=[(10.0, 10.0 + i * 20), (90.0, 60.0 + i * 20)],
+                width=8.0, color=(255, 0, 0, 255)))
+        w.layer_stack.layers.insert(0, lyr)
+        w.layer_stack.set_active_path([0])
+        return w, lyr
+
+    @staticmethod
+    def answer(monkeypatch, value, log=None):
+        """確認ダイアログの答えを決め打ちする。log に呼び出しを記録する。"""
+        from PyQt6.QtWidgets import QMessageBox
+        import main as m
+
+        def fake(parent, title, text, *a, **k):
+            if log is not None:
+                log.append(title)
+            return value
+        monkeypatch.setattr(m.QMessageBox, "question", staticmethod(fake))
+        return QMessageBox
+
+    def test_rasterize_replaces_vector_with_raster(self, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+        from layer import Layer
+        w, lyr = self.win_with_vector()
+        self.answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        w._rasterize_vector()
+        got = w.layer_stack.layers[0]
+        assert type(got) is Layer          # VectorLayer ではなくなる
+        assert got.is_vector is False
+        assert got.name == "ベク"
+
+    def test_rasterize_keeps_the_picture(self, monkeypatch):
+        """線は捨てても、焼いた絵は残っていること。"""
+        from PyQt6.QtWidgets import QMessageBox
+        w, lyr = self.win_with_vector()
+        before = _alpha_count(lyr.image)
+        assert before > 0
+        self.answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        w._rasterize_vector()
+        assert _alpha_count(w.layer_stack.layers[0].image) == before
+
+    def test_rasterize_keeps_layer_properties(self, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+        w, lyr = self.win_with_vector()
+        lyr.opacity = 128
+        lyr.visible = False
+        lyr.clipping = True
+        self.answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        w._rasterize_vector()
+        got = w.layer_stack.layers[0]
+        assert (got.opacity, got.visible, got.clipping) == (128, False, True)
+
+    def test_rasterize_can_be_cancelled(self, monkeypatch):
+        """No を押したら何も起きないこと。"""
+        from PyQt6.QtWidgets import QMessageBox
+        w, lyr = self.win_with_vector()
+        self.answer(monkeypatch, QMessageBox.StandardButton.No)
+        w._rasterize_vector()
+        assert w.layer_stack.layers[0] is lyr
+        assert len(lyr.strokes) == 1
+
+    def test_rasterize_asks_first(self, monkeypatch):
+        """確認なしに焼いてしまわないこと。"""
+        from PyQt6.QtWidgets import QMessageBox
+        log = []
+        w, lyr = self.win_with_vector()
+        self.answer(monkeypatch, QMessageBox.StandardButton.No, log)
+        w._rasterize_vector()
+        assert log == ["ベクターをラスタライズ"]
+
+    def test_rasterize_ignores_raster_layer(self, monkeypatch):
+        """ふつうのレイヤーを選んでいるときは何もしない（落ちない）こと。"""
+        from PyQt6.QtWidgets import QMessageBox
+        log = []
+        w, lyr = self.win_with_vector()
+        w.layer_stack.set_active_path([1])          # ラスター側
+        self.answer(monkeypatch, QMessageBox.StandardButton.Yes, log)
+        w._rasterize_vector()
+        assert log == []                            # 確認すら出さない
+        assert isinstance(w.layer_stack.layers[0], VectorLayer)
+
+    def test_rasterize_drops_orphan_history(self, monkeypatch):
+        """差し替えで迷子になった履歴が残らないこと。
+
+        履歴は id() でレイヤーを指しているので、捨てないと undo が
+        別のレイヤーへ当たる。
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        w, lyr = self.win_with_vector()
+        w.canvas._save_history()                    # 古いレイヤーを指す履歴
+        self.answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        w._rasterize_vector()
+        live = w.canvas._all_layer_ids()
+        assert all(e[0] == "structure" or e[1] in live
+                   for e in w.canvas._history)
+
+    def test_rasterize_is_in_the_menu(self):
+        """メニューに項目があること（追記漏れの検出）。"""
+        from PyQt6.QtWidgets import QMenu
+        from main import MainWindow
+        w = MainWindow()
+        texts = [a.text() for m in w.menuBar().findChildren(QMenu)
+                 for a in m.actions()]
+        assert "ベクターをラスタライズ" in texts
+        # 効果だけを焼く既存の項目と別物であること
+        assert "レイヤーをラスタライズ" in texts
+
+    def test_merge_down_asks_before_losing_vector(self, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+        log = []
+        w, lyr = self.win_with_vector()
+        before = len(w.layer_stack.layers)
+        self.answer(monkeypatch, QMessageBox.StandardButton.No, log)
+        w._merge_down()
+        assert log == ["ベクターレイヤーの統合"]
+        assert len(w.layer_stack.layers) == before   # 中止された
+        assert w.layer_stack.layers[0] is lyr
+
+    def test_merge_down_proceeds_on_yes(self, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+        w, lyr = self.win_with_vector()
+        before = len(w.layer_stack.layers)
+        self.answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        w._merge_down()
+        assert len(w.layer_stack.layers) == before - 1
+
+    def test_merge_without_vector_does_not_ask(self, monkeypatch):
+        """ベクターが絡まないときに確認を出すと、ただの邪魔になる。"""
+        from PyQt6.QtWidgets import QMessageBox
+        from main import MainWindow
+        log = []
+        w = MainWindow()
+        w.layer_stack.add("レイヤー2")
+        w.layer_stack.set_active_path([0])
+        before = len(w.layer_stack.layers)
+        self.answer(monkeypatch, QMessageBox.StandardButton.Yes, log)
+        w._merge_down()
+        assert log == []
+        assert len(w.layer_stack.layers) == before - 1
+
+    def test_merge_all_visible_asks(self, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+        log = []
+        w, lyr = self.win_with_vector()
+        self.answer(monkeypatch, QMessageBox.StandardButton.No, log)
+        w._merge_all_visible()
+        assert log == ["ベクターレイヤーの統合"]
+        assert w.layer_stack.layers[0] is lyr
+
+    def test_merge_marked_asks(self, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+        log = []
+        w, lyr = self.win_with_vector()
+        lyr.merge_marked = True
+        w.layer_stack.layers[1].merge_marked = True
+        self.answer(monkeypatch, QMessageBox.StandardButton.No, log)
+        w.layer_panel.refresh()
+        w._merge_marked_layers()
+        assert log == ["ベクターレイヤーの統合"]
+        assert w.layer_stack.layers[0] is lyr
+
+    def test_hidden_vector_in_group_is_found(self, monkeypatch):
+        """グループの中のベクターも見落とさないこと。
+
+        入れ子をたどらないと、フォルダに入れた線が黙って焼かれる。
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        from layer import GroupLayer
+        from main import MainWindow
+        w = MainWindow()
+        grp = GroupLayer("フォルダ", w.layer_stack.width, w.layer_stack.height)
+        inner = VectorLayer("奥のベク", w.layer_stack.width,
+                            w.layer_stack.height)
+        grp.children.append(inner)
+        assert w._vectors_in([grp]) == [inner]
+
+    def test_confirm_lists_vector_names(self, monkeypatch):
+        """どのレイヤーが対象かが文面に出ること。"""
+        import main as m
+        from PyQt6.QtWidgets import QMessageBox
+        seen = []
+
+        def fake(parent, title, text, *a, **k):
+            seen.append(text)
+            return QMessageBox.StandardButton.No
+        monkeypatch.setattr(m.QMessageBox, "question", staticmethod(fake))
+        w, lyr = self.win_with_vector()
+        w._merge_down()
+        assert "ベク" in seen[0]

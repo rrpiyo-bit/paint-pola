@@ -1530,6 +1530,8 @@ class MainWindow(QMainWindow):
         self._add_action(image_menu, "表示レイヤーを統合", self._merge_all_visible, "Ctrl+Shift+M")
         self._add_action(image_menu, "フォルダを結合", self._merge_folder)
         self._add_action(image_menu, "レイヤーをラスタライズ", self._rasterize_layer)
+        self._add_action(image_menu, "ベクターをラスタライズ",
+                         self._rasterize_vector)
         image_menu.addSeparator()
         self._add_action(image_menu, "線画抽出...", self._extract_line)
         # 方眼は「表示」メニューにも同じものが出ていたが、これは実際に
@@ -2393,7 +2395,58 @@ class MainWindow(QMainWindow):
         w = 90 + (220 if visible else 0)
         self._left_area.setFixedWidth(w)
 
+    @staticmethod
+    def _vectors_in(items) -> list:
+        """items（レイヤーやグループ）に含まれるベクターレイヤーを集める。
+
+        グループの中はたどる。入れ子をたどらないと、フォルダに入れた線が
+        確認なしに焼かれてしまう。
+        """
+        found = []
+        for item in items:
+            if item is None:
+                continue
+            leaves = (Canvas._collect_leaf_layers(item) if item.is_group
+                      else [item])
+            found += [l for l in leaves if l.is_vector]
+        return found
+
+    def _confirm_merge_vector(self, items) -> bool:
+        """統合でベクターが失われる前に確認を取る。続けてよければ True。
+
+        統合は見た目どおりの絵にはなるが、線は点の列ごと捨てられるので
+        あとから太さや形を直せなくなる。黙って失うと取り返しがつかない
+        （undo で戻せはするが、気づかないまま作業を進めてしまう）。
+        """
+        vectors = self._vectors_in(items)
+        if not vectors:
+            return True
+        names = "、".join(v.name for v in vectors[:5])
+        if len(vectors) > 5:
+            names += f" ほか{len(vectors) - 5}枚"
+        ans = QMessageBox.question(
+            self, "ベクターレイヤーの統合",
+            f"統合するとベクターレイヤーが絵に焼き込まれ、"
+            f"線をあとから編集できなくなります。\n\n"
+            f"対象: {names}\n\n続けますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return ans == QMessageBox.StandardButton.Yes
+
+    def _merge_down_targets(self) -> list:
+        """「下に統合」で実際に混ざる2枚。確認の対象を絞るために使う。"""
+        path = self.layer_stack.active_path
+        if not path:
+            return []
+        container, _ = self.layer_stack.parent_of(path)
+        idx = path[-1]
+        if idx >= len(container) - 1:
+            return []
+        return [container[idx], container[idx + 1]]
+
     def _merge_down(self):
+        if not self._confirm_merge_vector(self._merge_down_targets()):
+            return
         self.canvas.reset_state()
         self.canvas.save_structure_history()
         if self.layer_stack.merge_down():
@@ -2410,6 +2463,8 @@ class MainWindow(QMainWindow):
         if len(targets) < 2:
             self.statusBar().showMessage(
                 "統合するレイヤーに ⛓ を2枚以上付けてください", 3000)
+            return
+        if not self._confirm_merge_vector(targets):
             return
         self.canvas.reset_state()
         self.canvas.save_structure_history()
@@ -2429,6 +2484,9 @@ class MainWindow(QMainWindow):
                 "統合できません（同じ階層で連続した通常レイヤーを選んでください）", 3000)
 
     def _merge_all_visible(self):
+        if not self._confirm_merge_vector(
+                [l for l in self.layer_stack.layers if l.visible]):
+            return
         self.canvas.reset_state()
         self.canvas.save_structure_history()
         if self.layer_stack.merge_all_visible():
@@ -2444,6 +2502,8 @@ class MainWindow(QMainWindow):
         active = self.layer_stack.active
         path = self.layer_stack.active_path
         if active and active.is_group and active.children and path:  # type: ignore
+            if not self._confirm_merge_vector(active.children):  # type: ignore
+                return
             self.canvas.reset_state()
             self.canvas.save_structure_history()
             grp = active
@@ -2490,6 +2550,44 @@ class MainWindow(QMainWindow):
         self.layer_panel.refresh()
         self.canvas.update()
         self.navigator.refresh()
+
+    def _rasterize_vector(self):
+        """ベクターをラスタライズ: 線を捨てて、ふつうのラスターレイヤーに置き換える。
+
+        効果だけを焼く「レイヤーをラスタライズ」と違い、レイヤーの型そのものが
+        変わる。ペンで引いた線はピクセルになり、以後は太さも形も直せない。
+        """
+        layer = self.layer_stack.active
+        path = self.layer_stack.active_path
+        if layer is None or not layer.is_vector or not path:
+            self.statusBar().showMessage(
+                "ベクターレイヤーを選択してください", 3000)
+            return
+        ans = QMessageBox.question(
+            self, "ベクターをラスタライズ",
+            f"「{layer.name}」の線を絵に焼き込みます。\n"
+            f"以後、線の太さや形をあとから直せなくなります。\n\n続けますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        # 変形やベクター線の選択を持ち越すと、別物になったレイヤーを
+        # 指したままになる。
+        self.canvas.reset_state()
+        self.canvas.save_structure_history()
+        container, parent_path = self.layer_stack.parent_of(path)
+        container[path[-1]] = layer.to_raster()  # type: ignore
+        self.layer_stack.active_path = parent_path + [path[-1]]
+        # 履歴は id() でレイヤーを指している。差し替えで古い id が
+        # 迷子になるので捨てる（undo が別レイヤーへ当たるのを防ぐ）。
+        self.canvas.purge_orphan_history()
+        self.layer_panel.refresh()
+        self._refresh_tool_options()
+        self.canvas.update()
+        self.navigator.refresh()
+        self.statusBar().showMessage(
+            f"「{layer.name}」をラスタライズしました", 3000)
 
     def _filter_blur(self):
         """フィルター → ぼかし (ガウス): レイヤー全体または選択範囲にガウスぼかしをかける。"""
