@@ -3666,3 +3666,129 @@ class TestPalettePersistence:
         sw = p._palette_swatches[0]
         sw.clicked.emit(sw.color())
         assert w.canvas.pen_color.name() == "#3366cc"
+
+    def test_click_selects_and_sets_drawing_color(self):
+        """スウォッチのクリックが、描画色の変更と削除対象の選択を兼ねること。"""
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        for c in ("#ff0000", "#00ff00", "#0000ff"):
+            p.set_color(QColor(c))
+            p._register_to_palette()
+
+        sw = p._palette_swatches[1]
+        sw.clicked.emit(sw.color())
+        assert p._selected_index == 1
+        assert p.current_color().name() == "#00ff00"
+        assert [x.is_selected() for x in p._palette_swatches] == [False, True, False]
+
+    def test_delete_selected_color(self):
+        """選択した色だけが消え、保存されること。"""
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        for c in ("#ff0000", "#00ff00", "#0000ff"):
+            p.set_color(QColor(c))
+            p._register_to_palette()
+
+        p._select_swatch(1)                      # 真ん中を選ぶ
+        p._delete_selected_color()
+        assert p._user_palettes["わたしの色"] == ["#ffff0000", "#ff0000ff"]
+        assert len(p._palette_swatches) == 2
+        assert cp.ColorPanel()._user_palettes["わたしの色"] == ["#ffff0000",
+                                                                "#ff0000ff"]
+
+    def test_delete_clears_selection(self):
+        """削除後は選択が外れ、続けて押しても消えないこと。
+
+        選択が残っていると、同じ位置にずれてきた別の色を
+        気づかずに消してしまう。
+        """
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        for c in ("#ff0000", "#00ff00"):
+            p.set_color(QColor(c))
+            p._register_to_palette()
+
+        p._select_swatch(0)
+        p._delete_selected_color()
+        assert p._selected_index == -1
+        assert not p._del_color_btn.isEnabled()
+        assert p._user_palettes["わたしの色"] == ["#ff00ff00"]
+
+    def test_registered_color_is_selected(self):
+        """登録した色がそのまま選択され、すぐ取り消せること。"""
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        p.set_color(QColor("#123456"))
+        p._register_to_palette()
+        assert p._selected_index == 0
+        assert p._del_color_btn.isEnabled()
+        p._delete_selected_color()
+        assert p._user_palettes["わたしの色"] == []
+
+    def test_delete_button_disabled_without_selection(self):
+        """色を選ぶまで「選択色を削除」は押せないこと。"""
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        assert not p._del_color_btn.isEnabled()      # 空のパレット
+        p.set_color(QColor("#ff0000"))
+        p._register_to_palette()
+        p._select_swatch(-1)
+        assert not p._del_color_btn.isEnabled()
+        p._select_swatch(0)
+        assert p._del_color_btn.isEnabled()
+
+    def test_delete_button_disabled_on_builtin(self):
+        """組み込みパレットでは、色をクリックしても削除は押せないこと。"""
+        import color_panel as cp
+        p = cp.ColorPanel()
+        assert p._current_palette == "基本色"
+        sw = p._palette_swatches[3]
+        sw.clicked.emit(sw.color())
+        assert p._selected_index == 3             # 選択自体はされる
+        assert not p._del_color_btn.isEnabled()   # が、消せない
+
+    def test_builtin_color_cannot_be_deleted(self, monkeypatch):
+        """組み込みパレットの色を消そうとしても変わらないこと。"""
+        import color_panel as cp
+        monkeypatch.setattr(cp.QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+        p = cp.ColorPanel()
+        before = [sw.color().name() for sw in p._palette_swatches]
+        p._select_swatch(2)
+        p._delete_selected_color()
+        assert [sw.color().name() for sw in p._palette_swatches] == before
+
+    def test_selection_does_not_survive_palette_switch(self):
+        """パレットを切り替えたら選択が持ち越されないこと。
+
+        位置で消しているので、持ち越すと別の色を消してしまう。
+        """
+        from PyQt6.QtGui import QColor
+        p = self._panel_with("A")
+        p.set_color(QColor("#ff0000"))
+        p._register_to_palette()
+        assert p._selected_index == 0
+
+        p._palette_combo.setCurrentIndex(0)       # 基本色へ
+        assert p._selected_index == -1
+        assert not p._del_color_btn.isEnabled()
+
+    def test_selection_ring_does_not_resize_swatch(self):
+        """選択枠を出してもスウォッチの大きさが変わらないこと。
+
+        スタイルシートの border だと内側が狭まって並びがずれる。
+        """
+        import color_panel as cp
+        from PyQt6.QtGui import QColor, QPixmap
+        sw = cp.MiniSwatch(QColor("#3366cc"))
+        before = sw.size()
+        sw.set_selected(True)
+        assert sw.size() == before
+
+        pm = QPixmap(sw.size())
+        sw.render(pm)
+        img = pm.toImage()
+        assert QColor(img.pixel(0, 0)).name() == "#ffffff"   # 外側は白
+        assert QColor(img.pixel(1, 1)).name() == "#000000"   # 内側は黒
+        assert QColor(img.pixel(8, 8)).name() == "#3366cc"   # 中身は色のまま

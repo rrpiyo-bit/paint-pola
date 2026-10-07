@@ -332,6 +332,7 @@ class MiniSwatch(QFrame):
     def __init__(self, color: QColor = QColor("black"), size: int = _SWATCH_SIZE, parent=None):
         super().__init__(parent)
         self._color = color
+        self._selected = False
         self.setFixedSize(size, size)
         self.setFrameStyle(QFrame.Shape.NoFrame)
         self._refresh()
@@ -343,11 +344,35 @@ class MiniSwatch(QFrame):
     def color(self) -> QColor:
         return self._color
 
+    def set_selected(self, on: bool):
+        """選択中の枠を出す／消す。"""
+        if self._selected != on:
+            self._selected = on
+            self.update()
+
+    def is_selected(self) -> bool:
+        return self._selected
+
     def _refresh(self):
         self.setStyleSheet(
             f"background-color: rgba({self._color.red()},{self._color.green()},"
             f"{self._color.blue()},{self._color.alpha()});"
             f"border: none;")
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._selected:
+            return
+        # 枠はスタイルシートではなく自分で描く。border を付けると
+        # 内側が狭まってスウォッチの大きさが変わり、並びがずれるため。
+        # どんな色の上でも見えるよう白と黒の二重枠にする。
+        p = QPainter(self)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        p.setPen(QColor(255, 255, 255))
+        p.drawRect(r)
+        p.setPen(QColor(0, 0, 0))
+        p.drawRect(r.adjusted(1, 1, -1, -1))
+        p.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -444,6 +469,8 @@ class ColorPanel(QWidget):
         self._user_palettes = _safe_user_palettes(
             self._settings.value(_USER_PALETTE_KEY, ""))
         self._current_palette = "基本色"
+        # 「選択色を削除」の対象。クリックしたスウォッチの位置。-1 は未選択。
+        self._selected_index = -1
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -494,28 +521,37 @@ class ColorPanel(QWidget):
         self._palette_combo.currentIndexChanged.connect(self._on_palette_change)
         self._sec_palette.add_widget(self._palette_combo)
 
-        # 登録・名前変更・削除。名前変更と削除は自分のパレットだけ。
-        btn_row = QWidget()
-        btn_layout = QHBoxLayout(btn_row)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(3)
+        # 1段目は「色」に対する操作、2段目は「パレット」に対する操作。
+        # 同じ「削除」が隣に2つ並ぶと何を消すのか分からないので段を分ける。
+        color_row = QWidget()
+        color_layout = QHBoxLayout(color_row)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.setSpacing(3)
         self._add_btn = QPushButton("現在色を登録")
         self._add_btn.setFixedHeight(22)
         self._add_btn.clicked.connect(self._register_to_palette)
-        btn_layout.addWidget(self._add_btn)
-        self._rename_btn = QPushButton("名前")
+        color_layout.addWidget(self._add_btn)
+        self._del_color_btn = QPushButton("選択色を削除")
+        self._del_color_btn.setFixedHeight(22)
+        self._del_color_btn.clicked.connect(self._delete_selected_color)
+        color_layout.addWidget(self._del_color_btn)
+        self._sec_palette.add_widget(color_row)
+
+        pal_row = QWidget()
+        pal_layout = QHBoxLayout(pal_row)
+        pal_layout.setContentsMargins(0, 0, 0, 0)
+        pal_layout.setSpacing(3)
+        self._rename_btn = QPushButton("パレット名を変更")
         self._rename_btn.setFixedHeight(22)
-        self._rename_btn.setFixedWidth(44)
         self._rename_btn.setToolTip("このパレットの名前を変える")
         self._rename_btn.clicked.connect(self._rename_palette)
-        btn_layout.addWidget(self._rename_btn)
-        self._delete_btn = QPushButton("削除")
+        pal_layout.addWidget(self._rename_btn)
+        self._delete_btn = QPushButton("パレットを削除")
         self._delete_btn.setFixedHeight(22)
-        self._delete_btn.setFixedWidth(44)
-        self._delete_btn.setToolTip("このパレットを削除する")
+        self._delete_btn.setToolTip("このパレットを色ごと削除する")
         self._delete_btn.clicked.connect(self._delete_palette)
-        btn_layout.addWidget(self._delete_btn)
-        self._sec_palette.add_widget(btn_row)
+        pal_layout.addWidget(self._delete_btn)
+        self._sec_palette.add_widget(pal_row)
 
         self._palette_scroll = QScrollArea()
         self._palette_scroll.setWidgetResizable(True)
@@ -563,9 +599,21 @@ class ColorPanel(QWidget):
         self.color_committed.emit(color)
 
     def _on_swatch_click(self, color: QColor):
+        # クリックは描画色の変更と「削除の対象」の選択を兼ねる。
+        # 色を選ぶ操作を増やさずに、消す対象を指せるようにしている。
+        sender = self.sender()
+        if isinstance(sender, MiniSwatch) and sender in self._palette_swatches:
+            self._select_swatch(self._palette_swatches.index(sender))
         self.set_color(color)
         self.color_changed.emit(color)
         self.color_committed.emit(color)
+
+    def _select_swatch(self, index: int):
+        """index のスウォッチだけを選択状態にする。-1 で選択解除。"""
+        self._selected_index = index
+        for i, sw in enumerate(self._palette_swatches):
+            sw.set_selected(i == index)
+        self._refresh_buttons()
 
     def _on_palette_right_click(self, color: QColor):
         """右クリックで現在色をそのスウォッチに上書き。
@@ -641,6 +689,19 @@ class ColorPanel(QWidget):
         user = self._is_user_palette()
         self._rename_btn.setEnabled(user)
         self._delete_btn.setEnabled(user)
+
+        # 消せるのは自分のパレットの、選択中の色だけ。
+        can_delete = user and 0 <= self._selected_index < len(
+            self._user_palettes.get(self._current_palette, []))
+        self._del_color_btn.setEnabled(can_delete)
+        if not user:
+            self._del_color_btn.setToolTip("組み込みパレットの色は削除できません。")
+        elif can_delete:
+            self._del_color_btn.setToolTip("選択中の色をこのパレットから削除します。")
+        else:
+            self._del_color_btn.setToolTip(
+                "削除する色をクリックして選んでください。")
+
         self._add_btn.setToolTip(
             "現在色をこのパレットの末尾に追加します。"
             if user else
@@ -730,6 +791,9 @@ class ColorPanel(QWidget):
         return _PALETTES.get(name, _PALETTES["基本色"])
 
     def _load_palette(self, name: str):
+        # 並べ直すと位置が変わるので選択は持ち越さない。消す対象が
+        # ずれて別の色を消してしまうのを防ぐ。
+        self._selected_index = -1
         for sw in self._palette_swatches:
             self._palette_grid.removeWidget(sw)
             sw.deleteLater()
@@ -804,3 +868,25 @@ class ColorPanel(QWidget):
         colors.append(self._current.name(QColor.NameFormat.HexArgb))
         self._save_user_palettes()
         self._load_palette(self._current_palette)
+        # 登録した色をそのまま選択しておく。間違えて登録したときに
+        # すぐ「選択色を削除」で取り消せる。
+        self._select_swatch(len(colors) - 1)
+
+    def _delete_selected_color(self):
+        """選択中の色をこのパレットから削除する。
+
+        1色消すだけなので確認は出さない。消したあとは選択を解除する
+        （同じ位置の別の色を続けて消してしまわないように）。
+        """
+        if not self._is_user_palette():
+            self._notice("組み込みパレットの色は削除できません。")
+            return
+        colors = self._user_palettes[self._current_palette]
+        if not 0 <= self._selected_index < len(colors):
+            self._notice("削除する色をクリックして選んでください。")
+            return
+
+        del colors[self._selected_index]
+        self._save_user_palettes()
+        self._load_palette(self._current_palette)
+        self._refresh_buttons()
