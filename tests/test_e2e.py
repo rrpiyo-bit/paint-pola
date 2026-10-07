@@ -3792,3 +3792,204 @@ class TestPalettePersistence:
         assert QColor(img.pixel(0, 0)).name() == "#ffffff"   # 外側は白
         assert QColor(img.pixel(1, 1)).name() == "#000000"   # 内側は黒
         assert QColor(img.pixel(8, 8)).name() == "#3366cc"   # 中身は色のまま
+
+
+def _QPointF(x, y):
+    from PyQt6.QtCore import QPointF
+    return QPointF(float(x), float(y))
+
+
+def _click(widget, x, y):
+    """実際のマウスイベントで押して離す。配線の誤りも拾えるように。"""
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QMouseEvent
+    pos = _QPointF(x, y)
+    for typ in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+        ev = QMouseEvent(typ, pos, pos, Qt.MouseButton.LeftButton,
+                         Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        if typ == QEvent.Type.MouseButtonPress:
+            widget.mousePressEvent(ev)
+        else:
+            widget.mouseReleaseEvent(ev)
+
+
+class TestColorWheel:
+    """色相環＋SV四角と、無彩色で色相が失われない修正。"""
+
+    def _wheel(self):
+        import color_panel as cp
+        return cp.ColorWheel(200)
+
+    def _ring_point(self, w, hue: int):
+        """色相環上の、その色相の位置。"""
+        import math
+        cx, cy = w.width() / 2.0, w.height() / 2.0
+        mid = (w._outer_radius() + w._inner_radius()) / 2.0
+        rad = math.radians(90.0 - hue)
+        return cx + mid * math.cos(rad), cy - mid * math.sin(rad)
+
+    def test_ring_colors_match_picking(self):
+        """環に描かれた色と、そこをクリックして得られる色相が一致すること。
+
+        QConicalGradient は反時計回りなので、素直に置くと見えている色と
+        掴める色が左右逆になる。
+        """
+        from PyQt6.QtGui import QColor, QPixmap
+        w = self._wheel()
+        pm = QPixmap(w.size())
+        w.render(pm)
+        img = pm.toImage()
+        for hue in (0, 45, 90, 180, 270, 315):
+            x, y = self._ring_point(w, hue)
+            painted = QColor(img.pixel(int(round(x)), int(round(y)))).hue()
+            diff = min(abs(painted - hue), 360 - abs(painted - hue))
+            assert diff <= 3, f"hue {hue} に {painted} が描かれている"
+
+    def test_square_colors_match_picking(self):
+        """SV四角の各画素が、その座標の意味する HSV と一致すること。
+
+        グラデーション2枚で作っているので、1画素ずつ計算した場合と
+        ずれていないかを確かめる。
+        """
+        from PyQt6.QtGui import QColor
+        w = self._wheel()
+        w.set_hsv(200, 255, 255, 255)
+        img = w._build_square(200)
+        W, H = img.width(), img.height()
+        for s, v in [(0, 255), (255, 255), (0, 0), (255, 0),
+                     (128, 128), (255, 128), (64, 200)]:
+            x = int(round((W - 1) * s / 255))
+            y = int(round((H - 1) * (255 - v) / 255))
+            got = QColor(img.pixel(x, y))
+            exp = QColor.fromHsv(200, s, v)
+            assert max(abs(got.red() - exp.red()),
+                       abs(got.green() - exp.green()),
+                       abs(got.blue() - exp.blue())) <= 4
+
+    def test_ring_click_sets_hue_only(self):
+        """環のクリックは色相だけを変え、彩度・明度は保つこと。"""
+        w = self._wheel()
+        w.set_hsv(0, 200, 180, 255)
+        x, y = self._ring_point(w, 120)
+        _click(w, x, y)
+        h, s, v, a = w.hsv()
+        assert min(abs(h - 120), 360 - abs(h - 120)) <= 2
+        assert (s, v, a) == (200, 180, 255)
+
+    def test_square_click_sets_sv_only(self):
+        """四角のクリックは彩度・明度だけを変え、色相を保つこと。"""
+        w = self._wheel()
+        w.set_hsv(200, 0, 0, 255)
+        r = w._square_rect()
+        _click(w, r.right() - 1, r.top() + 1)
+        h, s, v, _ = w.hsv()
+        assert s > 240 and v > 240
+        assert h == 200                   # 色相は動かない
+
+    def test_click_outside_is_ignored(self):
+        """環の外や中心の隙間をクリックしても色が変わらないこと。"""
+        from PyQt6.QtCore import Qt, QEvent
+        from PyQt6.QtGui import QMouseEvent
+        w = self._wheel()
+        w.set_hsv(100, 100, 100, 255)
+        before = w.hsv()
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress,
+                         _QPointF(2, 2), _QPointF(2, 2),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        w.mousePressEvent(ev)
+        assert w.hsv() == before
+
+    def test_hue_survives_black(self):
+        """黒を選んでも色相が失われず、そこから色が作れること。
+
+        QColor は無彩色の色相を -1 で返す。0 に丸めていたため、
+        黒や白を選ぶたび色相が赤に戻り「黒から水色を作る」ができなかった。
+        """
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        p = cp.ColorPanel()
+        p._hsv._h.setValue(200)
+        p.set_color(QColor("black"))
+        assert p._wheel.hsv()[0] == 200
+        assert p._hsv._h.value() == 200
+
+        p._hsv._s.setValue(255)
+        p._hsv._v.setValue(255)
+        assert p.current_color().hue() == 200          # 赤ではなく水色
+
+    def test_hue_survives_white_and_gray(self):
+        """白・灰でも同じこと。"""
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        p = cp.ColorPanel()
+        p._hsv._h.setValue(300)
+        for c in ("white", "#808080"):
+            p.set_color(QColor(c))
+            assert p._wheel.hsv()[0] == 300, f"{c} で色相が失われた"
+
+    def test_wheel_and_sliders_stay_in_sync(self):
+        """環とスライダーが互いに追従すること。"""
+        import color_panel as cp
+        p = cp.ColorPanel()
+        p._wheel.set_hsv(120, 200, 220, 255)
+        p._on_wheel_change(p._wheel.color())
+        assert p._hsv._h.value() == 120
+        assert p._hsv._s.value() == 200
+        assert p._hsv._v.value() == 220
+        assert p.current_color().hue() == 120
+
+        p._hsv._h.setValue(240)
+        assert p._wheel.hsv()[0] == 240
+
+    def test_spinboxes_mirror_sliders(self):
+        """数値欄とスライダーが双方向に連動すること。"""
+        import color_panel as cp
+        p = cp.ColorPanel()
+        p._hsv._h.setValue(200)
+        assert p._hsv._spins["H"].value() == 200
+        p._hsv._spins["S"].setValue(123)
+        assert p._hsv._s.value() == 123
+        assert p.current_color().hsvSaturation() == 123
+
+    def test_sliders_have_color_gradients(self):
+        """スライダーの溝に色が敷かれていること。
+
+        どちらへ動かせば何色になるか見えないと、動かして戻すを繰り返す。
+        """
+        import color_panel as cp
+        p = cp.ColorPanel()
+        for sl in (p._hsv._h, p._hsv._s, p._hsv._v, p._hsv._a):
+            assert "qlineargradient" in sl.styleSheet()
+
+    def test_square_build_is_fast(self):
+        """SV四角の生成が十分速いこと。
+
+        1画素ずつ Python で回すと 25ms かかり、色相環のドラッグが
+        目に見えて遅れる。
+        """
+        import time
+        w = self._wheel()
+        w._build_square(0)                       # 初回の分は測らない
+        t = time.perf_counter()
+        for h in range(0, 360, 36):
+            w._build_square(h)
+        per = (time.perf_counter() - t) / 10 * 1000
+        assert per < 15, f"1枚あたり {per:.1f} ms かかっている"
+
+    def test_wheel_reaches_canvas(self):
+        """環を操作すると実際の描画色が変わること。"""
+        from main import MainWindow
+        w = MainWindow()
+        wheel = w.color_panel._wheel
+        wheel.set_hsv(0, 255, 255, 255)
+        r = wheel._square_rect()
+        _click(wheel, r.right() - 1, r.top() + 1)
+        assert w.canvas.pen_color.hue() == 0
+        assert w.canvas.pen_color.saturation() > 240
+
+        x, y = self._ring_point(wheel, 120)
+        _click(wheel, x, y)
+        got = w.canvas.pen_color.hue()
+        assert min(abs(got - 120), 360 - abs(got - 120)) <= 3

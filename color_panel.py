@@ -11,9 +11,10 @@ import json
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QSlider, QPushButton, QGridLayout, QFrame,
                               QSizePolicy, QColorDialog, QScrollArea, QComboBox,
-                              QInputDialog, QMessageBox)
-from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QBrush
-from PyQt6.QtCore import Qt, QRect, pyqtSignal, QSize, QSettings
+                              QInputDialog, QMessageBox, QSpinBox)
+from PyQt6.QtGui import (QColor, QPainter, QLinearGradient, QBrush, QImage,
+                          QConicalGradient)
+from PyQt6.QtCore import Qt, QRect, QRectF, pyqtSignal, QSize, QSettings
 
 
 class CollapsibleSection(QWidget):
@@ -399,11 +400,27 @@ class HsvSlider(QWidget):
         self._v = self._make_slider(0, 255, "V")
         self._a = self._make_slider(0, 255, "A")
 
+        # 数値も出す。今の値が読めないと「H=200 にして」が再現できない。
+        self._spins: dict[str, QSpinBox] = {}
         for label, sl in [("H", self._h), ("S", self._s),
                            ("V", self._v), ("A", self._a)]:
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
             row.addWidget(sl)
+            spin = QSpinBox()
+            spin.setRange(sl.minimum(), sl.maximum())
+            spin.setFixedWidth(48)
+            spin.setFixedHeight(18)
+            spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+            # スライダーと数値を互いに縛る。valueChanged は値が実際に
+            # 変わったときだけ出るので、往復しても無限には回らない。
+            sl.valueChanged.connect(spin.setValue)
+            spin.valueChanged.connect(sl.setValue)
+            # 数値を打ち込んだ場合はドラッグの終わりが無いので、
+            # ここで確定も出す（履歴に残すため）。
+            spin.editingFinished.connect(self._emit_committed)
+            row.addWidget(spin)
+            self._spins[label] = spin
             layout.addLayout(row)
 
         self._block = False
@@ -421,6 +438,7 @@ class HsvSlider(QWidget):
         self._s.setValue(0)
         self._v.setValue(0)
         self._a.setValue(255)
+        self._restyle()
 
     def _make_slider(self, lo: int, hi: int, name: str) -> QSlider:
         sl = QSlider(Qt.Orientation.Horizontal)
@@ -428,11 +446,46 @@ class HsvSlider(QWidget):
         sl.setFixedHeight(18)
         return sl
 
+    def _restyle(self):
+        """各スライダーの溝に、その軸の色を敷く。
+
+        標準の灰色の溝だと「どちらへ動かせば何色になるか」が見えず、
+        動かして・見て・戻す の繰り返しになる。
+        """
+        h, s, v = self._h.value(), self._s.value(), self._v.value()
+
+        def stops(colors: list[QColor]) -> str:
+            parts = []
+            for i, c in enumerate(colors):
+                pos = i / max(1, len(colors) - 1)
+                parts.append(f"stop:{pos:.4f} rgba({c.red()},{c.green()},"
+                             f"{c.blue()},{c.alpha()})")
+            return ", ".join(parts)
+
+        grads = {
+            # 色相は虹。彩度・明度は今の色を保ったまま端だけ変える。
+            self._h: [QColor.fromHsv(i, 255, 255) for i in range(0, 360, 30)],
+            self._s: [QColor.fromHsv(h, 0, v or 255),
+                      QColor.fromHsv(h, 255, v or 255)],
+            self._v: [QColor.fromHsv(h, s, 0), QColor.fromHsv(h, s, 255)],
+            self._a: [QColor.fromHsv(h, s, v, 0), QColor.fromHsv(h, s, v, 255)],
+        }
+        for sl, colors in grads.items():
+            sl.setStyleSheet(
+                "QSlider::groove:horizontal {"
+                " height: 12px; border: 1px solid #888; border-radius: 2px;"
+                f" background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {stops(colors)}); }}"
+                "QSlider::handle:horizontal {"
+                " width: 7px; margin: -3px 0; border: 1px solid #000;"
+                " border-radius: 2px; background: #fff; }")
+
     def _current(self) -> QColor:
         return QColor.fromHsv(self._h.value(), self._s.value(),
                                self._v.value(), self._a.value())
 
     def _emit(self):
+        # 溝の色は常に追従させる（ブロック中でも見た目は合わせる）
+        self._restyle()
         if self._block:
             return
         self.color_changed.emit(self._current())
@@ -445,11 +498,225 @@ class HsvSlider(QWidget):
     def set_color(self, color: QColor):
         self._block = True
         h, s, v, a = color.hsvHue(), color.hsvSaturation(), color.value(), color.alpha()
-        self._h.setValue(max(0, h))
+        # 無彩色（黒・白・灰）の QColor は色相を -1 で返す。0 に丸めると
+        # 黒を選ぶたびに色相が赤へ戻り、そこから別の色を作れなくなる。
+        # 色相が無いときは今のスライダーの値をそのまま残す。
+        if h >= 0:
+            self._h.setValue(h)
         self._s.setValue(s)
         self._v.setValue(v)
         self._a.setValue(a)
         self._block = False
+
+
+class ColorWheel(QWidget):
+    """色相環＋SV四角（クリスタ風のカラーサークル）。
+
+    外周のリングで色相、内側の四角で彩度（横）と明度（縦）を選ぶ。
+    S と V が1つの面にあるので「同じ色のまま少し暗く・少し鈍く」が
+    1ドラッグで済む。スライダーが別々だと必ず2操作になる。
+
+    色は HSV のまま持つ。QColor に預けると無彩色（S=0 や V=0）のときに
+    色相が -1 になって失われ、黒や白を選ぶたびに赤へ戻ってしまう。
+    """
+    color_changed = pyqtSignal(QColor)
+    color_committed = pyqtSignal(QColor)
+
+    _RING_WIDTH = 14          # 色相環の太さ
+    _MARGIN = 2
+
+    def __init__(self, size: int = 200, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+        # HSV を素のまま保持する（H は無彩色でも覚えておく）
+        self._h, self._s, self._v, self._a = 0, 0, 0, 255
+        self._drag = None         # "ring" / "square" / None
+        self._ring_cache: QImage | None = None
+        self._square_cache: QImage | None = None
+        self._square_cache_hue = -1
+
+    # ── 値 ───────────────────────────────────────────────────────────────────
+
+    def color(self) -> QColor:
+        return QColor.fromHsv(self._h, self._s, self._v, self._a)
+
+    def set_hsv(self, h: int, s: int, v: int, a: int):
+        """外から HSV を直接入れる（色相を失わせないため QColor 経由にしない）。"""
+        self._h = h % 360
+        self._s = max(0, min(255, s))
+        self._v = max(0, min(255, v))
+        self._a = max(0, min(255, a))
+        self.update()
+
+    def hsv(self) -> tuple[int, int, int, int]:
+        return self._h, self._s, self._v, self._a
+
+    # ── 幾何 ─────────────────────────────────────────────────────────────────
+
+    def _outer_radius(self) -> float:
+        return min(self.width(), self.height()) / 2.0 - self._MARGIN
+
+    def _inner_radius(self) -> float:
+        return self._outer_radius() - self._RING_WIDTH
+
+    def _square_rect(self) -> QRect:
+        """リングの内側に収まる最大の正方形。"""
+        r = self._inner_radius() - 3        # リングとの隙間
+        side = int(r * 2 / (2 ** 0.5))
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        return QRect(int(cx - side / 2), int(cy - side / 2), side, side)
+
+    # ── 描画 ─────────────────────────────────────────────────────────────────
+
+    def _build_ring(self) -> QImage:
+        """色相環を1枚の画像に焼く。毎回描くと重いので使い回す。"""
+        w, h = self.width(), self.height()
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy = w / 2.0, h / 2.0
+        outer, inner = self._outer_radius(), self._inner_radius()
+
+        # 円錐グラデーションで色相を一周させ、中央を抜いてリングにする。
+        # QConicalGradient は反時計回りに進むので、色相を逆順に置いて
+        # 時計回り（_hue_at / マーカーの計算と同じ向き）に合わせる。
+        grad = QConicalGradient(cx, cy, 90.0)
+        for i in range(361):
+            grad.setColorAt(i / 360.0, QColor.fromHsv((360 - i) % 360, 255, 255))
+        p.setBrush(QBrush(grad))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QRectF(cx - outer, cy - outer, outer * 2, outer * 2))
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        p.drawEllipse(QRectF(cx - inner, cy - inner, inner * 2, inner * 2))
+        p.end()
+        return img
+
+    def _build_square(self, hue: int) -> QImage:
+        """SV 四角を作る。横が彩度、縦が明度（上が明るい）。
+
+        色相ごとに作り直す必要があるので、同じ色相なら使い回す。
+        """
+        r = self._square_rect()
+        w, h = max(1, r.width()), max(1, r.height())
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(0)
+
+        # 1画素ずつ Python で回すと 114x114 でも 25ms かかり、色相環を
+        # ドラッグするたびに作り直すので目に見えて遅れる。
+        # 「白→純色」の横グラデに「透明→黒」の縦グラデを重ねれば
+        # 同じ絵が2回の塗りで作れる。
+        p = QPainter(img)
+        horiz = QLinearGradient(0, 0, w, 0)
+        horiz.setColorAt(0.0, QColor(255, 255, 255))
+        horiz.setColorAt(1.0, QColor.fromHsv(hue, 255, 255))
+        p.fillRect(0, 0, w, h, QBrush(horiz))
+        vert = QLinearGradient(0, 0, 0, h)
+        vert.setColorAt(0.0, QColor(0, 0, 0, 0))
+        vert.setColorAt(1.0, QColor(0, 0, 0, 255))
+        p.fillRect(0, 0, w, h, QBrush(vert))
+        p.end()
+        return img
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if self._ring_cache is None or self._ring_cache.size() != self.size():
+            self._ring_cache = self._build_ring()
+        p.drawImage(0, 0, self._ring_cache)
+
+        if (self._square_cache is None
+                or self._square_cache_hue != self._h
+                or self._square_cache.size() != self._square_rect().size()):
+            self._square_cache = self._build_square(self._h)
+            self._square_cache_hue = self._h
+        rect = self._square_rect()
+        p.drawImage(rect.topLeft(), self._square_cache)
+        p.setPen(QColor(128, 128, 128))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(rect.adjusted(0, 0, -1, -1))
+
+        self._draw_ring_marker(p)
+        self._draw_square_marker(p)
+        p.end()
+
+    def _draw_ring_marker(self, p: QPainter):
+        """色相環の現在位置に印を描く。"""
+        import math
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        mid = (self._outer_radius() + self._inner_radius()) / 2.0
+        # _build_ring の開始角 90° に合わせる
+        rad = math.radians(90.0 - self._h)
+        x, y = cx + mid * math.cos(rad), cy - mid * math.sin(rad)
+        self._marker(p, x, y, 5)
+
+    def _draw_square_marker(self, p: QPainter):
+        r = self._square_rect()
+        x = r.left() + (r.width() - 1) * self._s / 255.0
+        y = r.top() + (r.height() - 1) * (255 - self._v) / 255.0
+        self._marker(p, x, y, 5)
+
+    def _marker(self, p: QPainter, x: float, y: float, rad: float):
+        """白と黒の二重丸。どんな色の上でも見えるように。"""
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QColor(255, 255, 255))
+        p.drawEllipse(QRectF(x - rad, y - rad, rad * 2, rad * 2))
+        p.setPen(QColor(0, 0, 0))
+        p.drawEllipse(QRectF(x - rad + 1, y - rad + 1, (rad - 1) * 2, (rad - 1) * 2))
+
+    # ── 操作 ─────────────────────────────────────────────────────────────────
+
+    def _hue_at(self, pos) -> int:
+        import math
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        ang = math.degrees(math.atan2(cy - pos.y(), pos.x() - cx))
+        return int(round(90.0 - ang)) % 360
+
+    def _sv_at(self, pos) -> tuple[int, int]:
+        r = self._square_rect()
+        s = (pos.x() - r.left()) / max(1, r.width() - 1) * 255.0
+        v = 255.0 - (pos.y() - r.top()) / max(1, r.height() - 1) * 255.0
+        return (max(0, min(255, int(round(s)))),
+                max(0, min(255, int(round(v)))))
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        import math
+        pos = event.position()
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        dist = math.hypot(pos.x() - cx, pos.y() - cy)
+
+        if self._square_rect().contains(int(pos.x()), int(pos.y())):
+            self._drag = "square"
+            self._s, self._v = self._sv_at(pos)
+        elif self._inner_radius() <= dist <= self._outer_radius():
+            self._drag = "ring"
+            self._h = self._hue_at(pos)
+        else:
+            return
+        self.update()
+        self.color_changed.emit(self.color())
+
+    def mouseMoveEvent(self, event):
+        if self._drag is None:
+            return
+        # 掴んだまま外へ出ても、掴んだ側を動かし続ける（端で張り付く）
+        pos = event.position()
+        if self._drag == "square":
+            self._s, self._v = self._sv_at(pos)
+        else:
+            self._h = self._hue_at(pos)
+        self.update()
+        self.color_changed.emit(self.color())
+
+    def mouseReleaseEvent(self, event):
+        if self._drag is None:
+            return
+        self._drag = None
+        # 履歴に積むのは指を離したときだけ（ドラッグ中の中間値で汚さない）
+        self.color_committed.emit(self.color())
 
 
 class ColorPanel(QWidget):
@@ -503,7 +770,21 @@ class ColorPanel(QWidget):
         self._preview.clicked.connect(self._pick_from_dialog)
         body_layout.addWidget(self._preview)
 
-        # HSV スライダー（折りたたみセクション）
+        # カラーサークル（色相環＋SV四角）
+        self._sec_wheel = CollapsibleSection("カラーサークル")
+        wheel_row = QWidget()
+        wheel_layout = QHBoxLayout(wheel_row)
+        wheel_layout.setContentsMargins(0, 0, 0, 0)
+        wheel_layout.addStretch()
+        self._wheel = ColorWheel(200)
+        self._wheel.color_changed.connect(self._on_wheel_change)
+        self._wheel.color_committed.connect(self._on_hsv_committed)
+        wheel_layout.addWidget(self._wheel)
+        wheel_layout.addStretch()
+        self._sec_wheel.add_widget(wheel_row)
+        body_layout.addWidget(self._sec_wheel)
+
+        # HSV スライダー（微調整と数値指定用。折りたたみセクション）
         self._sec_hsv = CollapsibleSection("HSV スライダー")
         self._hsv = HsvSlider()
         self._hsv.color_changed.connect(self._on_hsv_change)
@@ -585,14 +866,36 @@ class ColorPanel(QWidget):
         self._block_hsv = False
         self._preview.set_color(color)
 
+        # 色相はウィジェット側で覚えておく。無彩色（黒・白・灰）の QColor は
+        # 色相を -1 で返すので、そのまま入れると毎回 0（赤）に落ちてしまい、
+        # 「黒から赤を作る」「白から水色を作る」が素直にできなくなる。
+        h = color.hsvHue()
+        if h < 0:
+            h = self._wheel.hsv()[0]        # 直前の色相を保つ
+        self._wheel.set_hsv(h, color.hsvSaturation(), color.value(),
+                            color.alpha())
+
     def current_color(self) -> QColor:
         return self._current
 
     # ── internal ─────────────────────────────────────────────────────────────
 
+    def _on_wheel_change(self, color: QColor):
+        """カラーサークルを動かしたとき。スライダー側も追従させる。"""
+        self._current = color
+        self._preview.set_color(color)
+        self._block_hsv = True
+        self._hsv.set_color(color)
+        self._block_hsv = False
+        self.color_changed.emit(color)
+
     def _on_hsv_change(self, color: QColor):
         self._current = color
         self._preview.set_color(color)
+        # スライダーで色相を動かしたら環のマーカーも動かす。こちらは
+        # スライダーが色相を持っているので -1 にはならない。
+        self._wheel.set_hsv(max(0, color.hsvHue()), color.hsvSaturation(),
+                            color.value(), color.alpha())
         self.color_changed.emit(color)
 
     def _on_hsv_committed(self, color: QColor):
