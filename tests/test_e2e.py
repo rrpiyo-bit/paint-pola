@@ -3474,3 +3474,195 @@ class TestThemePersistence:
             else:
                 s.setValue("theme", before)
             s.sync()
+
+
+class TestPalettePersistence:
+    """自分のパレットが再起動後も残り、作成・改名・削除ができること。"""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self):
+        """本物の設定を壊さないよう、パレットのキーだけ退避する。"""
+        from PyQt6.QtCore import QSettings
+        import color_panel as cp
+        s = QSettings("PaintPola", "PaintPola")
+        before = s.value(cp._USER_PALETTE_KEY)
+        s.remove(cp._USER_PALETTE_KEY)
+        s.sync()
+        yield
+        if before is None:
+            s.remove(cp._USER_PALETTE_KEY)
+        else:
+            s.setValue(cp._USER_PALETTE_KEY, before)
+        s.sync()
+
+    def _panel_with(self, name: str = "わたしの色"):
+        """空のユーザーパレットを1つ持ったパネルを作る。"""
+        import color_panel as cp
+        p = cp.ColorPanel()
+        p._user_palettes[name] = []
+        p._save_user_palettes()
+        p._rebuild_combo(name)
+        return p
+
+    def test_registered_color_survives_restart(self):
+        """「現在色を登録」した色が、作り直したパネルにも残ること。
+
+        以前は組み込みパレットのスウォッチを書き換えるだけだったので、
+        アプリを開き直すと消えていた。
+        """
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        p.set_color(QColor("#3366cc"))
+        p._register_to_palette()
+
+        fresh = cp.ColorPanel()           # 再起動に相当
+        assert fresh._user_palettes == {"わたしの色": ["#ff3366cc"]}
+
+    def test_registered_color_survives_palette_switch(self):
+        """別のパレットに切り替えて戻っても色が残ること。"""
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        p.set_color(QColor("#112233"))
+        p._register_to_palette()
+        assert len(p._palette_swatches) == 1
+
+        p._palette_combo.setCurrentIndex(0)          # 基本色へ
+        assert p._current_palette == "基本色"
+        p._rebuild_combo("わたしの色")                # 戻る
+        assert len(p._palette_swatches) == 1
+        assert p._palette_swatches[0].color().name() == "#112233"
+
+    def test_alpha_is_preserved(self):
+        """半透明の色も透明度ごと保存されること。"""
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        p = self._panel_with()
+        p.set_color(QColor(0, 255, 0, 128))
+        p._register_to_palette()
+        assert cp.ColorPanel()._user_palettes["わたしの色"] == ["#8000ff00"]
+
+    def test_builtin_palette_rejects_registration(self, monkeypatch):
+        """組み込みパレットは書き換えられないこと。"""
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        monkeypatch.setattr(cp.QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+        p = cp.ColorPanel()
+        assert p._current_palette == "基本色"
+        before = [sw.color().name() for sw in p._palette_swatches]
+        p.set_color(QColor("#abcdef"))
+        p._register_to_palette()
+        assert [sw.color().name() for sw in p._palette_swatches] == before
+        assert p._user_palettes == {}
+
+    def test_create_empty_palette_from_combo(self, monkeypatch):
+        """「＋ 新しいパレット…」で空のパレットが作れること。"""
+        import color_panel as cp
+        monkeypatch.setattr(cp.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("カスタム", True)))
+        p = cp.ColorPanel()
+        p._palette_combo.setCurrentIndex(p._palette_combo.count() - 1)
+        assert p._current_palette == "カスタム"
+        assert p._user_palettes == {"カスタム": []}
+        assert p._palette_swatches == []
+        assert cp.ColorPanel()._user_palettes == {"カスタム": []}
+
+    def test_cancelling_creation_restores_selection(self, monkeypatch):
+        """作成をやめたら、元のパレットの選択に戻ること。"""
+        import color_panel as cp
+        monkeypatch.setattr(cp.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("", False)))
+        p = self._panel_with("A")
+        p._palette_combo.setCurrentIndex(p._palette_combo.count() - 1)
+        assert p._current_palette == "A"
+        assert p._palette_combo.currentData() == "A"
+        assert list(p._user_palettes) == ["A"]
+
+    def test_duplicate_name_is_rejected(self, monkeypatch):
+        """組み込みと同じ名前は付けられないこと。"""
+        import color_panel as cp
+        monkeypatch.setattr(cp.QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr(cp.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("基本色", True)))
+        p = self._panel_with("A")
+        p._palette_combo.setCurrentIndex(p._palette_combo.count() - 1)
+        assert list(p._user_palettes) == ["A"]
+        assert p._current_palette == "A"
+
+    def test_rename_keeps_colors_and_order(self, monkeypatch):
+        """名前を変えても色と並び順が保たれること。"""
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        monkeypatch.setattr(cp.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("あたらしい名前", True)))
+        p = cp.ColorPanel()
+        p._user_palettes = {"A": [], "B": [], "C": []}
+        p._save_user_palettes()
+        p._rebuild_combo("B")
+        p.set_color(QColor("#ff0000"))
+        p._register_to_palette()
+
+        p._rename_palette()
+        assert list(p._user_palettes) == ["A", "あたらしい名前", "C"]
+        assert p._user_palettes["あたらしい名前"] == ["#ffff0000"]
+        assert p._current_palette == "あたらしい名前"
+        assert cp.ColorPanel()._user_palettes["あたらしい名前"] == ["#ffff0000"]
+
+    def test_delete_palette(self, monkeypatch):
+        """パレットを削除すると設定からも消えること。"""
+        import color_panel as cp
+        monkeypatch.setattr(
+            cp.QMessageBox, "question",
+            staticmethod(lambda *a, **k: cp.QMessageBox.StandardButton.Yes))
+        p = self._panel_with("消すやつ")
+        p._delete_palette()
+        assert p._user_palettes == {}
+        assert p._current_palette == "基本色"
+        assert cp.ColorPanel()._user_palettes == {}
+
+    def test_rename_and_delete_disabled_on_builtin(self):
+        """組み込みパレットでは名前変更・削除が押せないこと。"""
+        import color_panel as cp
+        p = cp.ColorPanel()
+        assert not p._rename_btn.isEnabled()
+        assert not p._delete_btn.isEnabled()
+        p._user_palettes["A"] = []
+        p._rebuild_combo("A")
+        assert p._rename_btn.isEnabled()
+        assert p._delete_btn.isEnabled()
+
+    def test_broken_setting_does_not_crash(self):
+        """設定が壊れていても起動でき、読めるところは拾うこと。"""
+        import color_panel as cp
+        assert cp._safe_user_palettes("") == {}
+        assert cp._safe_user_palettes("これはJSONではない") == {}
+        assert cp._safe_user_palettes('["配列"]') == {}
+        assert cp._safe_user_palettes('{"A": "リストではない"}') == {}
+        # 名前が空・色が不正なものは捨て、残りは残す
+        assert cp._safe_user_palettes(
+            '{"  ": ["#112233"], "A": ["#112233", 5, "みどり"]}'
+        ) == {"A": ["#ff112233"]}
+
+    def test_list_valued_setting_is_recovered(self):
+        """QSettings が文字列をリストで返す環境でも読めること。"""
+        import color_panel as cp
+        assert cp._safe_user_palettes(['{"A": ["#112233"]}']) == {"A": ["#ff112233"]}
+
+    def test_swatch_click_reaches_canvas(self, monkeypatch):
+        """登録した色をクリックすると、実際に描画色になること。"""
+        import color_panel as cp
+        from PyQt6.QtGui import QColor
+        from main import MainWindow
+        monkeypatch.setattr(cp.QInputDialog, "getText",
+                            staticmethod(lambda *a, **k: ("わたしの色", True)))
+        w = MainWindow()
+        p = w.color_panel
+        p._palette_combo.setCurrentIndex(p._palette_combo.count() - 1)
+        p.set_color(QColor("#3366cc"))
+        p._register_to_palette()
+
+        sw = p._palette_swatches[0]
+        sw.clicked.emit(sw.color())
+        assert w.canvas.pen_color.name() == "#3366cc"

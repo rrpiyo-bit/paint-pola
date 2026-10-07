@@ -6,11 +6,14 @@
 """
 from __future__ import annotations
 
+import json
+
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QSlider, QPushButton, QGridLayout, QFrame,
-                              QSizePolicy, QColorDialog, QScrollArea, QComboBox)
+                              QSizePolicy, QColorDialog, QScrollArea, QComboBox,
+                              QInputDialog, QMessageBox)
 from PyQt6.QtGui import QColor, QPainter, QLinearGradient, QBrush
-from PyQt6.QtCore import Qt, QRect, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QRect, pyqtSignal, QSize, QSettings
 
 
 class CollapsibleSection(QWidget):
@@ -268,6 +271,57 @@ _PALETTES: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+# 自分のパレットを選ぶときの目印。組み込みパレットと混ざらないよう
+# コンボの表示名に付ける（保存する名前そのものには含めない）。
+_USER_MARK = "★ "
+_NEW_PALETTE_ITEM = "＋ 新しいパレット…"
+_USER_PALETTE_KEY = "palettes/user"
+_MAX_USER_PALETTES = 50
+_MAX_USER_COLORS = 240
+
+
+def _normalize_setting(value) -> str:
+    """QSettings から返った値を文字列に均す。
+
+    保存した型のまま返るとは限らず、環境によっては文字列がリストで
+    戻ってくる。そのまま json.loads に渡すと例外になる。
+    """
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value or "")
+
+
+def _safe_user_palettes(raw) -> dict[str, list[str]]:
+    """保存済みユーザーパレットを読み出す。壊れていても落ちない。
+
+    手で設定を書き換えられたり、別バージョンが書いた形でも、
+    読めるところだけ拾って残りは捨てる。
+    """
+    text = _normalize_setting(raw)
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for name, colors in list(data.items())[:_MAX_USER_PALETTES]:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(colors, list):
+            continue
+        kept: list[str] = []
+        for c in colors[:_MAX_USER_COLORS]:
+            if not isinstance(c, str):
+                continue
+            col = QColor(c)
+            if col.isValid():
+                kept.append(col.name(QColor.NameFormat.HexArgb))
+        out[name.strip()[:40]] = kept
+    return out
 
 
 class MiniSwatch(QFrame):
@@ -384,6 +438,13 @@ class ColorPanel(QWidget):
         self._current = QColor("black")
         self._collapsed = False
 
+        # 自分で作ったパレットは設定に保存する。組み込みパレットは
+        # 読み取り専用で、登録先にはならない。
+        self._settings = QSettings("PaintPola", "PaintPola")
+        self._user_palettes = _safe_user_palettes(
+            self._settings.value(_USER_PALETTE_KEY, ""))
+        self._current_palette = "基本色"
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -428,17 +489,33 @@ class ColorPanel(QWidget):
 
         # パレット種類プルダウン
         self._palette_combo = QComboBox()
-        for name in _PALETTES:
-            self._palette_combo.addItem(name)
         self._palette_combo.setFixedHeight(24)
         self._palette_combo.setStyleSheet("font-size:11px;")
-        self._palette_combo.currentTextChanged.connect(self._on_palette_change)
+        self._palette_combo.currentIndexChanged.connect(self._on_palette_change)
         self._sec_palette.add_widget(self._palette_combo)
 
-        add_btn = QPushButton("現在色を登録")
-        add_btn.setFixedHeight(22)
-        add_btn.clicked.connect(self._register_to_palette)
-        self._sec_palette.add_widget(add_btn)
+        # 登録・名前変更・削除。名前変更と削除は自分のパレットだけ。
+        btn_row = QWidget()
+        btn_layout = QHBoxLayout(btn_row)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(3)
+        self._add_btn = QPushButton("現在色を登録")
+        self._add_btn.setFixedHeight(22)
+        self._add_btn.clicked.connect(self._register_to_palette)
+        btn_layout.addWidget(self._add_btn)
+        self._rename_btn = QPushButton("名前")
+        self._rename_btn.setFixedHeight(22)
+        self._rename_btn.setFixedWidth(44)
+        self._rename_btn.setToolTip("このパレットの名前を変える")
+        self._rename_btn.clicked.connect(self._rename_palette)
+        btn_layout.addWidget(self._rename_btn)
+        self._delete_btn = QPushButton("削除")
+        self._delete_btn.setFixedHeight(22)
+        self._delete_btn.setFixedWidth(44)
+        self._delete_btn.setToolTip("このパレットを削除する")
+        self._delete_btn.clicked.connect(self._delete_palette)
+        btn_layout.addWidget(self._delete_btn)
+        self._sec_palette.add_widget(btn_row)
 
         self._palette_scroll = QScrollArea()
         self._palette_scroll.setWidgetResizable(True)
@@ -452,7 +529,7 @@ class ColorPanel(QWidget):
         self._palette_scroll.setWidget(self._palette_container)
         self._palette_swatches: list[MiniSwatch] = []
         self._sec_palette.add_widget(self._palette_scroll)
-        self._load_palette("基本色")
+        self._rebuild_combo("基本色")
         body_layout.addWidget(self._sec_palette)
 
         outer.addWidget(self._body)
@@ -491,10 +568,24 @@ class ColorPanel(QWidget):
         self.color_committed.emit(color)
 
     def _on_palette_right_click(self, color: QColor):
-        """右クリックで現在色をそのスウォッチに上書き登録。"""
+        """右クリックで現在色をそのスウォッチに上書き。
+
+        自分のパレットなら保存もする。組み込みパレットは読み取り専用なので
+        見た目だけ変わって次に開いたときには戻る — そのことを伝える。
+        """
         sender = self.sender()
-        if isinstance(sender, MiniSwatch):
-            sender.set_color(self._current)
+        if not isinstance(sender, MiniSwatch):
+            return
+        if not self._is_user_palette():
+            self._notice("組み込みパレットは変更できません。\n"
+                         "「＋ 新しいパレット…」で自分のパレットを作ってください。")
+            return
+        sender.set_color(self._current)
+        index = self._palette_swatches.index(sender)
+        colors = self._user_palettes[self._current_palette]
+        if 0 <= index < len(colors):
+            colors[index] = self._current.name(QColor.NameFormat.HexArgb)
+            self._save_user_palettes()
 
     def _pick_from_dialog(self, _=None):
         c = QColorDialog.getColor(
@@ -505,8 +596,138 @@ class ColorPanel(QWidget):
             self.color_changed.emit(c)
             self.color_committed.emit(c)
 
-    def _on_palette_change(self, name: str):
+    # ── パレットの管理 ───────────────────────────────────────────────────────
+
+    def _is_user_palette(self, name: str | None = None) -> bool:
+        return (name or self._current_palette) in self._user_palettes
+
+    def _notice(self, text: str):
+        QMessageBox.information(self, "パレット", text)
+
+    def _save_user_palettes(self):
+        """自分のパレットを設定に書き込む。
+
+        「登録したのに再起動したら消えている」のは、ここが無かったため。
+        書き込みは遅延されるので、終了の仕方で失われないよう毎回 sync する。
+        """
+        self._settings.setValue(
+            _USER_PALETTE_KEY,
+            json.dumps(self._user_palettes, ensure_ascii=False))
+        self._settings.sync()
+
+    def _rebuild_combo(self, select: str):
+        """コンボの項目を作り直して select を選ぶ。
+
+        組み込み → 自分のパレット → 「＋ 新しいパレット…」の順。
+        表示名には ★ を付けるが、保存する名前には含めない。
+        """
+        self._palette_combo.blockSignals(True)
+        self._palette_combo.clear()
+        for name in _PALETTES:
+            self._palette_combo.addItem(name, name)
+        for name in self._user_palettes:
+            self._palette_combo.addItem(_USER_MARK + name, name)
+        self._palette_combo.addItem(_NEW_PALETTE_ITEM, None)
+
+        index = self._palette_combo.findData(select)
+        self._palette_combo.setCurrentIndex(max(0, index))
+        self._palette_combo.blockSignals(False)
+
+        self._current_palette = self._palette_combo.currentData() or "基本色"
+        self._load_palette(self._current_palette)
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        user = self._is_user_palette()
+        self._rename_btn.setEnabled(user)
+        self._delete_btn.setEnabled(user)
+        self._add_btn.setToolTip(
+            "現在色をこのパレットの末尾に追加します。"
+            if user else
+            "組み込みパレットには登録できません。\n"
+            "「＋ 新しいパレット…」で自分のパレットを作ってください。")
+
+    def _on_palette_change(self, index: int):
+        name = self._palette_combo.itemData(index)
+        if name is None:
+            # 「＋ 新しいパレット…」が選ばれた。作るか、やめたら元の選択に戻す。
+            self._create_palette()
+            return
+        self._current_palette = name
         self._load_palette(name)
+        self._refresh_buttons()
+
+    def _create_palette(self):
+        """空のパレットを新しく作る。"""
+        if len(self._user_palettes) >= _MAX_USER_PALETTES:
+            self._rebuild_combo(self._current_palette)
+            self._notice(f"パレットは {_MAX_USER_PALETTES} 個までです。")
+            return
+
+        name, ok = QInputDialog.getText(self, "新しいパレット", "名前:",
+                                        text=self._unique_name("カスタム"))
+        name = (name or "").strip()[:40]
+        if not ok or not name:
+            self._rebuild_combo(self._current_palette)
+            return
+        if name in _PALETTES or name in self._user_palettes:
+            self._rebuild_combo(self._current_palette)
+            self._notice(f"「{name}」は既にあります。別の名前にしてください。")
+            return
+
+        self._user_palettes[name] = []
+        self._save_user_palettes()
+        self._rebuild_combo(name)
+
+    def _unique_name(self, base: str) -> str:
+        """「カスタム」「カスタム 2」…と重複しない名前を作る。"""
+        taken = set(_PALETTES) | set(self._user_palettes)
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base} {n}" in taken:
+            n += 1
+        return f"{base} {n}"
+
+    def _rename_palette(self):
+        if not self._is_user_palette():
+            return
+        old = self._current_palette
+        name, ok = QInputDialog.getText(self, "パレットの名前", "名前:", text=old)
+        name = (name or "").strip()[:40]
+        if not ok or not name or name == old:
+            return
+        if name in _PALETTES or name in self._user_palettes:
+            self._notice(f"「{name}」は既にあります。別の名前にしてください。")
+            return
+
+        # 並び順を保ったまま差し替える。作った順で見えているので、
+        # 名前を変えただけで末尾に飛ぶと探しにくい。
+        self._user_palettes = {
+            (name if k == old else k): v
+            for k, v in self._user_palettes.items()}
+        self._save_user_palettes()
+        self._rebuild_combo(name)
+
+    def _delete_palette(self):
+        if not self._is_user_palette():
+            return
+        name = self._current_palette
+        count = len(self._user_palettes[name])
+        if QMessageBox.question(
+                self, "パレットの削除",
+                f"「{name}」を削除します。登録した {count} 色は戻せません。\n"
+                "よろしいですか？") != QMessageBox.StandardButton.Yes:
+            return
+        del self._user_palettes[name]
+        self._save_user_palettes()
+        self._rebuild_combo("基本色")
+
+    def _palette_entries(self, name: str) -> list[tuple[str, str | None]]:
+        """表示用の (ラベル, 色) 一覧。自分のパレットはラベルなし。"""
+        if name in self._user_palettes:
+            return [("", c) for c in self._user_palettes[name]]
+        return _PALETTES.get(name, _PALETTES["基本色"])
 
     def _load_palette(self, name: str):
         for sw in self._palette_swatches:
@@ -519,7 +740,14 @@ class ColorPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-        entries = _PALETTES.get(name, _PALETTES["基本色"])
+        entries = self._palette_entries(name)
+        if name in self._user_palettes and not entries:
+            # 空のパレットは見分けがつかないので一言出す。
+            hint = QLabel("空です。「現在色を登録」で色を追加できます。")
+            hint.setStyleSheet("color: #888; font-size: 10px;")
+            hint.setWordWrap(True)
+            self._palette_grid.addWidget(hint, 0, 0, 1, _PALETTE_COLS)
+            return
         has_sep = any(h is None for _, h in entries)
         if name == "100 Brilliant Color":
             cols = 5
@@ -558,15 +786,21 @@ class ColorPanel(QWidget):
                 row += 1
 
     def _register_to_palette(self):
-        """現在色を最初の空白スウォッチに登録（なければ末尾に追加）。"""
-        for sw in self._palette_swatches:
-            if sw.color().name() == "#ffffff":
-                sw.set_color(self._current)
-                return
-        sw = MiniSwatch(self._current)
-        sw.setToolTip(f"カスタム ({self._current.name()})")
-        sw.clicked.connect(self._on_swatch_click)
-        sw.right_clicked.connect(self._on_palette_right_click)
-        idx = len(self._palette_swatches)
-        self._palette_grid.addWidget(sw, idx // _PALETTE_COLS, idx % _PALETTE_COLS)
-        self._palette_swatches.append(sw)
+        """現在色を自分のパレットの末尾に追加して保存する。
+
+        以前は組み込みパレットのスウォッチを書き換えていたので、
+        パレットを切り替えるだけで消え、再起動でも残らなかった。
+        """
+        if not self._is_user_palette():
+            self._notice("組み込みパレットには登録できません。\n"
+                         "「＋ 新しいパレット…」で自分のパレットを作ってください。")
+            return
+
+        colors = self._user_palettes[self._current_palette]
+        if len(colors) >= _MAX_USER_COLORS:
+            self._notice(f"1つのパレットは {_MAX_USER_COLORS} 色までです。")
+            return
+
+        colors.append(self._current.name(QColor.NameFormat.HexArgb))
+        self._save_user_palettes()
+        self._load_palette(self._current_palette)
