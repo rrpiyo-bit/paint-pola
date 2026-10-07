@@ -252,6 +252,10 @@ class LayerPanel(QWidget):
     layers_changed = pyqtSignal()
     layer_structure_changed = pyqtSignal()  # 削除・統合など構造変化時のみ
     structure_will_change = pyqtSignal()    # 構造変更直前（undo用スナップショット）
+    # 不透明度・表示・名前などの変更直前。引数は (レイヤーuid, 属性名)。
+    # スライダーのドラッグで何十回も積まれないよう、受け手が同じキーの
+    # 連続した変更を1つの取り消し単位にまとめる。
+    property_will_change = pyqtSignal(object)
     merge_down_requested = pyqtSignal()
     merge_marked_requested = pyqtSignal()  # ⛓ を付けたレイヤーだけ統合
     merge_all_requested = pyqtSignal()
@@ -368,6 +372,13 @@ class LayerPanel(QWidget):
             self._blend_combo.addItem(BLEND_LABELS[key], key)
         self._blend_combo.currentIndexChanged.connect(self._on_blend_mode)
         st.addWidget(self._blend_combo)
+        # フォルダーの「通過」: 中のレイヤーの合成モードをフォルダーの外の絵にも効かせる
+        self._pass_check = QCheckBox("通過（フォルダー用）")
+        self._pass_check.setToolTip(
+            "オン: フォルダー内の乗算などがフォルダーの下の絵にも効く\n"
+            "オフ: フォルダーの中だけで合成してから重ねる")
+        self._pass_check.toggled.connect(self._on_pass_through)
+        st.addWidget(self._pass_check)
 
         st.addWidget(self._sep())
 
@@ -655,6 +666,11 @@ class LayerPanel(QWidget):
     def _sync_settings_tab(self):
         active = self.layer_stack.active
         is_layer = active is not None and not active.is_group
+        is_group = active is not None and active.is_group
+        self._pass_check.setEnabled(is_group)
+        self._pass_check.blockSignals(True)
+        self._pass_check.setChecked(bool(is_group and getattr(active, "pass_through", False)))
+        self._pass_check.blockSignals(False)
         # 全コントロールの有効/無効
         for w in (self._blend_combo, self._border_check, self._border_size,
                   self._border_color_btn, self._shadow_check, self._shadow_strength,
@@ -704,12 +720,14 @@ class LayerPanel(QWidget):
     def _on_border_enabled(self, value: bool):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "border_enabled")
             active.border_enabled = value  # type: ignore
             self.layers_changed.emit()
 
     def _on_border_size(self, value: int):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "border_size")
             active.border_size = value  # type: ignore
             self.layers_changed.emit()
 
@@ -721,24 +739,39 @@ class LayerPanel(QWidget):
             self._refresh_border_color_btn()
             active = self.layer_stack.active
             if active and not active.is_group:
+                self._before_prop(active, "border_color")
                 active.border_color = c  # type: ignore
                 self.layers_changed.emit()
+
+    def _before_prop(self, layer, prop: str) -> None:
+        """属性を変える直前に呼ぶ。変更を取り消せるよう状態を控えさせる。"""
+        self.property_will_change.emit((layer.uid, prop))
+
+    def _on_pass_through(self, value: bool):
+        active = self.layer_stack.active
+        if active and active.is_group:
+            self._before_prop(active, "pass_through")
+            active.pass_through = value  # type: ignore
+            self.layers_changed.emit()
 
     def _on_blend_mode(self, index: int):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "blend_mode")
             active.blend_mode = BLEND_KEYS[index]  # type: ignore
             self.layers_changed.emit()
 
     def _on_shadow_enabled(self, value: bool):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "shadow_enabled")
             active.shadow_enabled = value  # type: ignore
             self.layers_changed.emit()
 
     def _on_shadow_param(self):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "shadow")
             active.shadow_strength = self._shadow_strength.value()  # type: ignore
             active.shadow_offset_x = self._shadow_ox.value()  # type: ignore
             active.shadow_offset_y = self._shadow_oy.value()  # type: ignore
@@ -753,18 +786,21 @@ class LayerPanel(QWidget):
             self._refresh_shadow_color_btn()
             active = self.layer_stack.active
             if active and not active.is_group:
+                self._before_prop(active, "shadow_color")
                 active.shadow_color = c  # type: ignore
                 self.layers_changed.emit()
 
     def _on_glow_enabled(self, value: bool):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "glow_enabled")
             active.glow_enabled = value  # type: ignore
             self.layers_changed.emit()
 
     def _on_glow_param(self):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "glow")
             active.glow_strength = self._glow_strength.value()  # type: ignore
             active.glow_size = self._glow_size.value()  # type: ignore
             self.layers_changed.emit()
@@ -777,18 +813,21 @@ class LayerPanel(QWidget):
             self._refresh_glow_color_btn()
             active = self.layer_stack.active
             if active and not active.is_group:
+                self._before_prop(active, "glow_color")
                 active.glow_color = c  # type: ignore
                 self.layers_changed.emit()
 
     def _on_blur_enabled(self, value: bool):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "blur_enabled")
             active.blur_enabled = value  # type: ignore
             self.layers_changed.emit()
 
     def _on_blur_param(self):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "blur")
             active.blur_strength = self._blur_strength.value()  # type: ignore
             active.blur_radius = self._blur_radius.value()  # type: ignore
             self.layers_changed.emit()
@@ -796,12 +835,14 @@ class LayerPanel(QWidget):
     def _on_hsl_enabled(self, value: bool):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "hsl_enabled")
             active.hsl_enabled = value  # type: ignore
             self.layers_changed.emit()
 
     def _on_hsl_param(self):
         active = self.layer_stack.active
         if active and not active.is_group:
+            self._before_prop(active, "hsl")
             active.hsl_hue = self._hsl_hue.value()  # type: ignore
             active.hsl_saturation = self._hsl_sat.value()  # type: ignore
             active.hsl_lightness = self._hsl_light.value()  # type: ignore
@@ -848,15 +889,18 @@ class LayerPanel(QWidget):
         self.layers_changed.emit()
 
     def _on_visibility(self, layer: Layer | GroupLayer, visible: bool):
+        self._before_prop(layer, "visible")
         layer.visible = visible
         self.layers_changed.emit()
 
     def _on_clipping(self, layer: Layer | GroupLayer, clipping: bool):
+        self._before_prop(layer, "clipping")
         layer.clipping = clipping
         self.refresh()
         self.layers_changed.emit()
 
     def _on_reference(self, layer: Layer | GroupLayer, reference: bool):
+        self._before_prop(layer, "reference")
         layer.reference = reference
         self.layers_changed.emit()
 
@@ -864,6 +908,7 @@ class LayerPanel(QWidget):
         layer.merge_marked = marked
 
     def _on_locked(self, layer: Layer | GroupLayer, locked: bool):
+        self._before_prop(layer, "locked")
         layer.locked = locked
 
     def _collect_marked(self) -> list:
@@ -885,13 +930,15 @@ class LayerPanel(QWidget):
     def _on_opacity(self, value: int):
         active = self.layer_stack.active
         if active:
+            self._before_prop(active, "opacity")
             active.opacity = value
             self.layers_changed.emit()
 
     def _on_rename(self, layer: Layer | GroupLayer):
         name, ok = QInputDialog.getText(
             self, "レイヤー名変更", "新しい名前:", text=layer.name)
-        if ok and name.strip():
+        if ok and name.strip() and name.strip() != layer.name:
+            self._before_prop(layer, "name")
             layer.name = name.strip()
             self.refresh()
 
@@ -910,12 +957,27 @@ class LayerPanel(QWidget):
                 break
         return container, path[-1] if path else 0
 
+    def _unique_name(self, prefix: str, start: int) -> str:
+        """「レイヤー 3」のような名前を、文書内で重ならない番号で作る。
+        削除したあとに足すと同じ名前が2枚できて見分けられなかった。"""
+        used: set[str] = set()
+        def _collect(items):
+            for it in items:
+                used.add(it.name)
+                if it.is_group:
+                    _collect(it.children)
+        _collect(self.layer_stack.layers)
+        n = max(1, start)
+        while f"{prefix} {n}" in used:
+            n += 1
+        return f"{prefix} {n}"
+
     def _add(self):
         self.structure_will_change.emit()
         ls = self.layer_stack
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
-        new_layer = Layer(f"レイヤー {len(container) + 1}", ls.width, ls.height)
+        new_layer = Layer(self._unique_name("レイヤー", len(container) + 1), ls.width, ls.height)
         insert_at = min(idx, len(container))
         container.insert(insert_at, new_layer)
         new_path = path[:-1] + [insert_at]
@@ -928,7 +990,7 @@ class LayerPanel(QWidget):
         ls = self.layer_stack
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
-        new_layer = VectorLayer(f"ベクター {len(container) + 1}", ls.width, ls.height)
+        new_layer = VectorLayer(self._unique_name("ベクター", len(container) + 1), ls.width, ls.height)
         insert_at = min(idx, len(container))
         container.insert(insert_at, new_layer)
         new_path = path[:-1] + [insert_at]
@@ -941,7 +1003,10 @@ class LayerPanel(QWidget):
         ls = self.layer_stack
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
-        group = GroupLayer(f"グループ {len(container) + 1}", ls.width, ls.height)
+        group = GroupLayer(self._unique_name("グループ", len(container) + 1), ls.width, ls.height)
+        # CLIP STUDIO と同じく、パネルから作るフォルダは「通過」。
+        # 中の乗算などがフォルダの下の絵にも効く。
+        group.pass_through = True
         insert_at = min(idx, len(container))
         container.insert(insert_at, group)
         new_path = path[:-1] + [insert_at]
@@ -991,6 +1056,7 @@ class LayerPanel(QWidget):
             new_g.reference = src.reference
             new_g.locked = src.locked
             new_g.collapsed = src.collapsed
+            new_g.pass_through = getattr(src, "pass_through", False)
             for child in src.children:
                 new_g.children.append(self._deep_copy_layer(child, ls, False))
             return new_g
@@ -1011,12 +1077,12 @@ class LayerPanel(QWidget):
             return c
 
     def _duplicate(self):
-        self.structure_will_change.emit()
         ls = self.layer_stack
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
         if idx >= len(container):
             return
+        self.structure_will_change.emit()
         src = container[idx]
         copy = self._deep_copy_layer(src, ls)
         container.insert(idx, copy)
@@ -1025,7 +1091,6 @@ class LayerPanel(QWidget):
         self.layers_changed.emit()
 
     def _remove(self):
-        self.structure_will_change.emit()
         ls = self.layer_stack
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
@@ -1033,6 +1098,8 @@ class LayerPanel(QWidget):
             return
         if idx >= len(container):
             return
+        # 消せると分かってから履歴を積む。消せないのに積むと空の undo が残る。
+        self.structure_will_change.emit()
         container.pop(idx)
         if not container:
             ls.set_active_path(path[:-1])

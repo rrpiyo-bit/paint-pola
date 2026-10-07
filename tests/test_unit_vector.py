@@ -923,9 +923,9 @@ class TestRasterizeAndMergeGuard:
         w = MainWindow()
         texts = [a.text() for m in w.menuBar().findChildren(QMenu)
                  for a in m.actions()]
-        assert "ベクターをラスタライズ" in texts
+        assert "ベクターを画像に変換" in texts
         # 効果だけを焼く既存の項目と別物であること
-        assert "レイヤーをラスタライズ" in texts
+        assert "効果を焼き込む" in texts
 
     def test_merge_down_asks_before_losing_vector(self, monkeypatch):
         from PyQt6.QtWidgets import QMessageBox

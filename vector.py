@@ -676,20 +676,12 @@ class VectorLayer(Layer):
         self.mark_dirty()
 
     def rasterize(self) -> None:
-        """レイヤー効果を絵に焼き込む。
+        """その場では焼き込めない。to_raster() で作ったレイヤーに対して呼ぶ。
 
-        効果はベクターのままでは持てないので、焼いた時点で線は捨てる。
-        以後はふつうのラスターと同じ扱いになる。
+        以前は線を捨てて絵だけ差し込んでいたが、型はベクターのままなので
+        次に線を1本描いた時点で（線から描き直されて）焼いた絵が丸ごと消えた。
         """
-        baked = self.image_with_effects().convertToFormat(
-            QImage.Format.Format_ARGB32)
-        self.strokes = []
-        self.image = baked          # setter が _strokes_dirty を下ろす
-        self.border_enabled = False
-        self.shadow_enabled = False
-        self.glow_enabled = False
-        self.blur_enabled = False
-        self.hsl_enabled = False
+        raise TypeError("VectorLayer は to_raster() してから rasterize() すること")
 
     def to_raster(self) -> Layer:
         """同じ見た目のふつうのラスターレイヤーを作って返す。"""

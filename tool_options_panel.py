@@ -82,6 +82,8 @@ class ToolOptionsPanel(QWidget):
     # 各設定の変更シグナル
     pen_size_changed      = pyqtSignal(int)
     eraser_size_changed   = pyqtSignal(int)
+    stabilization_changed = pyqtSignal(int)   # 手ブレ補正の強さ（0=なし）
+    taper_changed = pyqtSignal(str, int)      # 入り抜き ("in"/"out"/"tip", 値)
     brush_changed         = pyqtSignal(str)
     symmetry_toggled      = pyqtSignal(bool)
     shape_fill_changed    = pyqtSignal(str)
@@ -172,7 +174,9 @@ class ToolOptionsPanel(QWidget):
                  is_vector: bool = False,
                  vector_pen_mode: str = "draw",
                  vector_selected=None,
-                 vector_erase_mode: str = "cut"):
+                 vector_erase_mode: str = "cut",
+                 stabilization: int = 5,
+                 taper: dict | None = None):
         self._current_tool = tool
         self._clear()
 
@@ -195,11 +199,14 @@ class ToolOptionsPanel(QWidget):
         self._title.setText(label_map.get(tool, "ツールオプション"))
 
         if tool == Tool.PEN and is_vector:
-            self._build_vector_pen(pen_size, vector_pen_mode, vector_selected)
+            self._build_vector_pen(pen_size, vector_pen_mode, vector_selected,
+                                   stabilization)
 
         elif tool == Tool.PEN:
             self._add_spinbox("ブラシサイズ", pen_size, 1, 200,
                               lambda v: self.pen_size_changed.emit(v))
+            self._add_stabilization(stabilization)
+            self._add_taper(taper)
             self._add_brush_combo(brush_key)
             self._add_toggle("対称定規", symmetry,
                              lambda v: self.symmetry_toggled.emit(v))
@@ -210,8 +217,15 @@ class ToolOptionsPanel(QWidget):
         elif tool == Tool.ERASER:
             self._add_spinbox("消しゴムサイズ", eraser_size, 1, 300,
                               lambda v: self.eraser_size_changed.emit(v))
+            self._add_stabilization(stabilization)
+            self._add_taper(taper)
 
-        elif tool == Tool.FILL:
+        elif tool in (Tool.FILL, Tool.LASSO_FILL):
+            if tool == Tool.LASSO_FILL:
+                self._add_label("囲んだ範囲の中で、線で閉じている\n"
+                                "ところだけを塗ります。\n"
+                                "マウスを離すと自動で実行されます。\n"
+                                "下の設定はバケツ塗りと共通です。")
             self._add_fill_reference_combo(fill_reference_mode)
             self._add_spinbox("拡張/縮小 (px)", fill_expand, -30, 30,
                               lambda v: self.fill_expand_changed.emit(v),
@@ -242,11 +256,6 @@ class ToolOptionsPanel(QWidget):
                               lambda v: self.pen_size_changed.emit(v))
             if tool in (Tool.RECT, Tool.ELLIPSE):
                 self._add_fill_combo(shape_fill)
-
-        elif tool == Tool.LASSO_FILL:
-            self._add_label("囲んだ範囲の中で、線で閉じている\n"
-                            "ところだけを塗ります。\n"
-                            "マウスを離すと自動で実行されます。")
 
         elif tool in (Tool.SELECT_RECT, Tool.LASSO):
             self._add_select_mode_combo(select_mode)
@@ -317,6 +326,38 @@ class ToolOptionsPanel(QWidget):
         w._opt_key = key  # type: ignore
         w.connect_changed(callback)
         self._add_row(label, w, tooltip)
+
+    def _add_stabilization(self, value: int):
+        """ペン・消しゴム共通の手ブレ補正。指やマウスで描くときの
+        ガタつきを抑える（クリップスタジオの「手ブレ補正」と同じ考え方）。"""
+        from canvas import STABILIZATION_MAX
+        self._add_spinbox("手ブレ補正", value, 0, STABILIZATION_MAX,
+                          lambda v: self.stabilization_changed.emit(v),
+                          key="stabilization",
+                          tooltip="上げるほど線のガタつきが減り、なめらかになります。\n"
+                                  "そのぶん線がカーソルから少し遅れて付いてきます。\n"
+                                  "0 で補正なし。ペンと消しゴムで共通です。")
+
+    def _add_taper(self, taper: dict | None):
+        """入り抜き。描き終わると線の始め・終わりが指定の細さまで細くなる
+        （筆圧ではなく長さで決める。クリップスタジオの「入り抜き」と同じ考え方）。"""
+        from canvas import TAPER_MAX
+        t = taper or {"in": 0, "out": 0, "tip": 0}
+        self._add_spinbox("入り (px)", t["in"], 0, TAPER_MAX,
+                          lambda v: self.taper_changed.emit("in", v),
+                          key="taper_in",
+                          tooltip="線の描き始めを、この長さをかけて\n"
+                                  "細い先端から太くしていきます。0 で入りなし。")
+        self._add_spinbox("抜き (px)", t["out"], 0, TAPER_MAX,
+                          lambda v: self.taper_changed.emit("out", v),
+                          key="taper_out",
+                          tooltip="描き終わって離したときに、線の終わりを\n"
+                                  "この長さをかけて細くします。0 で抜きなし。")
+        self._add_spinbox("先端の太さ", t["tip"], 0, 100,
+                          lambda v: self.taper_changed.emit("tip", v),
+                          key="taper_tip", suffix=" %",
+                          tooltip="入り・抜きの一番先の太さを、ブラシサイズに\n"
+                                  "対する割合で決めます。0 % で一番細く尖ります。")
 
     def _add_brush_combo(self, current_key: str):
         cb = QComboBox()
@@ -474,7 +515,8 @@ class ToolOptionsPanel(QWidget):
         self._add_label("ベクターレイヤーです。消しゴムは\n"
                         "線そのものを消します。なぞると続けて消せます。")
 
-    def _build_vector_pen(self, pen_size: int, mode: str, selected):
+    def _build_vector_pen(self, pen_size: int, mode: str, selected,
+                          stabilization: int = 5):
         """ベクターレイヤー選択中のペンの設定。
 
         描く・選ぶ・制御点を削除する の3つを切り替えて使う。選ぶモードでは、
@@ -499,6 +541,7 @@ class ToolOptionsPanel(QWidget):
         if mode == "draw":
             self._add_spinbox("ブラシサイズ", pen_size, 1, 200,
                               lambda v: self.pen_size_changed.emit(v))
+            self._add_stabilization(stabilization)
             self._add_label("ベクターレイヤーです。引いた線は\n"
                             "あとから形も太さも色も変えられます。")
             return

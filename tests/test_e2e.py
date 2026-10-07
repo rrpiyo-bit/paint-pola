@@ -259,10 +259,16 @@ class TestSaveLoad:
 
         path = str(tmp_path / "big.pola")
         win._write_pola(path)
+        # ファイルの中身は絵の範囲だけ
+        import zipfile
+        with zipfile.ZipFile(path) as zf:
+            saved = QImage.fromData(zf.read("layer_0.png"), "PNG")
+        assert saved.width() == 100 and saved.height() == 100
+        # 開くとキャンバスを覆う大きさに戻り、絵は同じ場所にある
         win._load_pola(path)
         got = win.layer_stack.layers[0]
-        assert got.image.width() == 100 and got.image.height() == 100
-        assert QColor(got.image.pixel(50, 50)).getRgb() == (255, 0, 0, 255)
+        assert got.image.width() >= ls.width and got.image.height() >= ls.height
+        assert QColor(got.image.pixel(550 - got.offset_x, 550 - got.offset_y)).getRgb() == (255, 0, 0, 255)
 
     def test_fully_transparent_layer_saves_as_empty(self, win, tmp_path):
         from PyQt6.QtGui import QImage
@@ -273,9 +279,14 @@ class TestSaveLoad:
         layer.offset_x = layer.offset_y = 30
         path = str(tmp_path / "empty.pola")
         win._write_pola(path)
+        import zipfile
+        with zipfile.ZipFile(path) as zf:
+            saved = QImage.fromData(zf.read("layer_0.png"), "PNG")
+        assert saved.width() == 1 and saved.height() == 1
         win._load_pola(path)
         got = win.layer_stack.layers[0]
-        assert got.image.width() == 1 and got.image.height() == 1
+        assert (got.offset_x, got.offset_y) == (0, 0)
+        assert (got.image.width(), got.image.height()) == (win.layer_stack.width, win.layer_stack.height)
 
     def test_load_clears_undo_history(self, win):
         c = win.canvas
@@ -3295,14 +3306,19 @@ class TestMenuLayout:
     def _items(self, win):
         """(項目名, 属するメニュー名) の一覧。"""
         out = []
-        for top in win.menuBar().actions():
-            menu = top.menu()
-            if not menu:
-                continue
+
+        def walk(menu, path):
             for a in menu.actions():
-                if a.isSeparator() or a.menu():
+                if a.isSeparator():
                     continue
-                out.append((a.text(), top.text()))
+                if a.menu():
+                    walk(a.menu(), f"{path}>{a.text()}")
+                else:
+                    out.append((a.text(), path))
+
+        for top in win.menuBar().actions():
+            if top.menu():
+                walk(top.menu(), top.text())
         return out
 
     def test_no_duplicate_menu_items(self, win):
@@ -3310,31 +3326,57 @@ class TestMenuLayout:
 
         「方眼をキャンバスに表示」が「画像」と「表示」の
         両方に出ていて、どちらが本体か分からなかった。
+        （GIF書き出しは「書き出し」と「アニメーション」の両方に置く意図的な例外）
         """
         from collections import Counter
-        names = [n for n, _ in self._items(win)]
+        names = [n for n, p in self._items(win) if p != "アニメーション"]
         dupes = {n: c for n, c in Counter(names).items() if c > 1}
         assert not dupes, f"重複しているメニュー項目: {dupes}"
 
     def test_transform_items_are_in_transform_menu(self, win):
-        """変形系の項目は「変形」メニューにまとめる。"""
+        """変形系の項目はクリップスタジオと同じく「編集＞変形」にまとめる。"""
         items = dict(self._items(win))
-        assert items["レイヤーを変形（拡大縮小・回転）..."] == "変形"
+        for name in ("拡大・縮小・回転", "数値で指定...", "左右反転", "上下反転",
+                     "自由変形", "メッシュ変形", "変形を確定（Enter）"):
+            assert items[name] == "編集>変形", name
+
+    def test_csp_like_layout(self, win):
+        """クリップスタジオ経験者が迷わない場所に主要項目がある。"""
+        items = dict(self._items(win))
+        assert items["下のレイヤーに結合"] == "レイヤー"
+        assert items["効果を焼き込む"] == "レイヤー>ラスタライズ"
+        assert items["選択を解除"] == "選択範囲"
+        assert items["画像（PNG・JPEG・BMP）..."] == "ファイル>書き出し"
+        assert items["方眼の設定..."] == "表示"
+        assert items["キャンバスサイズを変更..."] == "編集"
+
+    def _shortcuts(self, win):
+        out = {}
+
+        def walk(menu):
+            for a in menu.actions():
+                if a.menu():
+                    walk(a.menu())
+                elif a.shortcut().toString():
+                    out.setdefault(a.shortcut().toString(), []).append(a.text())
+
+        for top in win.menuBar().actions():
+            if top.menu():
+                walk(top.menu())
+        return out
 
     def test_shortcuts_are_unique(self, win):
-        """ショートカットキーが衝突していない。"""
-        from collections import Counter
-        keys = []
-        for top in win.menuBar().actions():
-            menu = top.menu()
-            if not menu:
-                continue
-            for a in menu.actions():
-                k = a.shortcut().toString()
-                if k:
-                    keys.append(k)
-        dupes = {k: c for k, c in Counter(keys).items() if c > 1}
+        """ショートカットキーが衝突していない（サブメニューの中も含めて）。"""
+        dupes = {k: v for k, v in self._shortcuts(win).items() if len(v) > 1}
         assert not dupes, f"衝突しているショートカット: {dupes}"
+
+    def test_csp_shortcuts(self, win):
+        keys = self._shortcuts(win)
+        assert keys["Ctrl+T"] == ["拡大・縮小・回転"]
+        assert keys["Ctrl+E"] == ["下のレイヤーに結合"]
+        assert keys["Ctrl+D"] == ["選択を解除"]
+        # Esc はキャンバス側（変形取消・選択解除）に任せ、メニューでは奪わない
+        assert "Esc" not in keys
 
 
 # ── 透明背景まわりのバグ ─────────────────────────────────────────────────────

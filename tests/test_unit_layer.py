@@ -482,7 +482,7 @@ class TestLayerStack:
         ls = LayerStack(W, H)
         assert ls.merge_all_visible() is False
 
-    # ── フォルダ結合(_draw_layers_to)のクリッピング反映 ─────────────────────────
+    # ── フォルダ結合(render_items)のクリッピング反映 ─────────────────────────
     # グループを結合すると clipping フラグが無視され、クリッピングされているはずの
     # レイヤーが全面に描画されてしまうバグの回帰確認（実際のユーザーファイルで
     # 「色が消えて黒線だけになる」症状として再現した）。
@@ -556,7 +556,7 @@ class TestLayerStack:
         assert px(img, 80, 80).alpha() == 0
 
     def test_nested_clip_onto_subfolder_in_merge(self):
-        # 統合（_draw_layers_to）でも同じクリッピングが反映されること
+        # 統合（render_items）でも同じクリッピングが反映されること
         red = self._solid(0, 0, W, H, QColor(255, 0, 0, 255))
         red.clipping = True
         sub = GroupLayer("sub", W, H)

@@ -18,7 +18,7 @@ from PyQt6.QtCore import Qt, QSize, QRect, QByteArray, QBuffer, QIODevice, QProp
 from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
                           QFont, QPainter, QIcon, QImageReader)
 
-from layer import LayerStack, Layer, GroupLayer, CANVAS_W, CANVAS_H
+from layer import LayerStack, Layer, GroupLayer, CANVAS_W, CANVAS_H, render_items
 from vector import VectorLayer
 from animation_panel import AnimationPanel
 from canvas import Canvas
@@ -1115,8 +1115,15 @@ class TransformPercentDialog(QDialog):
         self._canvas.cancel_transform()
         self.reject()
 
+    def reject(self):
+        # Esc は closeEvent を通らず reject() だけが呼ばれる。ここで止めないと
+        # プレビュー中の変形がキャンバスに浮いたまま残る。
+        if self._canvas._transform_image:
+            self._canvas.cancel_transform()
+        super().reject()
+
     def closeEvent(self, event):
-        # ×ボタン / Esc でダイアログが閉じられたとき、変形を必ずキャンセルする
+        # ×ボタンでダイアログが閉じられたとき、変形を必ずキャンセルする
         if self._canvas._transform_image:
             self._canvas.cancel_transform()
         super().closeEvent(event)
@@ -1159,6 +1166,10 @@ class _CanvasPad(QWidget):
         self._canvas.move(margin, margin)
 
 
+# 入り抜きの設定をどのツールのものとして扱うか
+_TAPER_TOOL_KEYS = {Tool.PEN: "pen", Tool.ERASER: "eraser"}
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1185,6 +1196,7 @@ class MainWindow(QMainWindow):
         self.anim_panel.setVisible(False)
         self.anim_panel.set_composite_fn(lambda: self.layer_stack.composite())
         self.anim_panel.onion_skin_changed.connect(self.canvas.update)
+        self.anim_panel.frames_changed.connect(self._mark_dirty)
         self.canvas._get_onion_images = self.anim_panel.get_onion_images
         self._anim_mode = False
 
@@ -1222,6 +1234,20 @@ class MainWindow(QMainWindow):
         saved_theme = str(saved_theme or "default")
         self._apply_theme(saved_theme if saved_theme in self._theme_actions
                           else "default")
+        # 手ブレ補正は手の癖に合わせて決めるものなので、次回も同じ強さで始める
+        try:
+            self.canvas.set_stabilization(
+                int(self._settings.value("stabilization", self.canvas.stabilization)))
+        except (TypeError, ValueError):
+            pass
+        for key, fields in self.canvas.taper.items():
+            for field, cur in fields.items():
+                try:
+                    self.canvas.set_taper(key, field, int(
+                        self._settings.value(f"taper/{key}/{field}", cur)))
+                except (TypeError, ValueError):
+                    pass
+        self._refresh_tool_options()
         # ウィンドウ表示・レイアウト確定後でないと表示領域が0のままフィットできない
         QTimer.singleShot(0, lambda: self.navigator._fit_view())
 
@@ -1264,6 +1290,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.layers_changed.connect(self._mark_dirty)
         self.layer_panel.layer_structure_changed.connect(self.canvas.purge_orphan_history)
         self.layer_panel.structure_will_change.connect(self.canvas.save_structure_history)
+        self.layer_panel.property_will_change.connect(self.canvas.save_property_history)
         self.layer_panel.merge_down_requested.connect(self._merge_down)
         self.layer_panel.merge_marked_requested.connect(self._merge_marked_layers)
         self.layer_panel.merge_all_requested.connect(self._merge_all_visible)
@@ -1277,6 +1304,8 @@ class MainWindow(QMainWindow):
         self.tool_options.pen_size_changed.connect(self._on_pen_size_change)
         self.tool_options.eraser_size_changed.connect(self._on_eraser_size_change)
         self.tool_options.brush_changed.connect(self.canvas.set_brush)
+        self.tool_options.stabilization_changed.connect(self._on_stabilization_change)
+        self.tool_options.taper_changed.connect(self._on_taper_change)
         self.tool_options.symmetry_toggled.connect(
             lambda v: setattr(self.canvas, 'symmetry_enabled', v))
         self.tool_options.shape_fill_changed.connect(
@@ -1342,7 +1371,9 @@ class MainWindow(QMainWindow):
                 and tool not in (Tool.SELECT_RECT, Tool.LASSO, Tool.TRANSFORM)):
             self.canvas._commit_transform()
         # 自由変形ツールに切り替えたとき、選択範囲があれば自動的に持ち上げる
-        if tool == Tool.TRANSFORM and self.canvas._selection_rect:
+        # （すでに持ち上げ中なら二重に持ち上げない）
+        if (tool == Tool.TRANSFORM and self.canvas._selection_rect
+                and not self.canvas._transform_image):
             layer = self.canvas.layer_stack.active
             if layer and not layer.is_group:
                 self.canvas._lift_selection(layer)  # type: ignore
@@ -1354,6 +1385,17 @@ class MainWindow(QMainWindow):
         # ツールに応じたカーソル
         self.canvas._tool_cursor = self._tool_cursors.get(tool)
         self.canvas._restore_tool_cursor()
+
+    def _on_stabilization_change(self, value: int):
+        self.canvas.set_stabilization(value)
+        self._settings.setValue("stabilization", self.canvas.stabilization)
+
+    def _on_taper_change(self, field: str, value: int):
+        key = _TAPER_TOOL_KEYS.get(self.canvas.tool)
+        if key is None:
+            return
+        self.canvas.set_taper(key, field, value)
+        self._settings.setValue(f"taper/{key}/{field}", self.canvas.taper[key][field])
 
     def _refresh_tool_options(self):
         """ツールオプションの行を今の状態で作り直す。
@@ -1383,6 +1425,8 @@ class MainWindow(QMainWindow):
             vector_pen_mode=self.canvas.vector_pen_mode,
             vector_selected=self.canvas._vector_selected if is_vector else None,
             vector_erase_mode=self.canvas.vector_erase_mode,
+            stabilization=self.canvas.stabilization,
+            taper=self.canvas.taper.get(_TAPER_TOOL_KEYS.get(self.canvas.tool, "")),
         )
 
     def _refresh_tool_options_if_kind_changed(self):
@@ -1495,17 +1539,23 @@ class MainWindow(QMainWindow):
         root.addWidget(right_splitter)
 
     def _build_menus(self):
+        # 並びとショートカットはクリップスタジオに寄せている。
+        # 「どこに何があるか」をCSP経験者が迷わないことを優先し、
+        # 変形は編集メニュー、統合・ラスタライズはレイヤーメニューに置く。
         mb = self.menuBar()
 
         file_menu = mb.addMenu("ファイル")
-        self._add_action(file_menu, "新規", self._new, "Ctrl+N")
+        self._add_action(file_menu, "新規...", self._new, "Ctrl+N")
         self._add_action(file_menu, "開く...", self._open, "Ctrl+O")
         file_menu.addSeparator()
         self._add_action(file_menu, "保存", self._save, "Ctrl+S")
         self._add_action(file_menu, "名前を付けて保存...", self._save_as_pola, "Ctrl+Shift+S")
         file_menu.addSeparator()
-        self._add_action(file_menu, "PNG として書き出し...", self._export_png, "Ctrl+E")
-        self._add_action(file_menu, "画像をレイヤーとして追加...", self._import_as_layer)
+        import_menu = file_menu.addMenu("読み込み")
+        self._add_action(import_menu, "画像をレイヤーとして読み込み...", self._import_as_layer)
+        export_menu = file_menu.addMenu("書き出し")
+        self._add_action(export_menu, "画像（PNG・JPEG・BMP）...", self._export_png)
+        self._add_action(export_menu, "アニメーションGIF...", self.anim_panel._on_export_gif)
         file_menu.addSeparator()
         self._add_action(file_menu, "終了", self.close, "Ctrl+Q")
 
@@ -1513,31 +1563,57 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, "元に戻す", self.canvas.undo, "Ctrl+Z")
         self._add_action(edit_menu, "やり直し", self.canvas.redo, "Ctrl+Y")
         edit_menu.addSeparator()
-        self._add_action(edit_menu, "コピー", self.canvas.copy_selection, "Ctrl+C")
-        self._add_action(edit_menu, "切り取り", self.canvas.cut_selection, "Ctrl+X")
-        self._add_action(edit_menu, "貼り付け", self.canvas.paste_selection, "Ctrl+V")
-        self._add_action(edit_menu, "削除", self.canvas.delete_selection, "Delete")
+        self._act_cut = self._add_action(edit_menu, "切り取り", self.canvas.cut_selection, "Ctrl+X")
+        self._act_copy = self._add_action(edit_menu, "コピー", self.canvas.copy_selection, "Ctrl+C")
+        self._add_action(edit_menu, "貼り付け（新しいレイヤー）", self._paste, "Ctrl+V")
+        self._act_clear = self._add_action(edit_menu, "消去", self.canvas.delete_selection, "Delete")
         edit_menu.addSeparator()
-        self._add_action(edit_menu, "すべて選択", self.canvas.select_all, "Ctrl+A")
-        self._add_action(edit_menu, "イラストを選択", self._select_layer_alpha, "Ctrl+Shift+A")
-        self._add_action(edit_menu, "選択を反転", self._invert_selection, "Ctrl+Shift+I")
-        self._add_action(edit_menu, "選択解除", self.canvas.deselect, "Escape")
+        transform_menu = edit_menu.addMenu("変形")
+        self._add_action(transform_menu, "拡大・縮小・回転", self._transform_with_tool, "Ctrl+T")
+        self._add_action(transform_menu, "数値で指定...", self._open_transform_percent_dialog)
+        transform_menu.addSeparator()
+        self._add_action(transform_menu, "左右反転", lambda: self._transform_flip(True))
+        self._add_action(transform_menu, "上下反転", lambda: self._transform_flip(False))
+        transform_menu.addSeparator()
+        self._add_action(transform_menu, "自由変形",
+                         lambda: self._transform_set_mode("perspective"))
+        self._add_action(transform_menu, "メッシュ変形",
+                         lambda: self._transform_set_mode("mesh"))
+        transform_menu.addSeparator()
+        self._act_commit = self._add_action(transform_menu, "変形を確定（Enter）",
+                                            self._commit_transform)
+        self._act_cancel = self._add_action(transform_menu, "変形を取り消し（Esc）",
+                                            self.canvas.cancel_transform)
+        edit_menu.addSeparator()
+        self._add_action(edit_menu, "キャンバスサイズを変更...", self._resize_canvas)
+        # 状況に合わない項目は開いたときにグレーにする（閉じたら戻す。
+        # 無効のままだとショートカットまで効かなくなるため）
+        edit_menu.aboutToShow.connect(self._update_edit_menu)
+        edit_menu.aboutToHide.connect(self._enable_edit_menu)
+        transform_menu.aboutToShow.connect(self._update_edit_menu)
 
-        image_menu = mb.addMenu("画像")
-        self._add_action(image_menu, "キャンバスサイズ変更...", self._resize_canvas)
-        image_menu.addSeparator()
-        self._add_action(image_menu, "下に統合", self._merge_down, "Ctrl+M")
-        self._add_action(image_menu, "表示レイヤーを統合", self._merge_all_visible, "Ctrl+Shift+M")
-        self._add_action(image_menu, "フォルダを結合", self._merge_folder)
-        self._add_action(image_menu, "レイヤーをラスタライズ", self._rasterize_layer)
-        self._add_action(image_menu, "ベクターをラスタライズ",
-                         self._rasterize_vector)
-        image_menu.addSeparator()
-        self._add_action(image_menu, "線画抽出...", self._extract_line)
-        # 方眼は「表示」メニューにも同じものが出ていたが、これは実際に
-        # キャンバスへ描き込む操作（表示だけの「グリッド表示切替」とは別物）
-        # なので、画像メニュー側に一本化した。
-        self._add_action(image_menu, "方眼をキャンバスに表示...", self._grid_settings)
+        layer_menu = mb.addMenu("レイヤー")
+        self._add_action(layer_menu, "新規ラスターレイヤー", self.layer_panel._add)
+        self._add_action(layer_menu, "新規ベクターレイヤー", self.layer_panel._add_vector)
+        self._add_action(layer_menu, "新規フォルダ", self.layer_panel._add_group)
+        layer_menu.addSeparator()
+        self._add_action(layer_menu, "下のレイヤーに結合", self._merge_down, "Ctrl+E")
+        self._add_action(layer_menu, "表示レイヤーを結合", self._merge_all_visible, "Ctrl+Shift+E")
+        self._add_action(layer_menu, "フォルダを結合", self._merge_folder)
+        layer_menu.addSeparator()
+        raster_menu = layer_menu.addMenu("ラスタライズ")
+        self._add_action(raster_menu, "効果を焼き込む", self._rasterize_layer)
+        self._add_action(raster_menu, "ベクターを画像に変換", self._rasterize_vector)
+        layer_menu.addSeparator()
+        self._add_action(layer_menu, "線画抽出...", self._extract_line)
+
+        select_menu = mb.addMenu("選択範囲")
+        self._add_action(select_menu, "すべてを選択", self.canvas.select_all, "Ctrl+A")
+        self._add_action(select_menu, "選択を解除", self.canvas.deselect, "Ctrl+D")
+        self._add_action(select_menu, "選択範囲を反転", self._invert_selection, "Ctrl+Shift+I")
+        select_menu.addSeparator()
+        self._add_action(select_menu, "レイヤーから選択範囲（描いた部分）",
+                         self._select_layer_alpha, "Ctrl+Shift+A")
 
         filter_menu = mb.addMenu("フィルター")
         self._add_action(filter_menu, "ぼかし (ガウス)...", self._filter_blur)
@@ -1552,12 +1628,12 @@ class MainWindow(QMainWindow):
         self._add_action(zoom_menu, "全体表示（キャンバスを画面に収める）",
                          lambda: self.navigator._fit_view(), "Ctrl+Shift+0")
 
-        view_menu.addSeparator()
-        self._add_action(view_menu, "左に回転", self.canvas.rotate_ccw, "Ctrl+[")
-        self._add_action(view_menu, "右に回転", self.canvas.rotate_cw, "Ctrl+]")
-        self._add_action(view_menu, "回転をリセット", self.canvas.reset_rotation, "Ctrl+0")
-        view_menu.addSeparator()
-        self._add_action(view_menu, "左右反転表示", self.canvas.toggle_flip_h, "Ctrl+Shift+H")
+        rotate_menu = view_menu.addMenu("回転・反転")
+        self._add_action(rotate_menu, "左に回転", self.canvas.rotate_ccw, "Ctrl+[")
+        self._add_action(rotate_menu, "右に回転", self.canvas.rotate_cw, "Ctrl+]")
+        self._add_action(rotate_menu, "回転をリセット", self.canvas.reset_rotation, "Ctrl+0")
+        rotate_menu.addSeparator()
+        self._add_action(rotate_menu, "左右反転表示", self.canvas.toggle_flip_h, "Ctrl+Shift+H")
         view_menu.addSeparator()
         # チェック式にして、今方眼が出ているのかメニューで見て分かるようにする。
         # ダイアログ側で切り替えたときもチェックがずれないよう信号で合わせる。
@@ -1568,32 +1644,49 @@ class MainWindow(QMainWindow):
         self._grid_action.triggered.connect(self.canvas.set_grid_visible)
         self.canvas.grid_visibility_changed.connect(self._grid_action.setChecked)
         view_menu.addAction(self._grid_action)
-
-        mode_menu = mb.addMenu("モード")
-        self._anim_mode_action = QAction("アニメーションモード", self)
-        self._anim_mode_action.setCheckable(True)
-        self._anim_mode_action.setChecked(False)
-        self._anim_mode_action.toggled.connect(self._toggle_anim_mode)
-        mode_menu.addAction(self._anim_mode_action)
-
-        transform_menu = mb.addMenu("変形")
-        self._add_action(transform_menu, "変形を確定 (Enter)", self.canvas._commit_transform)
-        self._add_action(transform_menu, "変形をキャンセル", self.canvas.cancel_transform)
-        transform_menu.addSeparator()
-        self._add_action(transform_menu, "拡大縮小・回転（%指定）...", self._open_transform_percent_dialog)
-        # 「画像」メニューの線画抽出・方眼と並んでいたが、内容は変形なので
-        # 同種の「拡大縮小・回転（%指定）」の隣に移した。
-        self._add_action(transform_menu, "レイヤーを変形（拡大縮小・回転）...", self._transform_layer_dialog)
-
-        design_menu = mb.addMenu("デザイン")
+        # 方眼は表示だけで絵には描き込まれないので、表示メニューに置く
+        self._add_action(view_menu, "方眼の設定...", self._grid_settings)
+        view_menu.addSeparator()
+        theme_menu = view_menu.addMenu("テーマ")
         self._theme_actions: dict[str, QAction] = {}
         for key in get_theme_keys():
             action = QAction(get_theme_label(key), self)
             action.setCheckable(True)
             action.setChecked(key == "default")
             action.triggered.connect(lambda checked, k=key: self._apply_theme(k))
-            design_menu.addAction(action)
+            theme_menu.addAction(action)
             self._theme_actions[key] = action
+
+        anim_menu = mb.addMenu("アニメーション")
+        self._anim_mode_action = QAction("アニメーションモード", self)
+        self._anim_mode_action.setCheckable(True)
+        self._anim_mode_action.setChecked(False)
+        self._anim_mode_action.toggled.connect(self._toggle_anim_mode)
+        anim_menu.addAction(self._anim_mode_action)
+        anim_menu.addSeparator()
+        self._add_action(anim_menu, "アニメーションGIFを書き出し...", self.anim_panel._on_export_gif)
+
+    def _update_edit_menu(self):
+        has_sel = self.canvas._selection_rect is not None
+        floating = bool(self.canvas._transform_image)
+        for a in (self._act_cut, self._act_copy, self._act_clear):
+            a.setEnabled(has_sel)
+        self._act_commit.setEnabled(floating)
+        self._act_cancel.setEnabled(floating)
+
+    def _enable_edit_menu(self):
+        for a in (self._act_cut, self._act_copy, self._act_clear,
+                  self._act_commit, self._act_cancel):
+            a.setEnabled(True)
+
+    def _transform_set_mode(self, mode: str):
+        """自由変形・メッシュ変形。持ち上げて変形ツールにし、モードを切り替える。"""
+        if not self._begin_transform():
+            return
+        self.toolbar.select_tool(Tool.TRANSFORM)
+        self.canvas.set_transform_mode(mode)
+        self._refresh_tool_options()
+        self.canvas.setFocus()
 
     def _add_action(self, menu: QMenu, label: str, slot, shortcut: str | None = None):
         action = QAction(label, self)
@@ -1601,6 +1694,7 @@ class MainWindow(QMainWindow):
             action.setShortcut(QKeySequence(shortcut))
         action.triggered.connect(slot)
         menu.addAction(action)
+        return action
 
     def _new(self):
         if not self._confirm_discard("新規作成"):
@@ -1611,13 +1705,25 @@ class MainWindow(QMainWindow):
         w, h = dialog.values()
         self.canvas.reset_state()
         self._init_canvas(w, h)
+        self._document_replaced(None)
+
+    def _document_replaced(self, path: str | None):
+        """新規・開くで中身を丸ごと差し替えたあとの後片付け。
+
+        前の作品の履歴・アニメのコマ・サイズ表示を持ち越さないよう、
+        差し替え経路はすべてここを通す。
+        """
         self.canvas._history.clear()
         self.canvas._redo_stack.clear()
-        self._current_path = None
+        self.anim_panel.clear()
+        self._current_path = path
         self._dirty = False
         self._update_title()
         self.layer_panel.refresh()
+        self._refresh_tool_options()
         self.canvas._update_size()
+        self._update_canvas_size_label()
+        self.navigator.refresh()
 
     def _open(self):
         if not self._confirm_discard("ファイルを開く"):
@@ -1651,13 +1757,7 @@ class MainWindow(QMainWindow):
         p.drawImage(0, 0, img)
         p.end()
         self.layer_stack.layers.append(bg)
-        self.canvas._history.clear()
-        self.canvas._redo_stack.clear()
-        self._current_path = None
-        self._dirty = False
-        self._update_title()
-        self.layer_panel.refresh()
-        self.canvas._update_size()
+        self._document_replaced(None)
 
     # ── .pola 保存 / 読み込み ────────────────────────────────────────────────
 
@@ -1739,8 +1839,11 @@ class MainWindow(QMainWindow):
             "layers": [],
         }
 
+        # いったん別名に書いてから置き換える。途中で失敗しても
+        # 元のファイルは壊れずに残る。
+        tmp_path = path + ".saving"
         try:
-            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 img_index = 0
 
                 def _write_layer(lyr) -> dict:
@@ -1753,6 +1856,7 @@ class MainWindow(QMainWindow):
                     }
                     if lyr.is_group:
                         info["collapsed"] = lyr.collapsed
+                        info["pass_through"] = bool(getattr(lyr, "pass_through", False))
                         info["clipping"] = lyr.clipping
                         info["reference"] = lyr.reference
                         info["locked"] = lyr.locked
@@ -1815,14 +1919,62 @@ class MainWindow(QMainWindow):
                     return info
 
                 meta["layers"] = [_write_layer(lyr) for lyr in ls.layers]
+                self._write_anim_frames(zf, meta)
                 zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+            os.replace(tmp_path, path)
         except Exception as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             QMessageBox.warning(self, "エラー", f"保存に失敗しました:\n{e}")
             return
 
         self._current_path = path
         self._dirty = False
         self._update_title()
+
+    _MAX_ANIM_FRAMES = 1000
+
+    def _write_anim_frames(self, zf, meta: dict) -> None:
+        """アニメーションのコマも作品の一部として保存する。"""
+        frames = self.anim_panel.frames
+        if not frames:
+            return
+        names = []
+        for i, img in enumerate(frames):
+            buf = QByteArray()
+            bio = QBuffer(buf)
+            bio.open(QIODevice.OpenModeFlag.WriteOnly)
+            img.save(bio, "PNG")
+            bio.close()
+            name = f"frame_{i}.png"
+            zf.writestr(name, bytes(buf))
+            names.append(name)
+        meta["anim"] = {"frames": names, "fps": self.anim_panel.fps}
+
+    def _read_anim_frames(self, zf, meta: dict) -> tuple[list[QImage], int | None]:
+        import pathlib
+        anim = meta.get("anim")
+        if not isinstance(anim, dict):
+            return [], None
+        names = anim.get("frames")
+        if not isinstance(names, list):
+            return [], None
+        frames: list[QImage] = []
+        for n in names[:self._MAX_ANIM_FRAMES]:
+            if not isinstance(n, str):
+                continue
+            safe = pathlib.PurePosixPath(n).name
+            if not safe:
+                continue
+            img = QImage.fromData(zf.read(safe), "PNG")
+            if img.isNull():
+                raise ValueError(f"コマ画像の読み込みに失敗: {safe}")
+            frames.append(img.convertToFormat(QImage.Format.Format_ARGB32))
+        fps = anim.get("fps")
+        return frames, (self._clamp(fps, 1, 60, 8) if fps is not None else None)
 
     @staticmethod
     def _clamp(val, lo, hi, default):
@@ -1921,6 +2073,36 @@ class MainWindow(QMainWindow):
                                     smooth=bool(item.get("smooth", True))))
         return out
 
+    @staticmethod
+    def _expand_layer_to_canvas(lyr, canvas_w: int, canvas_h: int) -> None:
+        """保存時に絵の範囲へ切り詰めたレイヤーを、キャンバス全体を覆う大きさへ戻す。
+
+        小さいままだと、クリッピングがはみ出す・縁取りが切り詰めた端で
+        途切れる・バケツがレイヤーの外を塗れない、と保存前と見た目や
+        動きが変わってしまう。
+        """
+        ox, oy = lyr.offset_x, lyr.offset_y
+        iw, ih = lyr.image.width(), lyr.image.height()
+        if iw <= 1 and ih <= 1:
+            # 空レイヤー（1x1）は中身ごと作り直す
+            if QColor.fromRgba(lyr.image.pixel(0, 0)).alpha() == 0:
+                ox = oy = 0
+                iw = ih = 0
+        left, top = min(0, ox), min(0, oy)
+        right = max(canvas_w, ox + iw)
+        bottom = max(canvas_h, oy + ih)
+        if (left, top, right - left, bottom - top) == (ox, oy, iw, ih):
+            return
+        big = QImage(right - left, bottom - top, QImage.Format.Format_ARGB32)
+        big.fill(Qt.GlobalColor.transparent)
+        if iw and ih:
+            p = QPainter(big)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.drawImage(ox - left, oy - top, lyr.image)
+            p.end()
+        lyr.image = big
+        lyr.offset_x, lyr.offset_y = left, top
+
     def _load_pola(self, path: str):
         """`.pola` ファイルを読み込んでレイヤースタックを再構築する。"""
         MAX_CANVAS = 10000
@@ -1966,6 +2148,8 @@ class MainWindow(QMainWindow):
                         grp.visible = bool(info.get("visible", True))
                         grp.opacity = self._clamp(info.get("opacity", 255), 0, 255, 255)
                         grp.collapsed = bool(info.get("collapsed", False))
+                        # 古いファイルには無い。当時の見た目（非通過）で開く。
+                        grp.pass_through = bool(info.get("pass_through", False))
                         grp.clipping = bool(info.get("clipping", False))
                         grp.reference = bool(info.get("reference", False))
                         grp.locked = bool(info.get("locked", False))
@@ -2030,6 +2214,8 @@ class MainWindow(QMainWindow):
                         if img.isNull():
                             raise ValueError(f"画像の読み込みに失敗: {safe_name}")
                         lyr.image = img.convertToFormat(QImage.Format.Format_ARGB32)
+                        if not is_vec:
+                            self._expand_layer_to_canvas(lyr, w, h)
                         if is_vec:
                             # 線を優先する。PNG は trim で offset がずれていることがあり、
                             # 座標系が食い違うので、必ず線から描き直させる。
@@ -2043,6 +2229,7 @@ class MainWindow(QMainWindow):
                 if not isinstance(raw_layers, list):
                     raise ValueError("layers が配列ではありません")
                 layers = [_read_layer(info) for info in raw_layers]
+                anim_frames, anim_fps = self._read_anim_frames(zf, meta)
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"ファイルを開けませんでした:\n{e}")
             return
@@ -2062,26 +2249,25 @@ class MainWindow(QMainWindow):
             else:
                 ls.active_path = [0]
         else:
-            ai = min(meta.get("active_index", 0), max(0, len(layers) - 1))
+            # 古い形式。値が数値でないと min() で落ちるので確かめてから使う。
+            ai = meta.get("active_index", 0)
             aci = meta.get("active_child_index", -1)
+            ai = min(max(0, ai), max(0, len(layers) - 1)) if isinstance(ai, int) else 0
+            aci = aci if isinstance(aci, int) else -1
             ls.active_path = [ai, aci] if aci >= 0 else [ai]
-        self.canvas._history.clear()
-        self.canvas._redo_stack.clear()
-        self.canvas._rotation = meta.get("view_rotation", 0)
-        self.canvas._flip_h = meta.get("view_flip_h", False)
-        self._current_path = path
-        self._dirty = False
-        self._update_title()
-        self.layer_panel.refresh()
-        self.canvas._update_size()
-        self._update_canvas_size_label()
+        rot = meta.get("view_rotation", 0)
+        self.canvas._rotation = rot % 360 if isinstance(rot, int) and rot % 90 == 0 else 0
+        self.canvas._flip_h = bool(meta.get("view_flip_h", False))
+        self._document_replaced(path)
+        if anim_frames:
+            self.anim_panel.set_frames(anim_frames, anim_fps)
 
     # ── PNG 書き出し ─────────────────────────────────────────────────────────
 
     def _export_png(self):
         composite = self.layer_stack.composite()
         path, _ = QFileDialog.getSaveFileName(
-            self, "PNG として書き出し", "untitled.png",
+            self, "画像を書き出し", "untitled.png",
             "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp)")
         if not path:
             return
@@ -2103,6 +2289,8 @@ class MainWindow(QMainWindow):
     def _on_structure_restored(self):
         self.layer_panel.refresh()
         self.navigator.refresh()
+        # キャンバスサイズ変更を元に戻したときに表示がずれないように
+        self._update_canvas_size_label()
 
     def _apply_theme(self, key: str):
         qss = get_theme_qss(key)
@@ -2172,6 +2360,16 @@ class MainWindow(QMainWindow):
             return not self._dirty
         return reply == QMessageBox.StandardButton.Discard
 
+    def keyPressEvent(self, event):
+        # ツールボタンやレイヤー一覧をクリックした直後はそちらにフォーカスがあり、
+        # P / E などのツールキーが効かなかった。子が使わずに上がってきたキーは
+        # キャンバスに回す（文字入力欄は自分で受けるのでここには来ない）。
+        self.canvas.keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        # Alt スポイト・Space パンの「離した」もキャンバスに届けないと押しっぱなしになる
+        self.canvas.keyReleaseEvent(event)
+
     def closeEvent(self, event):
         if self._confirm_discard("終了"):
             event.accept()
@@ -2211,16 +2409,14 @@ class MainWindow(QMainWindow):
         def _resize_layer_image(lyr, nw: int, nh: int, scale_mode: bool):
             if lyr.is_vector:
                 # 絵を差し替えても線から描き直されて元に戻るので、点のほうを動かす。
-                lox = getattr(lyr, 'offset_x', 0)
-                loy = getattr(lyr, 'offset_y', 0)
+                # 点はキャンバス座標で持っているので、レイヤーの offset
+                # （描画バッファの位置）は足さない。足すと線がずれる。
                 if scale_mode:
                     sx = nw / old_w if old_w else 1.0
                     sy = nh / old_h if old_h else 1.0
-                    if lox or loy:
-                        lyr.translate_strokes(lox, loy)
                     lyr.scale_strokes(sx, sy)
                 else:
-                    lyr.translate_strokes(offset_x + lox, offset_y + loy)
+                    lyr.translate_strokes(offset_x, offset_y)
                 lyr.offset_x = 0
                 lyr.offset_y = 0
                 lyr.set_canvas_size(nw, nh)
@@ -2299,11 +2495,18 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         cw, ch = self.layer_stack.width, self.layer_stack.height
+        saved = False
         for path in paths:
             img = QImage(path)
             if img.isNull():
                 QMessageBox.warning(self, "エラー", f"読み込めませんでした:\n{path}")
                 continue
+            if not saved:
+                # 何枚追加しても「元に戻す」1回で取り消せるようにする。
+                # save_structure_history が未保存マークも付ける。
+                self.canvas.reset_state()
+                self.canvas.save_structure_history()
+                saved = True
             img = img.convertToFormat(QImage.Format.Format_ARGB32)
             # キャンバスより大きい場合は縮小、小さい場合はそのまま左上に配置
             if img.width() > cw or img.height() > ch:
@@ -2318,8 +2521,9 @@ class MainWindow(QMainWindow):
             canvas_img = canvas_img.convertToFormat(QImage.Format.Format_ARGB32)
 
             name = os.path.splitext(os.path.basename(path))[0]
-            layer = self.layer_stack.add(name)
+            layer = Layer(name, cw, ch)
             layer.image = canvas_img
+            self.layer_stack.insert_above_active(layer)
 
         self.layer_panel.refresh()
         self.canvas.update()
@@ -2331,9 +2535,35 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         result = dialog.extract()
-        line_layer = self.layer_stack.add("線画")
+        self.canvas.reset_state()
+        self.canvas.save_structure_history()
+        line_layer = Layer("線画", self.layer_stack.width, self.layer_stack.height)
         line_layer.image = result
+        self.layer_stack.insert_above_active(line_layer)
         self.layer_panel.refresh()
+        self.canvas.update()
+        self.navigator.refresh()
+
+    def _paste(self):
+        """クリップボードの絵を新しいレイヤーとして貼り付ける（クリスタと同じ）。
+
+        今のレイヤーに直接焼き込むと、位置を直したいときに元の絵ごと
+        動いてしまう。別レイヤーなら移動・変形・削除が自由にできる。
+        """
+        payload = self.canvas.clipboard_payload()
+        if payload is None:
+            self.statusBar().showMessage("貼り付けるものがありません", 3000)
+            return
+        img, pos = payload
+        self.canvas.reset_state()
+        self.canvas.save_structure_history()
+        layer = Layer("貼り付け", img.width(), img.height())
+        layer.image = img
+        layer.offset_x = pos.x()
+        layer.offset_y = pos.y()
+        self.layer_stack.insert_above_active(layer)
+        self.layer_panel.refresh()
+        self._refresh_tool_options()
         self.canvas.update()
         self.navigator.refresh()
 
@@ -2358,32 +2588,53 @@ class MainWindow(QMainWindow):
             return
         self.canvas.invert_selection()
 
-    def _transform_layer_dialog(self):
-        """画像メニュー: レイヤー全体をliftしてからTransformPercentDialogを開く。"""
+    def _begin_transform(self) -> bool:
+        """変形を始める。選択範囲があればその中を、なければレイヤー全体を持ち上げる。
+
+        すでに変形中ならそのまま続ける。始められなかったら理由を出して False。
+        """
+        if self.canvas._transform_image:
+            return True
         layer = self.layer_stack.active
         if not layer or layer.is_group:
             QMessageBox.warning(self, "変形", "通常レイヤーを選択してください。")
+            return False
+        if self.canvas._selection_rect is not None:
+            ok = self.canvas._lift_selection(layer)  # type: ignore
+        else:
+            ok = self.canvas.lift_whole_layer()
+        if not ok:
+            self.statusBar().showMessage("変形できません（ロック中か、変形するものがありません）", 3000)
+        return ok
+
+    def _transform_with_tool(self):
+        """拡大・縮小・回転（Ctrl+T）: 持ち上げて変形ツールに切り替え、ハンドルで操作する。"""
+        if self._begin_transform():
+            self.toolbar.select_tool(Tool.TRANSFORM)
+            self.canvas.setFocus()
+
+    def _transform_flip(self, horizontal: bool):
+        """左右・上下反転。変形中でなければ持ち上げて反転し、そのまま確定する。"""
+        was_floating = bool(self.canvas._transform_image)
+        if not self._begin_transform():
             return
-        if not self.canvas.lift_whole_layer():
-            return
-        dlg = TransformPercentDialog(self.canvas, self)
-        dlg.exec()
-        self.layer_panel.refresh()
+        if horizontal:
+            self.canvas.flip_transform_horizontal()
+        else:
+            self.canvas.flip_transform_vertical()
+        if not was_floating:
+            self.canvas._commit_transform()
         self.canvas.update()
         self.navigator.refresh()
 
+    def _commit_transform(self):
+        self.canvas._commit_transform()
+        self.navigator.refresh()
+
     def _open_transform_percent_dialog(self):
-        """変形メニュー: 既にlift済みの変形状態に%ゲージを開く。
-        lift済みでなければ、選択範囲があればそれを、なければレイヤー全体をliftする。"""
-        if not self.canvas._transform_image:
-            layer = self.layer_stack.active
-            if not layer or layer.is_group:
-                QMessageBox.warning(self, "変形", "通常レイヤーを選択してください。")
-                return
-            if self.canvas._selection_rect is not None:
-                self.canvas._lift_selection(layer)  # type: ignore
-            elif not self.canvas.lift_whole_layer():
-                return
+        """数値で変形: 変形中ならその続きを、そうでなければ持ち上げてから数値ゲージを開く。"""
+        if not self._begin_transform():
+            return
         dlg = TransformPercentDialog(self.canvas, self)
         dlg.exec()
         self.layer_panel.refresh()
@@ -2518,15 +2769,18 @@ class MainWindow(QMainWindow):
                 mw, mh = self.layer_stack.width, self.layer_stack.height
             merged = QImage(mw, mh, QImage.Format.Format_ARGB32_Premultiplied)
             merged.fill(Qt.GlobalColor.transparent)
-            mp = QPainter(merged)
-            self.layer_stack._draw_layers_to(mp, grp.children, min_x, min_y)
-            mp.end()
+            render_items(merged, grp.children, min_x, min_y)
             new_layer = Layer(grp.name, mw, mh)
             new_layer.image = merged.convertToFormat(QImage.Format.Format_ARGB32)
             new_layer.offset_x = min_x
             new_layer.offset_y = min_y
+            # フォルダの不透明度・表示・クリッピング・ロックは結合後も引き継ぐ。
+            # クリッピングが外れると、下のレイヤーからはみ出して見えてしまう。
             new_layer.opacity = grp.opacity
             new_layer.visible = grp.visible
+            new_layer.clipping = grp.clipping
+            new_layer.reference = grp.reference
+            new_layer.locked = grp.locked
             container[idx] = new_layer
             self.layer_stack.active_path = parent_path + [idx]
             self.layer_panel.refresh()
@@ -2545,8 +2799,19 @@ class MainWindow(QMainWindow):
         if not layer or layer.is_group:
             self.statusBar().showMessage("通常レイヤーを選択してください", 3000)
             return
-        self.canvas._save_history()
-        layer.rasterize()
+        if layer.is_vector:
+            # ベクターのままでは効果を焼いた絵を持てない（線から描き直されて
+            # 消える）ので、ラスターに置き換えてから焼く。
+            raster = self._replace_vector_with_raster(
+                "効果を焼き込む",
+                f"「{layer.name}」はベクターレイヤーです。効果を焼き込むと"
+                f"ふつうのレイヤーになり、線の太さや形をあとから直せなくなります。")
+            if raster is None:
+                return
+            raster.rasterize()
+        else:
+            self.canvas._save_history()
+            layer.rasterize()
         self.layer_panel.refresh()
         self.canvas.update()
         self.navigator.refresh()
@@ -2558,58 +2823,102 @@ class MainWindow(QMainWindow):
         変わる。ペンで引いた線はピクセルになり、以後は太さも形も直せない。
         """
         layer = self.layer_stack.active
-        path = self.layer_stack.active_path
-        if layer is None or not layer.is_vector or not path:
+        if layer is None or not layer.is_vector:
             self.statusBar().showMessage(
                 "ベクターレイヤーを選択してください", 3000)
             return
+        if self._replace_vector_with_raster(
+                "ベクターをラスタライズ",
+                f"「{layer.name}」の線を絵に焼き込みます。\n"
+                f"以後、線の太さや形をあとから直せなくなります。") is None:
+            return
+        self.layer_panel.refresh()
+        self.canvas.update()
+        self.navigator.refresh()
+        self.statusBar().showMessage(
+            f"「{layer.name}」をラスタライズしました", 3000)
+
+    def _replace_vector_with_raster(self, title: str, message: str):
+        """アクティブなベクターレイヤーを、確認のうえ同じ見た目のラスターに置き換える。
+
+        絵に直接手を入れる操作（効果の焼き込み・フィルター）はベクターのままだと
+        線から描き直されて消えるので、先にこれを通す。やめたときは None。
+        """
+        layer = self.layer_stack.active
+        path = self.layer_stack.active_path
+        if layer is None or not layer.is_vector or not path:
+            return None
+        if self.canvas.is_locked(layer):
+            self.statusBar().showMessage("このレイヤーはロックされています", 3000)
+            return None
         ans = QMessageBox.question(
-            self, "ベクターをラスタライズ",
-            f"「{layer.name}」の線を絵に焼き込みます。\n"
-            f"以後、線の太さや形をあとから直せなくなります。\n\n続けますか？",
+            self, title, f"{message}\n\n続けますか？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if ans != QMessageBox.StandardButton.Yes:
-            return
+            return None
 
         # 変形やベクター線の選択を持ち越すと、別物になったレイヤーを
-        # 指したままになる。
+        # 指したままになる。選択範囲はフィルターで使うので残す。
+        sel = (self.canvas._selection_rect, self.canvas._lasso_mask,
+               self.canvas._selection_outline_path)
         self.canvas.reset_state()
+        (self.canvas._selection_rect, self.canvas._lasso_mask,
+         self.canvas._selection_outline_path) = sel
         self.canvas.save_structure_history()
         container, parent_path = self.layer_stack.parent_of(path)
-        container[path[-1]] = layer.to_raster()  # type: ignore
+        raster = layer.to_raster()  # type: ignore
+        container[path[-1]] = raster
         self.layer_stack.active_path = parent_path + [path[-1]]
         # 履歴は id() でレイヤーを指している。差し替えで古い id が
         # 迷子になるので捨てる（undo が別レイヤーへ当たるのを防ぐ）。
         self.canvas.purge_orphan_history()
         self.layer_panel.refresh()
         self._refresh_tool_options()
-        self.canvas.update()
-        self.navigator.refresh()
-        self.statusBar().showMessage(
-            f"「{layer.name}」をラスタライズしました", 3000)
+        return raster
+
+    def _filter_target(self, title: str):
+        """フィルターをかけるレイヤー。使えないときは理由を出して None。"""
+        layer = self.canvas.layer_stack.active
+        if not layer or layer.is_group:
+            QMessageBox.warning(self, title, "通常レイヤーを選択してください。")
+            return None
+        if self.canvas.is_locked(layer):
+            QMessageBox.warning(self, title, "このレイヤーはロックされています。")
+            return None
+        if layer.is_vector:
+            return self._replace_vector_with_raster(
+                title,
+                f"「{layer.name}」はベクターレイヤーです。フィルターをかけるには"
+                f"ふつうのレイヤーに変換する必要があり、線の太さや形を"
+                f"あとから直せなくなります。")
+        return layer
 
     def _filter_blur(self):
         """フィルター → ぼかし (ガウス): レイヤー全体または選択範囲にガウスぼかしをかける。"""
         import cv2
         import numpy as np
 
-        layer = self.canvas.layer_stack.active
-        if not layer or layer.is_group:
+        layer = self._filter_target("ぼかし (ガウス)")
+        if layer is None:
             return
-        img: QImage = layer.image
 
         radius, ok = QInputDialog.getInt(
             self, "ぼかし (ガウス)", "ぼかし半径 (px):", 5, 1, 200)
         if not ok:
             return
+        img: QImage = layer.image
 
         self.canvas._save_history()
 
         k = radius * 2 + 1
-        bits = img.bits()
-        bits.setsize(img.sizeInBytes())
-        arr = np.frombuffer(bits, dtype=np.uint8).reshape(img.height(), img.width(), 4).copy()
+        # 乗算済みアルファでぼかす。そのままぼかすと透明部分の「黒」が
+        # 混ざり、線のふちに黒いにじみが出る。
+        pm = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        bits = pm.constBits()
+        bits.setsize(pm.sizeInBytes())
+        arr = np.frombuffer(bits, dtype=np.uint8).reshape(
+            pm.height(), pm.bytesPerLine() // 4, 4)[:, :pm.width()].copy()
 
         sel = self.canvas._selection_rect
         mask = self.canvas._lasso_mask
@@ -2624,18 +2933,18 @@ class MainWindow(QMainWindow):
             arr[local_mask] = blurred[local_mask]
 
         result = QImage(arr.data, img.width(), img.height(), arr.strides[0],
-                        QImage.Format.Format_ARGB32).copy()
+                        QImage.Format.Format_ARGB32_Premultiplied).copy()
         p = QPainter(img)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         p.drawImage(0, 0, result)
         p.end()
         self.canvas.update()
+        self.navigator.refresh()
 
     def _filter_tone_adjust(self):
         """フィルター → 色調補正: 選択レイヤーの線を濃く・くっきりさせる。"""
-        layer = self.canvas.layer_stack.active
-        if not layer or layer.is_group:
-            QMessageBox.warning(self, "色調補正", "通常レイヤーを選択してください。")
+        layer = self._filter_target("色調補正")
+        if layer is None:
             return
 
         local_mask = _selection_mask_for_layer(
@@ -2654,9 +2963,8 @@ class MainWindow(QMainWindow):
 
     def _filter_despeckle(self):
         """フィルター → ゴミ取り: 選択レイヤー上の孤立した小さな塊（面積 px² 以下）を透明化する。"""
-        layer = self.canvas.layer_stack.active
-        if not layer or layer.is_group:
-            QMessageBox.warning(self, "ゴミ取り", "通常レイヤーを選択してください。")
+        layer = self._filter_target("ゴミ取り")
+        if layer is None:
             return
 
         # 選択範囲はキャンバス座標なので、レイヤーローカルのマスクに変換してから使う

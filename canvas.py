@@ -1,12 +1,14 @@
 from __future__ import annotations
 import math
+import time
 import numpy as np
 import cv2
 
 from PyQt6.QtWidgets import QWidget, QApplication, QInputDialog, QFontDialog, QColorDialog
 from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QFont, QPixmap,
                           QTransform, QBrush, QPainterPath, QFontMetrics)
-from PyQt6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal, QTimer
+from PyQt6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal, QTimer,
+                          QEvent)
 
 from layer import LayerStack, Layer, BLEND_KEY_TO_MODE
 from tools import Tool
@@ -120,6 +122,60 @@ def _alpha(pixel: int) -> int:
 
 
 LINE_ALPHA_THRESHOLD = 10
+
+# 手ブレ補正の上限。大きいほど線がなめらかになるが、カーソルから遅れて付いてくる。
+STABILIZATION_MAX = 30
+
+# 入り抜きの長さの上限（px）
+TAPER_MAX = 500
+
+
+def _taper_width(d: float, total: float | None, size: float,
+                 t_in: float, t_out: float, tip_pct: float) -> float:
+    """入り抜きを付けたときの、線の始点から d の位置での太さ。
+
+    total が None のときは描いている途中で終わりが分からないので、入りだけ効かせる。
+    線が入り＋抜きより短いときは、両方を同じ比率で縮めて線の中に収める。
+    """
+    if total is not None and t_in + t_out > total:
+        k = total / (t_in + t_out) if t_in + t_out > 0 else 0.0
+        t_in, t_out = t_in * k, t_out * k
+    f = 1.0
+    if t_in > 0:
+        f = min(f, d / t_in)
+    if total is not None and t_out > 0:
+        f = min(f, (total - d) / t_out)
+    f = max(0.0, min(1.0, f))
+    tip = size * tip_pct / 100.0
+    return max(1.0, tip + (size - tip) * f)
+
+
+def _taper_pieces(pts: list[QPointF], size: float, t_in: float, t_out: float,
+                  tip_pct: float, total: float | None = None, start_dist: float = 0.0):
+    """折れ線 pts を、太さの変わる所だけ 1px 刻みに分けて (a, b, 太さ) で返す。
+
+    太さが一定の区間はまとめて1回で描く（長い線で描画回数が増えすぎないように）。
+    start_dist は pts[0] が線の始点からどれだけ進んだ位置か（描いている途中用）。
+    """
+    def w(d):
+        return _taper_width(d, total, size, t_in, t_out, tip_pct)
+
+    d = start_dist
+    for a, b in zip(pts, pts[1:]):
+        seg = math.hypot(b.x() - a.x(), b.y() - a.y())
+        if seg < 1e-6:
+            continue
+        d0, d1 = d, d + seg
+        d = d1
+        if w(d0) >= size and w(d1) >= size and w((d0 + d1) / 2) >= size:
+            yield a, b, float(size)
+            continue
+        n = max(1, int(math.ceil(seg)))
+        for i in range(n):
+            pa = QPointF(a.x() + (b.x() - a.x()) * i / n, a.y() + (b.y() - a.y()) * i / n)
+            pb = QPointF(a.x() + (b.x() - a.x()) * (i + 1) / n,
+                         a.y() + (b.y() - a.y()) * (i + 1) / n)
+            yield pa, pb, w(d0 + seg * (i + 0.5) / n)
 # 「線」と判定する alpha の下限。既定の 10 だと薄いアンチエイリアス部分まで
 # 線扱いになり、逆に上げすぎると薄い線が無視されて塗りが漏れる。
 
@@ -171,6 +227,22 @@ def _line_free_mask(judge_arr: np.ndarray, threshold: int = LINE_ALPHA_THRESHOLD
     diff = np.abs(judge_arr[:, :, :3].astype(np.int16)
                   - np.array([b, g, r], dtype=np.int16)).max(axis=2)
     return free | (opaque & (diff <= 24))
+
+
+def _holds(strokes, stroke) -> bool:
+    """strokes に stroke そのもの（同じオブジェクト）が入っているか。
+    VectorStroke は dataclass なので `in` だと中身が同じ別の線にも一致し、
+    undo で差し替わった古い線を掴んだまま編集が空振りしていた。"""
+    return any(s is stroke for s in strokes)
+
+
+def _alpha_array(img: QImage) -> np.ndarray:
+    """画像の alpha チャンネルを (h, w) の配列で返す（コピー）。"""
+    src = img.convertToFormat(QImage.Format.Format_ARGB32)
+    w, h = src.width(), src.height()
+    ptr = src.constBits()
+    ptr.setsize(h * w * 4)
+    return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)[:, :, 3].copy()
 
 
 def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
@@ -326,9 +398,14 @@ def _flood_fill_expanded(image: QImage, x: int, y: int,
 
 
 def _fill_closed_regions_in_area(image: QImage, area_mask: np.ndarray,
-                                  fill_color: QColor, ref_image: QImage | None) -> int:
+                                  fill_color: QColor, ref_image: QImage | None,
+                                  expand: int = 0, close_gap: int = 0,
+                                  line_threshold: int = LINE_ALPHA_THRESHOLD,
+                                  include_self: bool = False) -> int:
     """area_mask（投げなわ選択範囲）内にある、線で閉じた領域だけを自動検出して塗りつぶす。
     area_mask の外周に接している領域（＝閉じていない/範囲外に開いている）は対象外にする。
+    expand / close_gap / line_threshold / include_self はバケツ塗り
+    （_flood_fill_expanded）と同じ意味。
     戻り値: 実際に塗りつぶした領域の数。"""
     w, h = image.width(), image.height()
     judge = ref_image if ref_image is not None else image
@@ -337,7 +414,20 @@ def _fill_closed_regions_in_area(image: QImage, area_mask: np.ndarray,
     ptr = judge.bits(); ptr.setsize(nbytes)
     judge_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
     # 不透明=線(境界)。ただし白背景の線画は地色を塗れる側に含める。
-    line_mask = (~_line_free_mask(judge_arr)).astype(np.uint8)
+    free = _line_free_mask(judge_arr, line_threshold)
+    if include_self and ref_image is not None:
+        # 塗る側のレイヤーに描いてある線も境界にする（バケツと同じ）
+        self_ptr = image.bits(); self_ptr.setsize(nbytes)
+        self_arr = np.frombuffer(self_ptr, dtype=np.uint8).reshape(h, w, 4)
+        free = free & (self_arr[:, :, 3] <= line_threshold)
+    true_line = (~free).astype(np.uint8)
+    line_mask = true_line
+    gap_kernel = None
+    if close_gap > 0:
+        # 判定用の線だけを太らせて途切れを塞ぐ。塗る範囲は後で元の線まで戻す。
+        ksize = close_gap * 2 + 1
+        gap_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        line_mask = cv2.dilate(true_line, gap_kernel)
 
     # 選択範囲内かつ線でない領域を対象候補としてラベリング
     candidate = ((area_mask > 0) & (line_mask == 0)).astype(np.uint8)
@@ -375,8 +465,16 @@ def _fill_closed_regions_in_area(image: QImage, area_mask: np.ndarray,
     # 高速に処理する（従来の実装は領域数×面積に比例して QImage の低速なピクセル
     # アクセスを繰り返しており、投げなわ内に閉領域が多いと処理落ち・クラッシュしていた）。
     fill_mask = np.isin(labels, closed_labels)
+    if gap_kernel is not None:
+        # 太らせた線の分だけ痩せた塗りを、元の線の手前まで戻す
+        grown = cv2.dilate(fill_mask.astype(np.uint8), gap_kernel) > 0
+        fill_mask = grown & (true_line == 0) & area_bool
+    if expand:
+        ksize = abs(expand) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        op = cv2.dilate if expand > 0 else cv2.erode
+        fill_mask = op(fill_mask.astype(np.uint8), kernel) > 0
 
-    nbytes = h * w * 4
     ptr = image.bits(); ptr.setsize(nbytes)
     img_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
     img_arr[fill_mask] = (fill_color.blue(), fill_color.green(),
@@ -472,7 +570,16 @@ class Canvas(QWidget):
 
         # ブラシ
         self.brush_type: str = BrushType.ROUND
-        self._stabilizer = StabilizedBrush(get_brush(BrushType.ROUND), smooth=6)
+        # 手ブレ補正の強さ（0=なし）。平均をとる点数は「強さ+1」。
+        self.stabilization: int = 5
+        self._stabilizer = StabilizedBrush(get_brush(BrushType.ROUND),
+                                           smooth=self.stabilization + 1)
+        # 入り抜き（px で長さ、tip は先端の太さ % ）。ペンと消しゴムで別々に持つ。
+        self.taper: dict[str, dict[str, int]] = {
+            "pen": {"in": 0, "out": 0, "tip": 0},
+            "eraser": {"in": 0, "out": 0, "tip": 0},
+        }
+        self._taper_stroke: dict | None = None
 
         # 対称定規
         self.symmetry_enabled: bool = False
@@ -571,6 +678,13 @@ class Canvas(QWidget):
         self._transform_layer: Layer | None = None
         self._transform_erase_rect: QRect | None = None
         self._transform_erase_mask: QImage | None = None
+        # ベクターレイヤーを変形しているとき、持ち上げた線の番号。
+        # 絵を変形しても線から描き直されて元に戻るので、確定時は点を動かす。
+        self._transform_vector_idx: list[int] | None = None
+        # 持ち上げた線を除いた絵（プレビュー用）と、そのときの offset
+        self._transform_vector_rest: tuple[QImage, int, int] | None = None
+        # 変形中の反転（ベクターの点に反映するために覚えておく）
+        self._transform_flip: tuple[bool, bool] = (False, False)
         self._transform_pivot: tuple[int, int] = (1, 1)  # (ax, ay) 0=左/上 1=中央 2=右/下
         self._pivot_mode: str = "preset"  # "preset" | "custom"
         self._custom_pivot: QPointF | None = None  # キャンバス座標系の任意ピボット
@@ -595,7 +709,8 @@ class Canvas(QWidget):
         self._move_base_strokes = None
         self._move_base_pos: QPoint | None = None
         # グループ移動用：子レイヤー全員の元画像リスト
-        self._move_group_bases: list[tuple[Layer, QImage, int, int]] | None = None
+        # (子レイヤー, ベクターなら掴んだ時点の線・ラスターなら None, offset_x, offset_y)
+        self._move_group_bases: list[tuple[Layer, list | None, int, int]] | None = None
 
         # text — クリック後にダイアログを出すので、クリック位置を一時保持する
         self._text_pos: QPoint | None = None
@@ -641,7 +756,38 @@ class Canvas(QWidget):
 
     def set_brush(self, brush_type: str):
         self.brush_type = brush_type
-        self._stabilizer = StabilizedBrush(get_brush(brush_type), smooth=6)
+        self._stabilizer = StabilizedBrush(get_brush(brush_type),
+                                           smooth=self.stabilization + 1)
+
+    def _finish_stabilized_stroke(self):
+        """手ブレ補正で遅れている線の終わりを、最後に指があった所まで伸ばす。
+        補正を強くするほど遅れが大きく、これが無いと線が短く途切れる。"""
+        layer = self.layer_stack.active
+        if layer is None or layer.is_group:
+            return
+        tail = self._stabilizer.drain()
+        if not tail:
+            return
+        if self.tool == Tool.PEN and layer.is_vector:
+            if self._vector_points is not None and not self._vector_editing():
+                self._vector_points.extend((p.x(), p.y()) for p in tail)
+            return
+        if self.tool not in (Tool.PEN, Tool.ERASER) or self._last_pos is None:
+            return
+        for p in tail:
+            pt = p.toPoint()
+            if pt == self._last_pos:
+                continue
+            self._stroke_segment(layer, self._last_pos, pt)
+            self._last_pos = pt
+        self._apply_clip_to_selection()
+        self.update()
+
+    def set_stabilization(self, value: int):
+        """手ブレ補正の強さを変える（0〜STABILIZATION_MAX）。"""
+        self.stabilization = max(0, min(STABILIZATION_MAX, int(value)))
+        self._stabilizer.smooth = self.stabilization + 1
+        self._stabilizer.reset()
 
     def _viewport_anchor(self, widget_pos: QPointF | None = None):
         """拡大縮小の基準点を「ビューポート上の位置」と「その下にある
@@ -774,7 +920,9 @@ class Canvas(QWidget):
 
     def _widget_to_canvas(self, p: QPoint) -> QPoint:
         mapped = self._w2c().map(QPointF(p))
-        return QPoint(int(mapped.x()), int(mapped.y()))
+        # int() は 0 に向かって切り捨てるので、キャンバスの左・上の外
+        # （-0.5 など）が 0 列目扱いになる。floor で正しいピクセルにする。
+        return QPoint(math.floor(mapped.x()), math.floor(mapped.y()))
 
     def _painter_transform(self, p: QPainter):
         p.setTransform(self._c2w())
@@ -794,7 +942,7 @@ class Canvas(QWidget):
 
     def _layer_id(self) -> int | None:
         layer = self.layer_stack.active
-        return id(layer) if layer and not layer.is_group else None
+        return layer.uid if layer and not layer.is_group else None
 
     def _begin_stroke_cache(self, layer) -> None:
         """ストローク開始時に「描画中レイヤー以外」の合成結果をキャッシュする。
@@ -935,7 +1083,8 @@ class Canvas(QWidget):
     def _snapshot_layer(self, lyr) -> dict:
         if lyr.is_group:
             return {
-                "type": "group", "name": lyr.name, "visible": lyr.visible,
+                "type": "group", "uid": lyr.uid, "name": lyr.name, "visible": lyr.visible,
+                "pass_through": getattr(lyr, "pass_through", False),
                 "opacity": lyr.opacity, "clipping": lyr.clipping,
                 "reference": lyr.reference, "locked": lyr.locked,
                 "collapsed": lyr.collapsed,
@@ -949,7 +1098,7 @@ class Canvas(QWidget):
             "strokes": lyr.copy_strokes() if lyr.is_vector else None,
             "canvas_size": ((lyr._canvas_w, lyr._canvas_h)
                             if lyr.is_vector else None),
-            "name": lyr.name, "visible": lyr.visible,
+            "uid": lyr.uid, "name": lyr.name, "visible": lyr.visible,
             "opacity": lyr.opacity, "clipping": lyr.clipping,
             "reference": lyr.reference, "locked": lyr.locked,
             "image": lyr.image.copy(),
@@ -976,7 +1125,10 @@ class Canvas(QWidget):
             g.clipping = snap["clipping"]; g.reference = snap["reference"]
             g.locked = snap.get("locked", False)
             g.collapsed = snap["collapsed"]
+            g.pass_through = snap.get("pass_through", False)
             g.children = [self._restore_layer(c) for c in snap["children"]]
+            if "uid" in snap:
+                g.uid = snap["uid"]
             return g
         if snap.get("type") == "vector":
             from vector import VectorLayer
@@ -996,6 +1148,10 @@ class Canvas(QWidget):
                   "glow_size", "glow_strength", "blur_enabled", "blur_radius",
                   "blur_strength", "hsl_enabled", "hsl_hue", "hsl_saturation", "hsl_lightness"):
             setattr(lyr, k, snap[k])
+        # 作り直しても同じ番号にしておけば、構造の undo/redo をまたいでも
+        # 描画の履歴がそのレイヤーを指し続ける。
+        if "uid" in snap:
+            lyr.uid = snap["uid"]
         return lyr
 
     def save_structure_history(self):
@@ -1011,6 +1167,24 @@ class Canvas(QWidget):
         self._redo_stack.clear()
         self._trim_history()
         self.edited.emit()
+
+    _PROP_COALESCE_SEC = 1.0
+
+    def save_property_history(self, key) -> None:
+        """レイヤー属性（不透明度・表示・名前など）を変える直前の状態を控える。
+
+        スライダーを動かすと値が何十回も変わるので、同じ属性の変更が
+        続いている間（間に他の操作が入らず、間隔が短い）は1つにまとめる。
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_prop", None)
+        if (last is not None and last[0] == key and self._history
+                and self._history[-1] is last[1]
+                and now - last[2] < self._PROP_COALESCE_SEC):
+            self._last_prop = (key, last[1], now)
+            return
+        self.save_structure_history()
+        self._last_prop = (key, self._history[-1], now)
 
     def _apply_structure_snapshot(self, snap: dict):
         ls = self.layer_stack
@@ -1028,7 +1202,7 @@ class Canvas(QWidget):
         ids: set[int] = set()
         def _collect(items):
             for item in items:
-                ids.add(id(item))
+                ids.add(item.uid)
                 if item.is_group:
                     _collect(item.children)
         _collect(self.layer_stack.layers)
@@ -1050,7 +1224,7 @@ class Canvas(QWidget):
     def _find_layer_by_id(self, layer_id: int) -> Layer | None:
         def _search(items):
             for item in items:
-                if id(item) == layer_id:
+                if item.uid == layer_id:
                     return item
                 if item.is_group:
                     found = _search(item.children)
@@ -1068,85 +1242,77 @@ class Canvas(QWidget):
         layer = self._find_layer_by_id(lid)
         if layer is None or not layer.is_vector:
             return
+        sel_idx = None
+        if self._vector_selected is not None:
+            sel_idx = next((i for i, s in enumerate(layer.strokes)  # type: ignore
+                            if s is self._vector_selected), None)
         opposite.append(("vector", lid, layer.copy_strokes(),
                          getattr(layer, 'offset_x', 0),
                          getattr(layer, 'offset_y', 0)))
         layer.strokes = strokes  # type: ignore
         layer.mark_dirty()  # type: ignore
-        # 選択していた線が消えた可能性があるので、掴んだままにしない。
+        # 線は複製に置き換わるので、選択は古い線を指したままになる。本数が
+        # 変わらない（太さ・色・形の変更）ときは同じ位置の線を選び直し、
+        # 線が増減したときは選択を外す。
         if self._vector_selected is not None:
-            self._vector_selected = None
-            self._vector_drag = None
+            if sel_idx is not None and len(strokes) == len(opposite[-1][2]):
+                self._vector_selected = strokes[sel_idx]
+            else:
+                self._vector_selected = None
+                self._vector_drag = None
             self.vector_selection_changed.emit()
 
     def undo(self):
         if self._transform_image:
             self.cancel_transform()
             return
-        if not self._history:
-            return
-        entry = self._history.pop()
-        if entry[0] == "vector":
-            self._swap_vector_entry(entry, self._redo_stack)
-        elif entry[0] == "pixel":
-            lid = entry[1]
-            img = entry[2]
-            old_ox = entry[3] if len(entry) > 3 else 0
-            old_oy = entry[4] if len(entry) > 4 else 0
-            layer = self._find_layer_by_id(lid)
-            if layer is None:
-                return
-            cur_ox = getattr(layer, 'offset_x', 0)
-            cur_oy = getattr(layer, 'offset_y', 0)
-            self._redo_stack.append(("pixel", lid, layer.image.copy(), cur_ox, cur_oy))
-            layer.image = img
-            layer.offset_x = old_ox
-            layer.offset_y = old_oy
-        elif entry[0] == "structure":
-            _, snap = entry
-            current_snap = {
-                "layers": [self._snapshot_layer(l) for l in self.layer_stack.layers],
-                "active_path": list(self.layer_stack.active_path),
-                "canvas_size": (self.layer_stack.width, self.layer_stack.height),
-            }
-            self._redo_stack.append(("structure", current_snap))
-            self._apply_structure_snapshot(snap)
-            if self._on_structure_restored:
-                self._on_structure_restored()
-        self.update()
-        self.edited.emit()
+        self._step_history(self._history, self._redo_stack)
 
     def redo(self):
-        if not self._redo_stack:
-            return
-        entry = self._redo_stack.pop()
-        if entry[0] == "vector":
-            self._swap_vector_entry(entry, self._history)
-        elif entry[0] == "pixel":
-            lid = entry[1]
-            img = entry[2]
-            old_ox = entry[3] if len(entry) > 3 else 0
-            old_oy = entry[4] if len(entry) > 4 else 0
-            layer = self._find_layer_by_id(lid)
-            if layer is None:
-                return
-            cur_ox = getattr(layer, 'offset_x', 0)
-            cur_oy = getattr(layer, 'offset_y', 0)
-            self._history.append(("pixel", lid, layer.image.copy(), cur_ox, cur_oy))
-            layer.image = img
-            layer.offset_x = old_ox
-            layer.offset_y = old_oy
-        elif entry[0] == "structure":
-            _, snap = entry
-            current_snap = {
-                "layers": [self._snapshot_layer(l) for l in self.layer_stack.layers],
-                "active_path": list(self.layer_stack.active_path),
-                "canvas_size": (self.layer_stack.width, self.layer_stack.height),
-            }
-            self._history.append(("structure", current_snap))
-            self._apply_structure_snapshot(snap)
-            if self._on_structure_restored:
-                self._on_structure_restored()
+        self._step_history(self._redo_stack, self._history)
+
+    def _step_history(self, src: list, dst: list) -> None:
+        """src の末尾を1件適用し、今の状態を dst へ積む。undo と redo の共通部。
+
+        指すレイヤーがもう無い履歴（削除したレイヤーへの描画など）は
+        黙って捨てて次へ進む。そこで止まると、何も起きない undo が
+        挟まって「効かない」ように見えるため。
+        """
+        while src:
+            entry = src.pop()
+            if entry[0] == "vector":
+                layer = self._find_layer_by_id(entry[1])
+                if layer is None or not layer.is_vector:
+                    continue
+                self._swap_vector_entry(entry, dst)
+            elif entry[0] == "pixel":
+                lid, img = entry[1], entry[2]
+                old_ox = entry[3] if len(entry) > 3 else 0
+                old_oy = entry[4] if len(entry) > 4 else 0
+                layer = self._find_layer_by_id(lid)
+                if layer is None or layer.is_group or layer.is_vector:
+                    continue
+                dst.append(("pixel", lid, layer.image.copy(),
+                            getattr(layer, 'offset_x', 0), getattr(layer, 'offset_y', 0)))
+                layer.image = img
+                layer.offset_x = old_ox
+                layer.offset_y = old_oy
+            elif entry[0] == "structure":
+                _, snap = entry
+                dst.append(("structure", {
+                    "layers": [self._snapshot_layer(l) for l in self.layer_stack.layers],
+                    "active_path": list(self.layer_stack.active_path),
+                    "canvas_size": (self.layer_stack.width, self.layer_stack.height),
+                }))
+                self._apply_structure_snapshot(snap)
+                # 作り直したレイヤーには選択中のベクター線は無い
+                if self._vector_selected is not None:
+                    self._vector_selected = None
+                    self._vector_drag = None
+                    self.vector_selection_changed.emit()
+                if self._on_structure_restored:
+                    self._on_structure_restored()
+            break
         self.update()
         self.edited.emit()
 
@@ -1181,7 +1347,7 @@ class Canvas(QWidget):
             p.setPen(QPen(QColor(100, 160, 255, 180), 1, Qt.PenStyle.DashLine))
             p.drawLine(cx, 0, cx, self.layer_stack.height)
 
-        if self._preview_start and self._preview_end:
+        if self._preview_start is not None and self._preview_end is not None:
             self._draw_shape_preview(p)
 
         if self._lasso_points:
@@ -1244,7 +1410,7 @@ class Canvas(QWidget):
         self._draw_vector_handles(p)
 
         # ブラシカーソル円
-        if self._cursor_widget_pos and self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
+        if self._cursor_widget_pos is not None and self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
             self._draw_cursor_circle(p)
 
         p.end()
@@ -1517,7 +1683,17 @@ class Canvas(QWidget):
         # 変形元レイヤーから切り取り領域を消去したプレビュー用合成を作る
         # 元レイヤーを一時的に切り取り済み状態にしてから composite() を呼ぶ
         layer = self._transform_layer
-        if layer is not None and not layer.is_group:
+        if layer is not None and self._transform_vector_rest is not None:
+            # ベクターは持ち上げた線を除いて描いた絵を、合成のあいだだけ差し込む。
+            orig_img = layer.image  # type: ignore
+            orig_off = (layer.offset_x, layer.offset_y)  # type: ignore
+            rest_img, rx, ry = self._transform_vector_rest
+            layer.image = rest_img  # type: ignore
+            layer.offset_x, layer.offset_y = rx, ry  # type: ignore
+            base = self.layer_stack.composite()
+            layer.image = orig_img  # type: ignore
+            layer.offset_x, layer.offset_y = orig_off  # type: ignore
+        elif layer is not None and not layer.is_group:
             # 元画像をバックアップ
             orig_img = layer.image  # type: ignore
             ox = getattr(layer, 'offset_x', 0)
@@ -1735,7 +1911,7 @@ class Canvas(QWidget):
         if sel is None or not sel.points:
             return
         layer = self.layer_stack.active
-        if layer is None or not layer.is_vector or sel not in layer.strokes:
+        if layer is None or not layer.is_vector or not _holds(layer.strokes, sel):
             return
 
         c2w = self._c2w()
@@ -1851,7 +2027,7 @@ class Canvas(QWidget):
             alt, shift = True, False
         sel = self._vector_selected
 
-        if sel is not None and sel in layer.strokes:
+        if sel is not None and _holds(layer.strokes, sel):
             # 1. ハンドルを掴む。ただし Alt+Shift は出し入れの合図なので、
             #    ハンドルが点の近くにあっても掴まずに 2. へ流す。
             #    点を消す役割のときは、ハンドルも掴まない（消すのが目的なので）。
@@ -1929,7 +2105,7 @@ class Canvas(QWidget):
         if self._vector_drag is None:
             return False
         sel = self._vector_selected
-        if sel is None or sel not in layer.strokes:
+        if sel is None or not _holds(layer.strokes, sel):
             self._vector_drag = None
             return False
         x, y = float(cp.x()), float(cp.y())
@@ -2006,7 +2182,7 @@ class Canvas(QWidget):
             return None
         if self._vector_selected is None:
             return None
-        if self._vector_selected not in layer.strokes:
+        if not _holds(layer.strokes, self._vector_selected):
             # レイヤーを切り替えた等で取り残された参照を掃除する
             self._vector_selected = None
             return None
@@ -2081,7 +2257,7 @@ class Canvas(QWidget):
         if layer is None:
             return
         self._save_history()
-        layer.strokes.remove(self._vector_selected)
+        layer.strokes = [s for s in layer.strokes if s is not self._vector_selected]
         self._vector_selected = None
         self._vector_drag = None
         layer.mark_dirty()
@@ -2166,17 +2342,29 @@ class Canvas(QWidget):
                 self.status_message.emit("このレイヤーはロックされています。レイヤーパネルの錠マークを解除してください。")
                 return
             if layer and layer.is_group:
-                children = self._collect_leaf_layers(layer)
+                # 中に個別にロックしたレイヤーがあれば、それだけは動かさない。
+                children = [c for c in self._collect_leaf_layers(layer)
+                            if not self.is_locked(c)]
                 if children:
-                    for child in children:
-                        ox = getattr(child, 'offset_x', 0)
-                        oy = getattr(child, 'offset_y', 0)
-                        self._history.append(("pixel", id(child), child.image.copy(), ox, oy))  # type: ignore
-                    self._redo_stack.clear()
-                    self._trim_history()
-                    self.edited.emit()
+                    def _push_group_history(children=children):
+                        for child in children:
+                            ox = getattr(child, 'offset_x', 0)
+                            oy = getattr(child, 'offset_y', 0)
+                            if child.is_vector:
+                                self._history.append(
+                                    ("vector", child.uid, child.copy_strokes(), ox, oy))  # type: ignore
+                            else:
+                                self._history.append(("pixel", child.uid, child.image.copy(), ox, oy))  # type: ignore
+                        self._redo_stack.clear()
+                        self._trim_history()
+                        self.edited.emit()
+                    # クリックしただけで動かさなかったときに、中身のない取り消しが
+                    # 積まれないよう、実際に動き始めた時点で控える。
+                    self._move_pending_history = _push_group_history
+                    # ベクターは offset ではなく点を動かすので、掴んだ時点の線を控える。
                     self._move_group_bases = [
-                        (c, c.image.copy(), getattr(c, 'offset_x', 0), getattr(c, 'offset_y', 0))
+                        (c, c.copy_strokes() if c.is_vector else None,
+                         getattr(c, 'offset_x', 0), getattr(c, 'offset_y', 0))
                         for c in children]  # type: ignore
                     self._move_base_pos = cp
                     self._drawing = True
@@ -2185,12 +2373,11 @@ class Canvas(QWidget):
                     # 選択範囲の中を掴んだら、レイヤー全体ではなく選択部分だけを
                     # 動かす。ここを見ていないと「選択したのに選択外も一緒に
                     # 動く」ことになる（選択ツール側と同じ挙動に合わせる）。
-                    self._save_history()
-                    self._lift_selection(layer)  # type: ignore
-                    self._begin_transform_drag('move', wp)
-                    self._drawing = True
+                    if self._lift_selection(layer):  # type: ignore
+                        self._begin_transform_drag('move', wp)
+                        self._drawing = True
                     return
-                self._save_history()
+                self._move_pending_history = self._save_history
                 self._move_base_image = layer.image  # type: ignore
                 # ベクターは点を動かすので、掴んだ時点の線を控えておく。
                 self._move_base_strokes = (
@@ -2260,6 +2447,8 @@ class Canvas(QWidget):
         elif self.tool == Tool.PEN and layer.is_vector:
             # ベクターは確定するまで image に描かない。点を溜めておき、
             # 表示はプレビューで見せて、離したときに1本の線にする。
+            self._stabilizer.reset()
+            self._stabilizer.push(cp)
             self._vector_points = [(float(cp.x()), float(cp.y()))]
             self.update()
 
@@ -2269,7 +2458,7 @@ class Canvas(QWidget):
             self._stabilizer.reset()
             smooth_pt = self._stabilizer.push(lp).toPoint()
             self._last_pos = smooth_pt
-            self._brush_stamp(layer.image, smooth_pt)  # type: ignore
+            self._brush_stamp(layer.image, smooth_pt, self._taper_start_size(layer, smooth_pt))  # type: ignore
             self._apply_clip_to_selection()
             self.update()
 
@@ -2277,13 +2466,20 @@ class Canvas(QWidget):
             self._save_history()
             self._begin_stroke_cache(layer)
             self._stabilizer.reset()
+            self._stabilizer.push(lp)
             self._last_pos = lp
-            self._erase_point(layer.image, lp)  # type: ignore
+            self._erase_point(layer.image, lp, self._taper_start_size(layer, lp))  # type: ignore
             self._apply_clip_to_selection()
             self.update()
 
         elif self.tool == Tool.FILL:
             self._save_history()
+            # 移動したレイヤーや、開き直したファイルのレイヤーは画像が
+            # キャンバスより小さいことがある。そのままだとバッファ外の
+            # クリックが何も塗らないので、先にキャンバス全体を覆わせる。
+            self._ensure_layer_bounds(
+                layer, QRect(0, 0, self.layer_stack.width, self.layer_stack.height))
+            lp = QPoint(cp.x() - layer.offset_x, cp.y() - layer.offset_y)  # type: ignore
             # 参照画像は _build_fill_reference が対象レイヤーの座標系に
             # 合わせて返す（offset のずれもここで吸収される）。
             ref_img = self._build_fill_reference(layer)
@@ -2300,13 +2496,19 @@ class Canvas(QWidget):
             self._last_pos = lp
             self._blur_brush.strength = self.blur_strength
             self._blur_brush.stamp(layer.image, lp, self.pen_color, self.blur_size)
+            self._apply_clip_to_selection()
             self.update()
 
         elif self.tool == Tool.EYEDROPPER:
             composite = self.layer_stack.composite()
             if 0 <= cp.x() < composite.width() and 0 <= cp.y() < composite.height():
-                self._prev_color = QColor(self.pen_color)
-                self.color_picked.emit(QColor(composite.pixel(cp.x(), cp.y())))
+                picked = QColor.fromRgba(composite.pixel(cp.x(), cp.y()))
+                # 透明な所を拾うとペンが「透明な黒」になって描けなくなる。
+                # 何もない所は無視し、半透明は色だけを拾う。
+                if picked.alpha() > 0:
+                    picked.setAlpha(255)
+                    self._prev_color = QColor(self.pen_color)
+                    self.color_picked.emit(picked)
             if not self._alt_eyedropper:
                 self._drawing = False
 
@@ -2464,10 +2666,9 @@ class Canvas(QWidget):
         # 選択範囲内クリック後、実際にドラッグが始まったら lift を実行
         if self._lift_pending and self._drawing:
             layer = self.layer_stack.active
-            if layer and not layer.is_group:
-                self._lift_selection(layer)  # type: ignore
-                self._lift_pending = False
-                self._lift_pending_wp = None
+            self._lift_pending = False
+            self._lift_pending_wp = None
+            if layer and not layer.is_group and self._lift_selection(layer):  # type: ignore
                 self._begin_transform_drag('move', wp)
 
         if self._drawing and self._transform_handle and self._transform_image:
@@ -2484,10 +2685,18 @@ class Canvas(QWidget):
         if self.tool == Tool.MOVE and self._move_base_pos:
             dx = cp.x() - self._move_base_pos.x()
             dy = cp.y() - self._move_base_pos.y()
+            pending = getattr(self, "_move_pending_history", None)
+            if pending is not None and (dx or dy):
+                self._move_pending_history = None
+                pending()
             if self._move_group_bases is not None:
-                for child, base_img, base_ox, base_oy in self._move_group_bases:
-                    child.offset_x = base_ox + dx
-                    child.offset_y = base_oy + dy
+                for child, base_strokes, base_ox, base_oy in self._move_group_bases:
+                    if base_strokes is not None:
+                        child.strokes = [s.copy() for s in base_strokes]
+                        child.translate_strokes(dx, dy)
+                    else:
+                        child.offset_x = base_ox + dx
+                        child.offset_y = base_oy + dy
             elif self._move_base_image is not None and not layer.is_group:
                 self._move_layer(layer, dx, dy)  # type: ignore
             self.update()
@@ -2508,7 +2717,8 @@ class Canvas(QWidget):
                 self._vector_drag_move(layer, cp)
                 return
             if self._vector_points is not None:
-                self._vector_points.append((float(cp.x()), float(cp.y())))
+                sp = self._stabilizer.push(cp)
+                self._vector_points.append((sp.x(), sp.y()))
                 self.update()
             return
 
@@ -2526,27 +2736,28 @@ class Canvas(QWidget):
         loy = getattr(layer, 'offset_y', 0)
         lp = QPoint(cp.x() - lox, cp.y() - loy)
 
-        if self.tool == Tool.PEN and self._last_pos:
+        if self.tool == Tool.PEN and self._last_pos is not None:
             smooth_pt = self._stabilizer.push(lp).toPoint()
-            self._brush_stroke(layer.image, self._last_pos, smooth_pt)  # type: ignore
+            self._stroke_segment(layer, self._last_pos, smooth_pt)
             self._last_pos = smooth_pt
             self._apply_clip_to_selection()
             self.update()
 
-        elif self.tool == Tool.ERASER and self._last_pos:
-            self._erase_line(layer.image, self._last_pos, lp)  # type: ignore
-            self._last_pos = lp
+        elif self.tool == Tool.ERASER and self._last_pos is not None:
+            smooth_pt = self._stabilizer.push(lp).toPoint()
+            self._stroke_segment(layer, self._last_pos, smooth_pt)
+            self._last_pos = smooth_pt
             self._apply_clip_to_selection()
             self.update()
 
-        elif self.tool == Tool.BLUR and self._last_pos:
+        elif self.tool == Tool.BLUR and self._last_pos is not None:
             self._blur_brush.stroke_to(layer.image, self._last_pos, lp, self.pen_color, self.blur_size)
             self._last_pos = lp
             self._apply_clip_to_selection()
             self.update()
 
         elif self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.SELECT_RECT):
-            if (self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start
+            if (self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start is not None
                     and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier):
                 cp = _constrain_shape_shift(self.tool, self._preview_start, cp)
             self._preview_end = cp
@@ -2559,6 +2770,10 @@ class Canvas(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        if self._drawing and not self._panning:
+            self._finish_stabilized_stroke()
+            self._taper_finish()
+        self._taper_stroke = None
         self._end_stroke_cache()
         if self._panning:
             self._pan_start_widget = None
@@ -2572,6 +2787,7 @@ class Canvas(QWidget):
         self._move_base_strokes = None
         self._move_group_bases = None
         self._move_base_pos = None
+        self._move_pending_history = None
 
         # lift 保留のままリリース → クリックのみ（ドラッグなし）なので選択範囲を維持
         if self._lift_pending:
@@ -2599,7 +2815,7 @@ class Canvas(QWidget):
             self._commit_vector_stroke(layer)
             return
 
-        if self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start:
+        if self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start is not None:
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                 cp = _constrain_shape_shift(self.tool, self._preview_start, cp)
             # ドラッグせずクリックしただけ（始点=終点）の場合は退化図形なので何も描かない。
@@ -2628,7 +2844,7 @@ class Canvas(QWidget):
             self._preview_end = None
             self.update()
 
-        elif self.tool == Tool.SELECT_RECT and self._preview_start:
+        elif self.tool == Tool.SELECT_RECT and self._preview_start is not None:
             sel = QRect(self._preview_start, cp).normalized()
             self._preview_start = None
             self._preview_end = None
@@ -2746,7 +2962,11 @@ class Canvas(QWidget):
         # 参照画像は _build_fill_reference が対象レイヤーの座標系・サイズに
         # 合わせて返すので、ここでの切り出しは不要。
         ref_img = self._build_fill_reference(layer)
-        filled = _fill_closed_regions_in_area(layer.image, area_mask, self.pen_color, ref_img)  # type: ignore
+        filled = _fill_closed_regions_in_area(
+            layer.image, area_mask, self.pen_color, ref_img,  # type: ignore
+            self.fill_expand, self.fill_close_gap,
+            _sensitivity_to_threshold(self.fill_line_sensitivity),
+            self.fill_reference_mode == "ref_self")
         if filled == 0 and self._history and self._history[-1][0] == "pixel":
             # 何も塗られなかった場合は空の undo エントリを積まない
             self._history.pop()
@@ -2759,41 +2979,153 @@ class Canvas(QWidget):
                     Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
 
     def _mirror_x(self, pt: QPoint) -> QPoint:
-        """対称定規用: キャンバス中心でX軸ミラーした点を返す。"""
+        """対称定規用: キャンバス中心でX軸ミラーした点を返す。
+
+        pt は描いているレイヤーのローカル座標。移動したレイヤーでも
+        キャンバスの中心線で折り返すよう、いったんキャンバス座標に直す。
+        """
         cx = self.layer_stack.width // 2
-        return QPoint(2 * cx - pt.x(), pt.y())
+        layer = self.layer_stack.active
+        ox = getattr(layer, 'offset_x', 0) if layer is not None else 0
+        if isinstance(pt, QPointF):
+            return QPointF(2 * cx - pt.x() - 2 * ox, pt.y())
+        return QPoint(2 * cx - pt.x() - 2 * ox, pt.y())
 
-    def _brush_stamp(self, img: QImage, pt: QPoint):
-        """ブラシで1点描画（対称定規対応）。"""
+    def _brush_stamp(self, img: QImage, pt: QPoint, size: float | None = None):
+        """ブラシで1点描画（対称定規対応）。size 省略時はペンの太さ。"""
+        size = self.pen_size if size is None else size
         brush = get_brush(self.brush_type)
-        brush.stamp(img, pt, self.pen_color, self.pen_size)
+        brush.stamp(img, pt, self.pen_color, size)
         if self.symmetry_enabled:
-            brush.stamp(img, self._mirror_x(pt), self.pen_color, self.pen_size)
+            brush.stamp(img, self._mirror_x(pt), self.pen_color, size)
 
-    def _brush_stroke(self, img: QImage, a: QPoint, b: QPoint):
-        """ブラシでストローク描画（対称定規対応）。"""
+    def _brush_stroke(self, img: QImage, a: QPoint, b: QPoint, size: float | None = None):
+        """ブラシでストローク描画（対称定規対応）。size 省略時はペンの太さ。"""
+        size = self.pen_size if size is None else size
         brush = get_brush(self.brush_type)
-        brush.stroke_to(img, a, b, self.pen_color, self.pen_size)
+        brush.stroke_to(img, a, b, self.pen_color, size)
         if self.symmetry_enabled:
             brush.stroke_to(img, self._mirror_x(a), self._mirror_x(b),
-                            self.pen_color, self.pen_size)
+                            self.pen_color, size)
 
-    def _erase_point(self, img: QImage, p: QPoint):
+    def _erase_point(self, img: QImage, p: QPoint, size: float | None = None):
         painter = QPainter(img)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-        painter.setPen(QPen(Qt.GlobalColor.transparent, self.eraser_size,
+        painter.setPen(QPen(Qt.GlobalColor.transparent,
+                            self.eraser_size if size is None else size,
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawPoint(p)
         painter.end()
 
-    def _erase_line(self, img: QImage, a: QPoint, b: QPoint):
+    def _erase_line(self, img: QImage, a: QPoint, b: QPoint, size: float | None = None):
         painter = QPainter(img)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-        painter.setPen(QPen(Qt.GlobalColor.transparent, self.eraser_size,
+        painter.setPen(QPen(Qt.GlobalColor.transparent,
+                            self.eraser_size if size is None else size,
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                             Qt.PenJoinStyle.RoundJoin))
         painter.drawLine(a, b)
         painter.end()
+
+    # ── 入り抜き ──────────────────────────────────────────────────────────────
+    # 描いている間は入りだけを効かせて普通に描き、離したときに「描く前の絵」から
+    # 線全体を入り抜き付きで描き直す（抜きは終わりが分かるまで決められないため）。
+
+    def _taper_settings(self) -> dict | None:
+        """今のツールの入り抜き設定。どちらも 0 なら None（＝使わない）。"""
+        key = {Tool.PEN: "pen", Tool.ERASER: "eraser"}.get(self.tool)
+        t = self.taper.get(key) if key else None
+        if not t or (t["in"] <= 0 and t["out"] <= 0):
+            return None
+        return t
+
+    def set_taper(self, tool_key: str, field: str, value: int):
+        """入り抜きの設定を変える。tool_key は "pen"/"eraser"、field は in/out/tip。"""
+        if tool_key not in self.taper or field not in ("in", "out", "tip"):
+            return
+        hi = 100 if field == "tip" else TAPER_MAX
+        self.taper[tool_key][field] = max(0, min(hi, int(value)))
+
+    def _taper_begin(self, layer, lp: QPoint) -> dict | None:
+        """押したときに呼ぶ。描き直し用に描く前の絵と、始点を控える。"""
+        t = self._taper_settings()
+        self._taper_stroke = None
+        if t is None or layer is None or layer.is_vector:
+            return None
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
+        self._taper_stroke = {
+            "t": dict(t), "tool": self.tool, "layer": layer,
+            "base": layer.image.copy(), "base_off": (ox, oy),
+            # 点はキャンバス座標で持つ（途中でレイヤーが広がっても崩れない）
+            "pts": [QPointF(lp.x() + ox, lp.y() + oy)], "dist": 0.0,
+        }
+        return self._taper_stroke
+
+    def _taper_start_size(self, layer, lp: QPoint) -> float:
+        """押した瞬間の点の太さ。入りがあれば先端の細さから始める。"""
+        ts = self._taper_begin(layer, lp)
+        size = self._tool_size()
+        if ts is None:
+            return size
+        t = ts["t"]
+        return _taper_width(0.0, None, size, t["in"], 0, t["tip"])
+
+    def _tool_size(self) -> float:
+        return float(self.eraser_size if self.tool == Tool.ERASER else self.pen_size)
+
+    def _taper_draw_piece(self, img: QImage, a, b, size: float):
+        if self.tool == Tool.ERASER:
+            self._erase_line(img, a, b, size)
+        else:
+            self._brush_stroke(img, a, b, size)
+
+    def _stroke_segment(self, layer, a: QPoint, b: QPoint):
+        """ペン・消しゴムの1区間を描く。入りがあれば始点からの距離で細くする。"""
+        ts = self._taper_stroke
+        if ts is None or ts["layer"] is not layer:
+            self._taper_draw_piece(layer.image, a, b, self._tool_size())
+            return
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
+        ts["pts"].append(QPointF(b.x() + ox, b.y() + oy))
+        t = ts["t"]
+        start = ts["dist"]
+        ts["dist"] += math.hypot(b.x() - a.x(), b.y() - a.y())
+        for pa, pb, w in _taper_pieces([QPointF(a), QPointF(b)], self._tool_size(),
+                                       t["in"], 0, t["tip"], None, start):
+            self._taper_draw_piece(layer.image, pa, pb, w)
+
+    def _taper_finish(self):
+        """離したときに呼ぶ。描く前の絵に、入り抜き付きで線を描き直す。"""
+        ts = self._taper_stroke
+        self._taper_stroke = None
+        layer = self.layer_stack.active
+        if ts is None or ts["layer"] is not layer or ts["tool"] != self.tool:
+            return
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
+        img = QImage(layer.image.size(), layer.image.format())
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        bx, by = ts["base_off"]
+        p.drawImage(bx - ox, by - oy, ts["base"])
+        p.end()
+
+        pts = [QPointF(q.x() - ox, q.y() - oy) for q in ts["pts"]]
+        total = sum(math.hypot(b.x() - a.x(), b.y() - a.y()) for a, b in zip(pts, pts[1:]))
+        t, size = ts["t"], self._tool_size()
+        if total < 1e-6:
+            if self.tool == Tool.ERASER:
+                self._erase_point(img, pts[0], size)
+            else:
+                self._brush_stamp(img, pts[0], size)
+        for a, b, w in _taper_pieces(pts, size, t["in"], t["out"], t["tip"], total):
+            self._taper_draw_piece(img, a, b, w)
+        layer.image = img
+        self._apply_clip_to_selection()
+        self.update()
 
     def _commit_shape(self, img: QImage, a: QPoint, b: QPoint):
         painter = QPainter(img)
@@ -2862,6 +3194,9 @@ class Canvas(QWidget):
         text_rect = QRect(self._text_pos.x() + br.x(), self._text_pos.y() + br.y(),
                           max(1, br.width()), max(1, br.height()))
         self._ensure_layer_bounds(layer, text_rect.adjusted(-2, -2, 2, 2))
+        # 領域を広げた後で控えないと、元画像とサイズが合わなくなる
+        self._clip_mask = self._lasso_mask
+        self._begin_clip_to_selection(layer)
         painter = QPainter(layer.image)  # type: ignore
         painter.setFont(font)
         painter.setPen(QPen(color))
@@ -2869,6 +3204,7 @@ class Canvas(QWidget):
         painter.drawText(self._text_pos - QPoint(getattr(layer, 'offset_x', 0),
                                                  getattr(layer, 'offset_y', 0)), text)
         painter.end()
+        self._apply_clip_to_selection()
         self._text_pos = None
         self.update()
 
@@ -2891,44 +3227,53 @@ class Canvas(QWidget):
             p.end()
         self._clipboard_image = region
         self._clipboard_offset = self._selection_rect.topLeft()
+        # ほかのアプリにも貼れるよう、OS のクリップボードにも載せる。
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setImage(region)
 
     def cut_selection(self):
         """選択範囲をクリップボードにコピーしてから消去する。"""
         if not self._selection_rect:
             return
+        if self._warn_locked(self.layer_stack.active):
+            return
         self.copy_selection()
         self.delete_selection()
 
-    def paste_selection(self):
-        layer = self.layer_stack.active
-        if not layer or layer.is_group or not self._clipboard_image:
-            return
-        self._save_history()
-        # 貼り付け先がレイヤー画像の外に出る場合に切り捨てられないよう拡張する。
-        paste_rect = QRect(self._clipboard_offset,
-                           self._clipboard_image.size())
-        self._ensure_layer_bounds(layer, paste_rect)
-        img: QImage = layer.image  # type: ignore
-        ox = getattr(layer, 'offset_x', 0)
-        oy = getattr(layer, 'offset_y', 0)
-        w, h = img.width(), img.height()
-        overlay = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
-        overlay.fill(Qt.GlobalColor.transparent)
-        op = QPainter(overlay)
-        op.drawImage(self._clipboard_offset - QPoint(ox, oy), self._clipboard_image)
-        op.end()
-        p = QPainter(img)
-        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        p.drawImage(0, 0, overlay)
-        p.end()
-        self._selection_rect = None
-        self._lasso_mask = None
-        self._selection_outline_path = None
-        self.update()
+    def clipboard_payload(self) -> tuple[QImage, QPoint] | None:
+        """貼り付ける絵と、置く位置（キャンバス座標）を返す。
+
+        このアプリでコピーした絵ならコピー元と同じ位置に、ほかのアプリで
+        コピーした絵ならキャンバスの中央に置く。
+        """
+        cb = QApplication.clipboard()
+        if cb is not None and not cb.ownsClipboard():
+            img = cb.image()
+            if not img.isNull():
+                img = img.convertToFormat(QImage.Format.Format_ARGB32)
+                pos = QPoint((self.layer_stack.width - img.width()) // 2,
+                             (self.layer_stack.height - img.height()) // 2)
+                return img, pos
+        if self._clipboard_image is None:
+            return None
+        return self._clipboard_image.copy(), QPoint(self._clipboard_offset)
 
     def delete_selection(self):
         layer = self.layer_stack.active
         if not layer or layer.is_group or not self._selection_rect:
+            return
+        if self._warn_locked(layer):
+            return
+        if layer.is_vector:
+            # 絵を消しても線から描き直されて戻るので、掛かった線を消す。
+            hit = set(self._strokes_in_selection(layer.strokes))
+            keep = [s for i, s in enumerate(layer.strokes) if i not in hit]
+            if len(keep) != len(layer.strokes):
+                self._save_history()
+                layer.strokes = keep
+                layer.mark_dirty()
+            self.deselect()
             return
         self._save_history()
         ox = getattr(layer, 'offset_x', 0)
@@ -3000,9 +3345,40 @@ class Canvas(QWidget):
         self._sync_ant_timer()
         self.update()
 
+    def _strokes_in_selection(self, strokes) -> list[int]:
+        """選択範囲に実際に描かれた部分が掛かっている線の番号。
+
+        外接矩形だけで判定すると、斜めの長い線は選択の近くを通るだけで
+        丸ごと消えてしまう。線を選択範囲の大きさに描いて重なりを見る。
+        """
+        from vector import draw_strokes
+        sel = self._selection_rect
+        if sel is None or sel.isEmpty():
+            return []
+        self_mask = None
+        if self._lasso_mask is not None:
+            self_mask = _alpha_array(self._lasso_mask.copy(sel)) > 0
+        out = []
+        for i, st in enumerate(strokes):
+            if not st.points or not st.bounds().intersects(QRectF(sel)):
+                continue
+            img = QImage(sel.width(), sel.height(), QImage.Format.Format_ARGB32)
+            img.fill(Qt.GlobalColor.transparent)
+            p = QPainter(img)
+            draw_strokes(p, [st], sel.x(), sel.y())
+            p.end()
+            drawn = _alpha_array(img) > 0
+            if self_mask is not None:
+                drawn &= self_mask
+            if drawn.any():
+                out.append(i)
+        return out
+
     def deselect(self):
         if self._transform_image:
-            self.cancel_transform()
+            # CLIP STUDIO と同じく、変形中の解除は確定してから解除する。
+            # 捨てると動かした絵が黙って元に戻ってしまう。
+            self._commit_transform()
         self._selection_rect = None
         self._lasso_mask = None
         self._lasso_path_points = []
@@ -3073,8 +3449,24 @@ class Canvas(QWidget):
 
     # ── transform ────────────────────────────────────────────────────────────
 
-    def _lift_selection(self, layer: Layer):
-        """選択範囲をフローティング化する。ピクセル消去は確定時（_commit_transform）に行う。"""
+    def _warn_locked(self, layer) -> bool:
+        """ロック中なら理由を出して True を返す。"""
+        if self.is_locked(layer):
+            self.status_message.emit("このレイヤーはロックされています。レイヤーパネルの錠マークを解除してください。")
+            return True
+        return False
+
+    def _lift_selection(self, layer: Layer) -> bool:
+        """選択範囲をフローティング化する。ピクセル消去は確定時（_commit_transform）に行う。
+
+        変形の入口はすべてここを通るので、ロックの確認もここで行う。
+        持ち上げなかったときは False を返す。
+        """
+        if self._warn_locked(layer):
+            return False
+        self._transform_flip = (False, False)
+        if layer.is_vector:
+            return self._lift_vector(layer)
         if not self._selection_rect:
             self._selection_rect = QRect(0, 0, self.layer_stack.width, self.layer_stack.height)
 
@@ -3115,6 +3507,105 @@ class Canvas(QWidget):
         self._lasso_mask = None
         self._selection_outline_path = None
         self.update()
+        return True
+
+    def _lift_vector(self, layer) -> bool:
+        """ベクターレイヤーの線を持ち上げる。
+
+        選択範囲に掛かった線を丸ごと持ち上げ（選択が無ければ全部）、確定時に
+        点を動かす。線の途中で切ると別の線になってしまうので、線単位で扱う。
+        メッシュ・自由変形は点の移動で表せないので標準の変形だけにする。
+        """
+        from vector import draw_strokes
+        sel = QRectF(self._selection_rect) if self._selection_rect else None
+        chosen = [i for i, s in enumerate(layer.strokes)
+                  if s.points and (sel is None or s.bounds().intersects(sel))]
+        if not chosen:
+            self.status_message.emit("変形する線がありません。")
+            return False
+        if self._mesh_mode or self._perspective_mode:
+            self.status_message.emit(
+                "ベクターレイヤーは拡大縮小・回転だけ使えます（メッシュ・自由変形は"
+                "ラスタライズしてから）。")
+            self._mesh_mode = False
+            self._perspective_mode = False
+
+        area = QRectF()
+        for i in chosen:
+            area = area.united(layer.strokes[i].bounds())
+        rect = area.toAlignedRect()
+        img = QImage(max(1, rect.width()), max(1, rect.height()),
+                     QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        draw_strokes(p, [layer.strokes[i] for i in chosen], rect.x(), rect.y())
+        p.end()
+
+        # 持ち上げた線を除いた絵を先に作っておく（プレビューのたびに描き直さない）
+        all_strokes = layer.strokes
+        layer.strokes = [s for i, s in enumerate(all_strokes) if i not in chosen]
+        layer.mark_dirty()
+        self._transform_vector_rest = (layer.image.copy(), layer.offset_x, layer.offset_y)
+        layer.strokes = all_strokes
+        layer.mark_dirty()
+
+        self._transform_vector_idx = chosen
+        self._transform_image = img
+        self._transform_rect = QRectF(rect)
+        self._transform_orig_rect = QRectF(rect)
+        self._transform_angle = 0.0
+        self._custom_pivot = QPointF(rect.center())
+        self._perspective_corners = None
+        self._mesh_grid = None
+        self._transform_layer = layer
+        self._transform_erase_rect = None
+        self._transform_erase_mask = None
+        self._selection_rect = None
+        self._lasso_mask = None
+        self._selection_outline_path = None
+        self.update()
+        return True
+
+    def _commit_vector_transform(self, layer) -> None:
+        """持ち上げた線の点に、プレビューと同じ拡大縮小・反転・回転を掛ける。"""
+        o = self._transform_orig_rect
+        r = self._transform_rect
+        sx = r.width() / o.width() if o.width() else 1.0
+        sy = r.height() / o.height() if o.height() else 1.0
+        fx, fy = self._transform_flip
+        pv = self._pivot_point()
+        rad = math.radians(self._transform_angle)
+        c, s = math.cos(rad), math.sin(rad)
+
+        def rot(dx: float, dy: float) -> tuple[float, float]:
+            return dx * c - dy * s, dx * s + dy * c
+
+        def map_pt(x: float, y: float) -> tuple[float, float]:
+            u = (x - o.left()) / o.width() if o.width() else 0.0
+            v = (y - o.top()) / o.height() if o.height() else 0.0
+            if fx:
+                u = 1.0 - u
+            if fy:
+                v = 1.0 - v
+            dx, dy = rot(r.left() + u * r.width() - pv.x(),
+                         r.top() + v * r.height() - pv.y())
+            return pv.x() + dx, pv.y() + dy
+
+        # ハンドルは点からの相対ベクトルなので、平行移動を除いた部分だけ掛ける。
+        lx = -sx if fx else sx
+        ly = -sy if fy else sy
+
+        def map_vec(dx: float, dy: float) -> tuple[float, float]:
+            return rot(dx * lx, dy * ly)
+
+        for i in self._transform_vector_idx or []:
+            st = layer.strokes[i].copy()
+            st.points = [map_pt(x, y) for x, y in st.points]
+            st.handles = [None if h is None else (*map_vec(h[0], h[1]), *map_vec(h[2], h[3]))
+                          for h in st.handles]
+            st.width = max(0.1, st.width * (abs(sx) + abs(sy)) / 2.0)
+            layer.strokes[i] = st
+        layer.mark_dirty()
 
     def _hit_transform_handle(self, wp: QPointF) -> str | None:
         if not self._transform_rect:
@@ -3380,6 +3871,10 @@ class Canvas(QWidget):
         before_y = getattr(layer, 'offset_y', 0)
         m = max(1, int(margin))
         rect = QRect(cp.x() - m, cp.y() - m, m * 2 + 1, m * 2 + 1)
+        if self.symmetry_enabled and self.tool == Tool.PEN:
+            # 対称側の筆跡もバッファに収める
+            mx = 2 * (self.layer_stack.width // 2) - cp.x()
+            rect = rect.united(QRect(mx - m, cp.y() - m, m * 2 + 1, m * 2 + 1))
         self._ensure_layer_bounds(layer, rect)
         return QPoint(before_x - getattr(layer, 'offset_x', 0),
                       before_y - getattr(layer, 'offset_y', 0))
@@ -3398,6 +3893,11 @@ class Canvas(QWidget):
             return
 
         self._save_history()
+
+        if self._transform_vector_idx is not None and layer.is_vector:
+            self._commit_vector_transform(layer)
+            self._clear_transform_state()
+            return
 
         # 変形結果を先に確定させてから、キャンバス座標での実際の描画範囲に
         # layer.image が収まるようにする（拡大縮小・回転でキャンバス外にはみ出す
@@ -3457,6 +3957,10 @@ class Canvas(QWidget):
             painter.drawImage(r, self._transform_image)
             painter.end()
 
+        self._clear_transform_state()
+
+    def _clear_transform_state(self):
+        """変形中の状態をすべて捨てる（確定・キャンセル共通）。"""
         self._transform_image = None
         self._transform_rect = None
         self._transform_orig_rect = None
@@ -3464,6 +3968,9 @@ class Canvas(QWidget):
         self._transform_layer = None
         self._transform_erase_rect = None
         self._transform_erase_mask = None
+        self._transform_vector_idx = None
+        self._transform_vector_rest = None
+        self._transform_flip = (False, False)
         self._perspective_corners = None
         self._perspective_corners_start = None
         self._perspective_drag_idx = -1
@@ -3491,6 +3998,12 @@ class Canvas(QWidget):
 
     def set_transform_mode(self, mode: str):
         """"standard" / "perspective" / "mesh" を切り替える。"""
+        if mode != "standard" and self._transform_vector_idx is not None:
+            # ベクターの線はメッシュや自由変形の形を点で表せない。
+            self.status_message.emit(
+                "ベクターレイヤーは拡大縮小・回転だけ使えます（メッシュ・自由変形は"
+                "ラスタライズしてから）。")
+            return
         self._perspective_mode = (mode == "perspective")
         self._mesh_mode = (mode == "mesh")
         if self._transform_image and self._transform_rect:
@@ -3515,18 +4028,36 @@ class Canvas(QWidget):
         select_layer_alpha で不透明部分の外接矩形を求めてからliftする。
         レイヤーが全透明などで不透明部分が無い場合はキャンバス全体にフォールバックする。"""
         layer = self.layer_stack.active
-        if not layer or layer.is_group:
+        if not layer or layer.is_group or self._warn_locked(layer):
             return False
-        self.save_structure_history()
+        # 履歴は確定時に積む。ここで積むとキャンセルしたときに
+        # 何もしていない取り消し手順が1つ残ってしまう。
         self._selection_rect = None
         self._lasso_mask = None
         self._selection_outline_path = None
-        if not self.select_layer_alpha(layer):
-            self._selection_rect = None
-            self._lasso_mask = None
-            self._selection_outline_path = None
-        self._lift_selection(layer)  # type: ignore
-        return True
+        if not layer.is_vector:
+            # 薄いぼかしやキャンバス外にはみ出した部分も含めて丸ごと持ち上げる。
+            # 「選択範囲を作ってから」だと alpha の閾値とキャンバス枠で
+            # 切れて、元の位置に薄い残像やはみ出し部分が取り残された。
+            bbox = self._layer_content_rect(layer)
+            if bbox is not None:
+                self._selection_rect = bbox
+        return self._lift_selection(layer)  # type: ignore
+
+    @staticmethod
+    def _layer_content_rect(layer) -> QRect | None:
+        """レイヤー画像で alpha>0 の範囲（キャンバス座標）。空なら None。"""
+        img = layer.image.convertToFormat(QImage.Format.Format_ARGB32)
+        w, h = img.width(), img.height()
+        ptr = img.constBits()
+        ptr.setsize(h * w * 4)
+        alpha = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)[:, :, 3]
+        rows = np.flatnonzero(alpha.any(axis=1))
+        cols = np.flatnonzero(alpha.any(axis=0))
+        if rows.size == 0:
+            return None
+        return QRect(int(cols[0]) + layer.offset_x, int(rows[0]) + layer.offset_y,
+                     int(cols[-1] - cols[0]) + 1, int(rows[-1] - rows[0]) + 1)
 
     def apply_transform_percentage(self, scale_x_pct: float, scale_y_pct: float, angle_deg: float,
                                     offset_x: float = 0.0, offset_y: float = 0.0):
@@ -3550,6 +4081,8 @@ class Canvas(QWidget):
         if not self._transform_image:
             return
         self._transform_image = self._transform_image.mirrored(True, False)
+        fx, fy = self._transform_flip
+        self._transform_flip = (not fx, fy)
         self.update()
 
     def flip_transform_vertical(self):
@@ -3557,37 +4090,26 @@ class Canvas(QWidget):
         if not self._transform_image:
             return
         self._transform_image = self._transform_image.mirrored(False, True)
+        fx, fy = self._transform_flip
+        self._transform_flip = (fx, not fy)
         self.update()
 
     def cancel_transform(self):
         """変形をキャンセル。lift時にはピクセル消去しないので単純破棄でOK。"""
         if not self._transform_image:
             return
-        self._transform_image = None
-        self._transform_rect = None
-        self._transform_orig_rect = None
-        self._transform_angle = 0.0
-        self._transform_layer = None
-        self._transform_erase_rect = None
-        self._transform_erase_mask = None
-        self._perspective_corners = None
-        self._perspective_corners_start = None
-        self._perspective_drag_idx = -1
-        self._mesh_grid = None
-        self._mesh_grid_start = None
-        self._mesh_drag_idx = (-1, -1)
-        self._perspective_mode = False
-        self._mesh_mode = False
-        self.update()
+        self._clear_transform_state()
 
     def reset_state(self):
         """新規/開くなどでキャンバスを差し替える前に一切の作業状態を破棄する。"""
         self._end_stroke_cache()
+        self._taper_stroke = None
         self._move_base_image = None
         self._move_base_strokes = None
         self._vector_points = None
         self._vector_selected = None
         self._move_base_pos = None
+        self._move_pending_history = None
         self._move_group_bases = None
         self._transform_image = None
         self._transform_rect = None
@@ -3599,6 +4121,9 @@ class Canvas(QWidget):
         self._transform_layer = None
         self._transform_erase_rect = None
         self._transform_erase_mask = None
+        self._transform_vector_idx = None
+        self._transform_vector_rest = None
+        self._transform_flip = (False, False)
         self._perspective_corners = None
         self._perspective_corners_start = None
         self._perspective_drag_idx = -1
@@ -3629,6 +4154,28 @@ class Canvas(QWidget):
             event.accept()
         else:
             super().wheelEvent(event)
+
+    def _owns_key(self, key) -> bool:
+        """メニューのショートカットより先に、キャンバス自身が受けるべきキーか。
+
+        Delete はメニューの「消去」にも割り当てているが、線を選んでいる
+        ときやパスを打っているときはキャンバスの操作のほうが意図に近い。
+        """
+        if key == Qt.Key.Key_Escape:
+            return bool(self._path_pick_active or self._vector_selected is not None
+                        or self._transform_image or self._selection_rect)
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            return bool((self._path_pick_active and self._path_pick_points)
+                        or self._vector_selected is not None)
+        return False
+
+    def event(self, ev):
+        # メニューのショートカットは、受け取ったウィジェットが ShortcutOverride を
+        # accept しない限り keyPressEvent より先に発火してキーを奪う。
+        if ev.type() == QEvent.Type.ShortcutOverride and self._owns_key(ev.key()):
+            ev.accept()
+            return True
+        return super().event(ev)
 
     def keyPressEvent(self, event):
         # パスピックモード中のキー操作
@@ -3703,19 +4250,24 @@ class Canvas(QWidget):
             }
             if event.key() in arrow_map:
                 layer = self.layer_stack.active
-                step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+                if self._warn_locked(layer):
+                    event.accept()
+                    return
+                step =10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
                 ddx, ddy = arrow_map[event.key()]
                 if layer and layer.is_group:
-                    children = self._collect_leaf_layers(layer)
+                    # 中に個別にロックしたレイヤーがあれば、それだけは動かさない。
+                    children = [c for c in self._collect_leaf_layers(layer)
+                                if not self.is_locked(c)]
                     if children:
                         for child in children:
                             ox = getattr(child, 'offset_x', 0)
                             oy = getattr(child, 'offset_y', 0)
                             if child.is_vector:
                                 self._history.append(
-                                    ("vector", id(child), child.copy_strokes(), ox, oy))  # type: ignore
+                                    ("vector", child.uid, child.copy_strokes(), ox, oy))  # type: ignore
                             else:
-                                self._history.append(("pixel", id(child), child.image.copy(), ox, oy))  # type: ignore
+                                self._history.append(("pixel", child.uid, child.image.copy(), ox, oy))  # type: ignore
                         self._redo_stack.clear()
                         self._trim_history()
                         self.edited.emit()

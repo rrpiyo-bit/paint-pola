@@ -1,4 +1,5 @@
 from __future__ import annotations
+import itertools
 import numpy as np
 import cv2
 from PyQt6.QtGui import QImage, QPainter, QColor
@@ -22,9 +23,143 @@ BLEND_KEY_TO_MODE: dict[str, QPainter.CompositionMode | None] = {
 BLEND_KEYS: list[str] = [k for k, _, _ in BLEND_MODES]
 BLEND_LABELS: dict[str, str] = {k: label for k, label, _ in BLEND_MODES}
 
+# 履歴がレイヤーを指すための通し番号。id() はレイヤーを作り直すと
+# 変わる（構造の undo で全レイヤーが作り直される）うえ、捨てたレイヤーの
+# 番号が別のレイヤーに再利用されることもあるので使えない。
+_UIDS = itertools.count(1)
+
+
+def new_uid() -> int:
+    return next(_UIDS)
+
+
+def _premul_buffer(w: int, h: int) -> QImage:
+    img = QImage(max(1, w), max(1, h), QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    return img
+
+
+def _item_buffer(item, w: int, h: int, off_x: int, off_y: int, skip=None) -> QImage:
+    """item 1枚ぶんの絵を、target と同じ大きさ・位置合わせのバッファに描いて返す。
+
+    グループは中身だけを合成する（グループ自身の不透明度は掛けない）。
+    クリッピングのマスクと、クリッピングする側の絵の両方に使う。
+    バッファは target 全体を覆うので、item の画像の外側は透明として扱われる。
+    """
+    buf = _premul_buffer(w, h)
+    if item.is_group:
+        render_items(buf, item.children, off_x, off_y, skip)
+    else:
+        p = QPainter(buf)
+        p.drawImage(getattr(item, 'offset_x', 0) - off_x,
+                    getattr(item, 'offset_y', 0) - off_y,
+                    item.image_with_effects())
+        p.end()
+    return buf
+
+
+def _lerp_into(target: QImage, before: QImage, t: float) -> None:
+    """target = before + (target - before) * t。通過グループの不透明度用。"""
+    w, h = target.width(), target.height()
+    a = _as_premul_array(before, w, h)
+    b = _as_premul_array(target, w, h)
+    out = (a.astype(np.float32) * (1.0 - t) + b.astype(np.float32) * t)
+    out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+    img = QImage(out.tobytes(), w, h, w * 4,
+                 QImage.Format.Format_ARGB32_Premultiplied).copy()
+    p = QPainter(target)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+    p.drawImage(0, 0, img)
+    p.end()
+
+
+def _as_premul_array(img: QImage, w: int, h: int) -> np.ndarray:
+    src = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    ptr = src.constBits()
+    ptr.setsize(h * w * 4)
+    return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
+
+
+def _draw_item(target: QImage, item, off_x: int, off_y: int, skip=None) -> None:
+    """クリッピングでない item を target へ合成する。"""
+    if item.is_group:
+        if getattr(item, 'pass_through', False):
+            # 通過: 中のレイヤーの合成モードがフォルダの下にも効く（CLIP STUDIO の既定）。
+            if item.opacity >= 255:
+                render_items(target, item.children, off_x, off_y, skip)
+            else:
+                before = target.copy()
+                render_items(target, item.children, off_x, off_y, skip)
+                _lerp_into(target, before, item.opacity / 255)
+            return
+        buf = _item_buffer(item, target.width(), target.height(), off_x, off_y, skip)
+        p = QPainter(target)
+        p.setOpacity(item.opacity / 255)
+        p.drawImage(0, 0, buf)
+        p.end()
+        return
+    p = QPainter(target)
+    blend = BLEND_KEY_TO_MODE.get(getattr(item, 'blend_mode', 'normal'))
+    if blend:
+        p.setCompositionMode(blend)
+    p.setOpacity(item.opacity / 255)
+    p.drawImage(getattr(item, 'offset_x', 0) - off_x,
+                getattr(item, 'offset_y', 0) - off_y, item.image_with_effects())
+    p.end()
+
+
+def render_items(target: QImage, items, off_x: int = 0, off_y: int = 0,
+                 skip=None) -> None:
+    """レイヤー列（上が先頭）を target に合成する。合成処理の本体はここだけ。
+
+    target の (0,0) はキャンバス座標 (off_x, off_y) にあたる。画面表示・
+    グループ・統合のすべてがここを通るので、見た目と統合結果が食い違わない。
+
+    クリッピングは CLIP STUDIO と同じく「すぐ下のクリッピングでないレイヤー」
+    （下地）に対して効く。クリッピングを何枚重ねても全部が同じ下地で切り抜かれ、
+    下地を非表示にするとクリッピングしたレイヤーも消える。クリッピングした
+    レイヤーの合成モードも有効。
+
+    skip に渡したレイヤーは描かない（下地としてのマスクには使う）。
+    """
+    w, h = target.width(), target.height()
+    i = len(items) - 1
+    while i >= 0:
+        base = items[i]
+        # base の上に乗っているクリッピングレイヤーを集める（下から順）
+        j = i - 1
+        clips = []
+        while j >= 0 and items[j].clipping:
+            clips.append(items[j])
+            j -= 1
+        if base.visible:
+            if base is not skip:
+                _draw_item(target, base, off_x, off_y, skip)
+            shown = [c for c in clips if c.visible and c is not skip]
+            if shown:
+                mask = _item_buffer(base, w, h, off_x, off_y, skip)
+                for clip in shown:
+                    src = _premul_buffer(w, h)
+                    sp = QPainter(src)
+                    sp.drawImage(0, 0, _item_buffer(clip, w, h, off_x, off_y, skip))
+                    sp.setCompositionMode(
+                        QPainter.CompositionMode.CompositionMode_DestinationIn)
+                    sp.drawImage(0, 0, mask)
+                    sp.end()
+                    p = QPainter(target)
+                    blend = (None if clip.is_group else
+                             BLEND_KEY_TO_MODE.get(getattr(clip, 'blend_mode', 'normal')))
+                    if blend:
+                        p.setCompositionMode(blend)
+                    p.setOpacity(clip.opacity / 255)
+                    p.drawImage(0, 0, src)
+                    p.end()
+        i = j
+
 
 class Layer:
     def __init__(self, name: str, w: int = CANVAS_W, h: int = CANVAS_H):
+        self.uid = new_uid()
         self.name = name
         self.visible = True
         self.opacity = 255
@@ -273,7 +408,13 @@ class Layer:
 
 class GroupLayer:
     def __init__(self, name: str, w: int = CANVAS_W, h: int = CANVAS_H):
+        self.uid = new_uid()
         self.name = name
+        # 通過: 中のレイヤーの合成モードをフォルダの下にも効かせる。
+        # 既定は False（フォルダ内だけで合成）。自動生成のフォルダ（線画ずらし等）は
+        # 中だけで見た目が完結するよう作ってあるため。パネルから作るフォルダは
+        # CLIP STUDIO に合わせて True にする。
+        self.pass_through = False
         self.visible = True
         self.opacity = 255
         self.clipping = False
@@ -319,60 +460,9 @@ class GroupLayer:
         塗る対象のレイヤーがこのグループの中にあると、自分の塗った色まで
         境界になってしまうため。
         """
-        result = QImage(self._w, self._h, QImage.Format.Format_ARGB32)
-        result.fill(Qt.GlobalColor.transparent)
-        p = QPainter(result)
-        children = self.children
-        for i in range(len(children) - 1, -1, -1):
-            child = children[i]
-            if not child.visible or child is skip:
-                continue
-            clipping = child.clipping and i < len(children) - 1
-            if clipping:
-                # クリッピング元・クリップ先のどちらがグループでも動くよう、
-                # グループは composite()（キャンバスサイズ・offset 0,0）で扱う
-                # （LayerStack.composite と同じロジック）。
-                below = children[i + 1]
-                if child.is_group:
-                    src_img = child.composite(skip)
-                    ox = oy = 0
-                else:
-                    src_img = child.image_with_effects()  # type: ignore
-                    ox = getattr(child, 'offset_x', 0)
-                    oy = getattr(child, 'offset_y', 0)
-                if below.is_group:
-                    below_img = below.composite(skip)
-                    box = boy = 0
-                else:
-                    below_img = below.image_with_effects()  # type: ignore
-                    box = getattr(below, 'offset_x', 0)
-                    boy = getattr(below, 'offset_y', 0)
-                mask_img = QImage(self._w, self._h, QImage.Format.Format_ARGB32)
-                mask_img.fill(Qt.GlobalColor.transparent)
-                mp = QPainter(mask_img)
-                mp.setOpacity(child.opacity / 255)
-                mp.drawImage(ox, oy, src_img)
-                mp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-                mp.drawImage(box, boy, below_img)
-                mp.end()
-                p.setOpacity(1.0)
-                p.drawImage(0, 0, mask_img)
-            elif child.is_group:
-                p.setOpacity(child.opacity / 255)
-                p.drawImage(0, 0, child.composite(skip))
-            else:
-                ox = getattr(child, 'offset_x', 0)
-                oy = getattr(child, 'offset_y', 0)
-                blend = BLEND_KEY_TO_MODE.get(getattr(child, 'blend_mode', 'normal'))
-                if blend:
-                    p.setCompositionMode(blend)
-                else:
-                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                p.setOpacity(child.opacity / 255)
-                p.drawImage(ox, oy, child.image_with_effects())  # type: ignore
-                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        p.end()
-        return result
+        result = _premul_buffer(self._w, self._h)
+        render_items(result, self.children, 0, 0, skip)
+        return result.convertToFormat(QImage.Format.Format_ARGB32)
 
 
 class LayerStack:
@@ -527,6 +617,17 @@ class LayerStack:
         self.active_index = idx  # 挿入後に新レイヤーを選択状態にする
         return layer
 
+    def insert_above_active(self, layer) -> None:
+        """今のレイヤーと同じ階層の、すぐ上に差し込んで選択する。
+
+        フォルダの中で作業しているときにトップへ飛ばされないようにする。
+        """
+        path = list(self.active_path) or [0]
+        container, parent_path = self.parent_of(path)
+        at = min(path[-1], len(container))
+        container.insert(at, layer)
+        self.active_path = parent_path + [at]
+
     def add_group(self, name: str | None = None) -> GroupLayer:
         name = name or f"グループ {len(self.layers) + 1}"
         group = GroupLayer(name, self.width, self.height)
@@ -561,6 +662,11 @@ class LayerStack:
         lower = container[idx + 1]
         if upper.is_group or lower.is_group:
             return False
+        if lower.is_vector:
+            # ベクターのまま絵を入れると、次の描き直しで線だけに戻り
+            # 統合したラスター部分が消える。先に同じ見た目のラスターへ置き換える。
+            lower = lower.to_raster()  # type: ignore
+            container[idx + 1] = lower
 
         # 両レイヤーのオフセット+画像サイズから統合に必要な範囲を計算
         u_ox, u_oy = getattr(upper, 'offset_x', 0), getattr(upper, 'offset_y', 0)
@@ -575,9 +681,9 @@ class LayerStack:
         merged = QImage(mw, mh, QImage.Format.Format_ARGB32_Premultiplied)
         merged.fill(Qt.GlobalColor.transparent)
         p = QPainter(merged)
-        if lower.visible:
-            p.setOpacity(lower.opacity / 255)
-            p.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
+        # 下が非表示でも絵は残す。統合先の絵が黙って消えるのを防ぐ。
+        p.setOpacity(lower.opacity / 255)
+        p.drawImage(l_ox - min_x, l_oy - min_y, lower.image_with_effects())
         upper_img = upper.image_with_effects()
         u_dx, u_dy = u_ox - min_x, u_oy - min_y
         if upper.clipping:
@@ -620,11 +726,9 @@ class LayerStack:
         lower.hsl_enabled = False
 
         container.pop(idx)
-        if not container and parent_path:
-            self.active_path = parent_path
-        else:
-            new_idx = idx - 1 if idx > 0 else 0
-            self.active_path = parent_path + [new_idx]
+        # 上のレイヤーを抜いたので、統合先は idx の位置に繰り上がっている。
+        # idx - 1 にすると統合結果ではなく、その上の別レイヤーが選ばれてしまう。
+        self.active_path = parent_path + [idx]
         return True
 
     def merge_marked(self, targets: list) -> bool:
@@ -683,27 +787,45 @@ class LayerStack:
         画面外にはみ出た部分も保持する。"""
         if not self.layers:
             return False
-        hidden = [lyr for lyr in self.layers if not lyr.visible]
 
-        # 全表示レイヤーの範囲を計算
-        visible = [lyr for lyr in self.layers if lyr.visible]
-        if not visible:
+        # 実際に画面に出ているものだけを統合する。非表示の下地に乗った
+        # クリッピングは見えていないので、下地と一緒に残す。
+        shown: list = []
+        items = self.layers
+        i = len(items) - 1
+        while i >= 0:
+            base = items[i]
+            j = i - 1
+            while j >= 0 and items[j].clipping:
+                if base.visible and items[j].visible:
+                    shown.append(items[j])
+                j -= 1
+            if base.visible:
+                shown.append(base)
+            i = j
+        if not shown:
             return False
-        bounds = self._visible_bounds(visible)
-        min_x, min_y, mw, mh = bounds
+        min_x, min_y, mw, mh = self._visible_bounds(shown)
 
         merged = QImage(mw, mh, QImage.Format.Format_ARGB32_Premultiplied)
         merged.fill(Qt.GlobalColor.transparent)
-        p = QPainter(merged)
-        self._draw_layers_to(p, visible, min_x, min_y)
-        p.end()
+        render_items(merged, self.layers, min_x, min_y)
 
         new_layer = Layer("統合レイヤー", mw, mh)
         new_layer.image = merged.convertToFormat(QImage.Format.Format_ARGB32)
         new_layer.offset_x = min_x
         new_layer.offset_y = min_y
-        self.layers = [new_layer] + hidden
-        self.active_path = [0]
+        # 残すレイヤーは元の並び順のまま。統合結果は統合した中で一番下の位置に置く。
+        lowest = max(self.layers.index(l) for l in shown)
+        merged_ids = {id(l) for l in shown}
+        new_layers = []
+        for k, lyr in enumerate(self.layers):
+            if k == lowest:
+                new_layers.append(new_layer)
+            elif id(lyr) not in merged_ids:
+                new_layers.append(lyr)
+        self.layers = new_layers
+        self.active_path = [self.layers.index(new_layer)]
         return True
 
     def _visible_bounds(self, layers) -> tuple[int, int, int, int]:
@@ -766,111 +888,14 @@ class LayerStack:
                 vals[2] = max(vals[2], ox + child.image.width())
                 vals[3] = max(vals[3], oy + child.image.height())
 
-    def _draw_layers_to(self, p: QPainter, layers, off_x: int, off_y: int):
-        """統合用: 同階層のレイヤー群をクリッピング・ブレンドモードを反映して描画する
-        （composite() と同じロジックだが、キャンバス全面ではなく off_x/off_y 補正した
-        任意サイズのバッファに描く点だけが異なる）。"""
-        for i in range(len(layers) - 1, -1, -1):
-            child = layers[i]
-            if not child.visible:
-                continue
-            clipping = child.clipping and i < len(layers) - 1
-            if clipping:
-                # グループが絡むクリッピングは composite()（キャンバス座標・offset 0,0）
-                # で扱う（GroupLayer.composite / LayerStack.composite と同じロジック）。
-                below = layers[i + 1]
-                if child.is_group:
-                    src_img = child.composite()
-                    ox, oy = -off_x, -off_y
-                else:
-                    src_img = child.image_with_effects()  # type: ignore
-                    ox = getattr(child, 'offset_x', 0) - off_x
-                    oy = getattr(child, 'offset_y', 0) - off_y
-                if below.is_group:
-                    below_img = below.composite()
-                    box, boy = -off_x, -off_y
-                else:
-                    below_img = below.image_with_effects()  # type: ignore
-                    box = getattr(below, 'offset_x', 0) - off_x
-                    boy = getattr(below, 'offset_y', 0) - off_y
-                bw, bh = p.device().width(), p.device().height()
-                mask_img = QImage(bw, bh, QImage.Format.Format_ARGB32)
-                mask_img.fill(Qt.GlobalColor.transparent)
-                mp = QPainter(mask_img)
-                mp.setOpacity(child.opacity / 255)
-                mp.drawImage(ox, oy, src_img)
-                mp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-                mp.drawImage(box, boy, below_img)
-                mp.end()
-                p.setOpacity(1.0)
-                p.drawImage(0, 0, mask_img)
-            elif child.is_group:
-                p.setOpacity(child.opacity / 255)
-                self._draw_layers_to(p, child.children, off_x, off_y)
-            else:
-                ox = getattr(child, 'offset_x', 0) - off_x
-                oy = getattr(child, 'offset_y', 0) - off_y
-                blend = BLEND_KEY_TO_MODE.get(getattr(child, 'blend_mode', 'normal'))
-                if blend:
-                    p.setCompositionMode(blend)
-                else:
-                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                p.setOpacity(child.opacity / 255)
-                p.drawImage(ox, oy, child.image_with_effects())  # type: ignore
-                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
     def composite(self, skip: object = None) -> QImage:
         """全レイヤーを合成する。skip を指定すると、そのトップレベルレイヤー
         （通常レイヤーのみ・クリッピングと無関係なもの）の描画だけを省略する
         （ストローク中の背景キャッシュ用）。"""
-        result = QImage(self.width, self.height, QImage.Format.Format_ARGB32)
+        result = QImage(self.width, self.height, QImage.Format.Format_ARGB32_Premultiplied)
         result.fill(Qt.GlobalColor.transparent)
-        if not self.layers:
-            return result
-        p = QPainter(result)
-
-        for i in range(len(self.layers) - 1, -1, -1):
-            layer = self.layers[i]
-            if not layer.visible:
-                continue
-            if layer is skip:
-                continue
-
-            ox = getattr(layer, 'offset_x', 0)
-            oy = getattr(layer, 'offset_y', 0)
-
-            clipping = layer.clipping and i < len(self.layers) - 1
-            if clipping:
-                below = self.layers[i + 1]
-                box = getattr(below, 'offset_x', 0)
-                boy = getattr(below, 'offset_y', 0)
-                below_img = below.composite() if below.is_group else below.image_with_effects()  # type: ignore
-                src_img = layer.composite() if layer.is_group else layer.image_with_effects()  # type: ignore
-                mask_img = QImage(self.width, self.height, QImage.Format.Format_ARGB32_Premultiplied)
-                mask_img.fill(Qt.GlobalColor.transparent)
-                mp = QPainter(mask_img)
-                mp.setOpacity(layer.opacity / 255)
-                mp.drawImage(ox, oy, src_img)
-                mp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-                mp.drawImage(box, boy, below_img)
-                mp.end()
-                p.setOpacity(1.0)
-                p.drawImage(0, 0, mask_img)
-            elif layer.is_group:
-                p.setOpacity(layer.opacity / 255)
-                p.drawImage(0, 0, layer.composite())  # type: ignore
-            else:
-                blend = BLEND_KEY_TO_MODE.get(getattr(layer, 'blend_mode', 'normal'))
-                if blend:
-                    p.setCompositionMode(blend)
-                else:
-                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-                p.setOpacity(layer.opacity / 255)
-                p.drawImage(ox, oy, layer.image_with_effects())  # type: ignore
-                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
-        p.end()
-        return result
+        render_items(result, self.layers, 0, 0, skip)
+        return result.convertToFormat(QImage.Format.Format_ARGB32)
 
     def can_fast_preview(self, layer: object) -> bool:
         """layer が単独で（クリッピングの授受なしに）差し替え描画できるトップレベル

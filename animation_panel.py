@@ -110,6 +110,8 @@ class PlaybackPreview(QWidget):
 class AnimationPanel(QWidget):
     """アニメーションタイムラインパネル。"""
     onion_skin_changed = pyqtSignal()  # オニオンスキン状態が変わった
+    # コマの中身・並び・fps が変わった（文書の「未保存」印に使う）
+    frames_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -265,6 +267,22 @@ class AnimationPanel(QWidget):
         self._stop_play()
         self._rebuild_thumbs()
 
+    @property
+    def fps(self) -> int:
+        return self._fps_spin.value()
+
+    def set_frames(self, frames: list[QImage], fps: int | None = None) -> None:
+        """ファイルから読んだコマに置き換える（未保存扱いにはしない）。"""
+        self._stop_play()
+        self.frames = [f.copy() for f in frames]
+        self.current_frame = 0 if self.frames else -1
+        if fps is not None:
+            self._fps_spin.blockSignals(True)
+            self._fps_spin.setValue(max(1, min(60, int(fps))))
+            self._fps_spin.blockSignals(False)
+        self._rebuild_thumbs()
+        self.onion_skin_changed.emit()
+
     # ── 内部 ──
 
     def _on_add_frame(self):
@@ -279,6 +297,7 @@ class AnimationPanel(QWidget):
             self.current_frame = len(self.frames) - 1
         self._rebuild_thumbs()
         self.onion_skin_changed.emit()
+        self.frames_changed.emit()
 
     def _on_replace_frame(self):
         if self._get_composite is None or self.current_frame < 0:
@@ -286,6 +305,7 @@ class AnimationPanel(QWidget):
         self.frames[self.current_frame] = self._get_composite().copy()
         self._thumbs[self.current_frame].set_image(self.frames[self.current_frame])
         self.onion_skin_changed.emit()
+        self.frames_changed.emit()
 
     def _on_delete_frame(self):
         if self.current_frame < 0 or not self.frames:
@@ -297,6 +317,7 @@ class AnimationPanel(QWidget):
             self.current_frame = len(self.frames) - 1
         self._rebuild_thumbs()
         self.onion_skin_changed.emit()
+        self.frames_changed.emit()
 
     def _on_move_left(self):
         i = self.current_frame
@@ -305,6 +326,7 @@ class AnimationPanel(QWidget):
         self.frames[i], self.frames[i - 1] = self.frames[i - 1], self.frames[i]
         self.current_frame = i - 1
         self._rebuild_thumbs()
+        self.frames_changed.emit()
 
     def _on_move_right(self):
         i = self.current_frame
@@ -313,6 +335,7 @@ class AnimationPanel(QWidget):
         self.frames[i], self.frames[i + 1] = self.frames[i + 1], self.frames[i]
         self.current_frame = i + 1
         self._rebuild_thumbs()
+        self.frames_changed.emit()
 
     def _on_frame_clicked(self, index: int):
         self.current_frame = index
@@ -356,6 +379,8 @@ class AnimationPanel(QWidget):
     def _on_fps_changed(self, val: int):
         if self._playing and val > 0:
             self._play_timer.start(1000 // val)
+        if self.frames:
+            self.frames_changed.emit()
 
     def _on_preview_toggle(self, val: bool):
         if val:
@@ -421,14 +446,18 @@ class AnimationPanel(QWidget):
         fps = self._fps_spin.value()
         duration = 1000 // fps
 
-        pil_frames[0].save(
-            path,
-            save_all=True,
-            append_images=pil_frames[1:],
-            duration=duration,
-            loop=0,
-            disposal=2,
-        )
+        try:
+            pil_frames[0].save(
+                path,
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=duration,
+                loop=0,
+                disposal=2,
+            )
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "エラー", f"GIFの書き出しに失敗しました:\n{e}")
+            return
         QMessageBox.information(self, "GIF書き出し",
                                 f"保存しました: {path}\n"
                                 f"{len(self.frames)} フレーム / {fps} fps")

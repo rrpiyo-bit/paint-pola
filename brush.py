@@ -238,6 +238,17 @@ class StabilizedBrush(BrushBase):
         sy = sum(p.y() for p in self._buf) / len(self._buf)
         return QPointF(sx, sy)
 
+    def drain(self) -> list[QPointF]:
+        """離したときに呼ぶ。平均の遅れで線が手前で止まらないよう、
+        最後の生の座標まで追いつく途中の点を返す。"""
+        if not self._buf:
+            return []
+        last = self._buf[-1]
+        out = []
+        while any(p != last for p in self._buf):
+            out.append(self.push(last))
+        return out
+
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
                   color: QColor, size: int) -> None:
         self.inner.stroke_to(img, a, b, color, size)
