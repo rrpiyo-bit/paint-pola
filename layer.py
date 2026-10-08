@@ -167,6 +167,9 @@ class Layer:
         self.reference = False
         # ロック。つけると描画・消しゴム・塗りつぶし・移動・変形から守られる。
         self.locked = False
+        # 透明ピクセルをロック。つけると、すでに絵がある所にしか描けない
+        # （はみ出さずに塗り・影を入れられる）。
+        self.alpha_locked = False
         # レイヤーパネルの「統合対象」チェック。ファイルには保存しない一時的な印。
         self.merge_marked = False
         self.offset_x: int = 0

@@ -54,6 +54,7 @@ class LayerRow(QWidget):
     reference_changed  = pyqtSignal(object, bool)
     marked_changed     = pyqtSignal(object, bool)        # (layer,) 統合対象チェック
     locked_changed     = pyqtSignal(object, bool)        # (layer,) ロック
+    alpha_locked_changed = pyqtSignal(object, bool)      # (layer,) 透明ピクセルをロック
     rename_requested   = pyqtSignal(object)              # (layer,)
     select_requested   = pyqtSignal(object)              # (layer,)
     select_alpha_requested = pyqtSignal(object)           # (layer,) サムネイルCtrlクリック
@@ -159,6 +160,18 @@ class LayerRow(QWidget):
         self._lock.toggled.connect(
             lambda s: self.locked_changed.emit(self._layer, s))
         icon_row.addWidget(self._lock)
+
+        # 透明ピクセルをロック。絵の上だけに描けるのはピクセルを持つ
+        # ラスターレイヤーだけなので、グループ・ベクターには出さない。
+        if not self._layer.is_group and not getattr(self._layer, "is_vector", False):
+            self._alpha_lock = QPushButton("▦")
+            self._alpha_lock.setCheckable(True)
+            self._alpha_lock.setChecked(getattr(self._layer, 'alpha_locked', False))
+            self._alpha_lock.setToolTip("透明ピクセルをロック（絵がある所にだけ描ける）")
+            self._alpha_lock.setStyleSheet(_ICON_BTN_CSS)
+            self._alpha_lock.toggled.connect(
+                lambda s: self.alpha_locked_changed.emit(self._layer, s))
+            icon_row.addWidget(self._alpha_lock)
 
         # 統合対象マーク（複数選んで「選択レイヤーを統合」で使う）。
         # グループは統合対象外なので出さない。
@@ -590,6 +603,7 @@ class LayerPanel(QWidget):
         row.reference_changed.connect(self._on_reference)
         row.marked_changed.connect(self._on_marked)
         row.locked_changed.connect(self._on_locked)
+        row.alpha_locked_changed.connect(self._on_alpha_locked)
         row.rename_requested.connect(self._on_rename)
         row.select_requested.connect(self._on_select)
         row.select_alpha_requested.connect(self.select_alpha_requested)
@@ -911,6 +925,10 @@ class LayerPanel(QWidget):
         self._before_prop(layer, "locked")
         layer.locked = locked
 
+    def _on_alpha_locked(self, layer: Layer, locked: bool):
+        self._before_prop(layer, "alpha_locked")
+        layer.alpha_locked = locked
+
     def _collect_marked(self) -> list:
         """統合対象マークが付いた通常レイヤーを、表示順に集める。"""
         found = []
@@ -1021,6 +1039,7 @@ class LayerPanel(QWidget):
         dst.clipping = src.clipping
         dst.reference = src.reference
         dst.locked = src.locked
+        dst.alpha_locked = getattr(src, "alpha_locked", False)
         dst.blend_mode = src.blend_mode
         dst.offset_x = src.offset_x
         dst.offset_y = src.offset_y

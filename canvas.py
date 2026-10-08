@@ -6,7 +6,8 @@ import cv2
 
 from PyQt6.QtWidgets import QWidget, QApplication, QInputDialog, QFontDialog, QColorDialog
 from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QFont, QPixmap,
-                          QTransform, QBrush, QPainterPath, QFontMetrics)
+                          QTransform, QBrush, QPainterPath, QFontMetrics,
+                          QRadialGradient)
 from PyQt6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal, QTimer,
                           QEvent)
 
@@ -245,10 +246,22 @@ def _alpha_array(img: QImage) -> np.ndarray:
     return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)[:, :, 3].copy()
 
 
+def _shifted_image(img: QImage, size, shift) -> QImage:
+    """img を shift だけずらして、size の透明な画像に置いたものを返す。"""
+    out = QImage(size, QImage.Format.Format_ARGB32)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+    p.drawImage(shift.x(), shift.y(), img)
+    p.end()
+    return out
+
+
 def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
                 ref_image: QImage | None = None,
                 close_gap: int = 0, line_threshold: int = LINE_ALPHA_THRESHOLD,
-                include_self: bool = False):
+                include_self: bool = False, tolerance: int = 0,
+                color_judge: QImage | None = None):
     """連結領域を numpy/cv2 のラベリングで検出し、一括書き込みする塗りつぶし。
     QImage.pixel()/setPixel() を1ピクセルずつ呼ぶ旧scanline実装は、大キャンバスで
     UIスレッドが長時間ブロックされフリーズ/クラッシュする原因になっていたため廃止。
@@ -263,12 +276,21 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
         ピクセルも境界として扱う（クリスタの「複数参照: 参照レイヤー＋編集レイヤー」
         に相当）。off だと、塗る側に描いた囲み線を素通りして外まで漏れる。
         アニメ塗りのように「線画だけを境界にして下のレイヤーで色を塗り分ける」
-        使い方では off が正しいので、既定は off のまま切り替え式にしてある。"""
+        使い方では off が正しいので、既定は off のまま切り替え式にしてある。
+    tolerance: 色で判定するとき（参照なし・すべてのレイヤー）、クリックした所と
+        各チャンネルの差がこの % 以内なら同じ色とみなす。0 で完全一致。
+    color_judge: 色の判定に使う画像（「すべてのレイヤー」の合成）。None なら
+        塗るレイヤー自身で判定する。image と同じ大きさ・座標であること。"""
     w, h = image.width(), image.height()
     if not (0 <= x < w and 0 <= y < h):
         return
 
-    judge = ref_image if ref_image is not None else image
+    if ref_image is not None:
+        judge = ref_image
+    elif color_judge is not None:
+        judge = color_judge
+    else:
+        judge = image
     fill = fill_color.rgba()
 
     nbytes = h * w * 4
@@ -286,31 +308,32 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
             self_ptr = image.bits(); self_ptr.setsize(nbytes)
             self_arr = np.frombuffer(self_ptr, dtype=np.uint8).reshape(h, w, 4)
             candidate = candidate & (self_arr[:, :, 3] <= line_threshold)
-        if not candidate[y, x]:
-            return
-        candidate = candidate.astype(np.uint8)
-        if close_gap > 0:
-            # 線を太らせる = 候補領域を削る。これで数px の途切れが塞がり、
-            # 隣の領域へ塗りが漏れ出さなくなる。
-            ksize = close_gap * 2 + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-            closed = cv2.erode(candidate, kernel)
-            # 削った結果シード自体が候補から外れると何も塗れなくなるので、
-            # その場合は隙間閉じを諦めて元の候補で処理する。
-            if closed[y, x]:
-                candidate = closed
-            else:
-                close_gap = 0
     else:
-        target = judge.pixel(x, y)
-        if target == fill:
+        if color_judge is None and tolerance <= 0 and judge.pixel(x, y) == fill:
             return
-        img_ptr = image.bits(); img_ptr.setsize(nbytes)
-        img_arr_ro = np.frombuffer(img_ptr, dtype=np.uint8).reshape(h, w, 4)
-        target_color = QColor.fromRgba(target)
-        target_bgra = np.array([target_color.blue(), target_color.green(),
-                                 target_color.red(), target_color.alpha()], dtype=np.uint8)
-        candidate = np.all(img_arr_ro == target_bgra, axis=2).astype(np.uint8)
+        seed = judge_arr[y, x].copy()
+        tol = int(round(max(0, min(100, tolerance)) * 255 / 100))
+        if tol <= 0:
+            candidate = np.all(judge_arr == seed, axis=2)
+        else:
+            diff = np.abs(judge_arr.astype(np.int16) - seed.astype(np.int16))
+            candidate = diff.max(axis=2) <= tol
+    if not candidate[y, x]:
+        return
+    original_candidate = candidate
+    candidate = candidate.astype(np.uint8)
+    if close_gap > 0:
+        # 線を太らせる = 候補領域を削る。これで数px の途切れが塞がり、
+        # 隣の領域へ塗りが漏れ出さなくなる。
+        ksize = close_gap * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        closed = cv2.erode(candidate, kernel)
+        # 削った結果シード自体が候補から外れると何も塗れなくなるので、
+        # その場合は隙間閉じを諦めて元の候補で処理する。
+        if closed[y, x]:
+            candidate = closed
+        else:
+            close_gap = 0
 
     num, labels = cv2.connectedComponents(candidate, connectivity=4)
     seed_label = labels[y, x]
@@ -318,30 +341,23 @@ def _flood_fill(image: QImage, x: int, y: int, fill_color: QColor,
         return
     fill_mask = labels == seed_label
 
-    if ref_image is not None and close_gap > 0:
+    if close_gap > 0:
         # 隙間閉じで削った分だけ塗りを太らせ直し、元の線の手前まで塗る。
-        # 太らせ過ぎて線を越えないよう、本来の候補領域でクリップする。
+        # 太らせ過ぎて線を越えないよう、本来の候補領域でクリップする
+        # （自分のレイヤーの線も境界にしているときは、それも含めた候補）。
         ksize = close_gap * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
         grown = cv2.dilate(fill_mask.astype(np.uint8), kernel)
-        original_candidate = _line_free_mask(judge_arr, line_threshold)
-        if include_self:
-            # 膨張し直すときも同じ境界でクリップしないと、自分の線を越えて戻る。
-            self_ptr2 = image.bits(); self_ptr2.setsize(nbytes)
-            self_arr2 = np.frombuffer(self_ptr2, dtype=np.uint8).reshape(h, w, 4)
-            original_candidate = original_candidate & (self_arr2[:, :, 3] <= line_threshold)
         fill_mask = (grown > 0) & original_candidate
 
+    img_ptr = image.bits(); img_ptr.setsize(nbytes)
+    img_arr = np.frombuffer(img_ptr, dtype=np.uint8).reshape(h, w, 4)
     if ref_image is not None:
-        img_ptr = image.bits(); img_ptr.setsize(nbytes)
-        img_arr = np.frombuffer(img_ptr, dtype=np.uint8).reshape(h, w, 4)
         # 参照モードでは「未塗り(候補)」かつ「既に fill 色ではない」ピクセルのみ書き換える
         fill_color_bgra = np.array([fill_color.blue(), fill_color.green(),
                                      fill_color.red(), fill_color.alpha()], dtype=np.uint8)
         already_filled = np.all(img_arr == fill_color_bgra, axis=2)
         fill_mask = fill_mask & ~already_filled
-    else:
-        img_arr = img_arr_ro
 
     img_arr[fill_mask] = (fill_color.blue(), fill_color.green(),
                            fill_color.red(), fill_color.alpha())
@@ -351,17 +367,18 @@ def _flood_fill_expanded(image: QImage, x: int, y: int,
                           fill_color: QColor, ref_image: QImage | None,
                           expand: int, close_gap: int = 0,
                           line_threshold: int = LINE_ALPHA_THRESHOLD,
-                          include_self: bool = False):
+                          include_self: bool = False, tolerance: int = 0,
+                          color_judge: QImage | None = None):
     """flood fill 後に expand px だけ塗り範囲を膨張(正)/収縮(負)させる。"""
     if expand == 0:
         _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold,
-                    include_self)
+                    include_self, tolerance, color_judge)
         return
 
     # fill 前のスナップショット
     before = image.copy()
     _flood_fill(image, x, y, fill_color, ref_image, close_gap, line_threshold,
-                include_self)
+                include_self, tolerance, color_judge)
 
     # 「新たに塗られたピクセル」のマスクを numpy で取り出す
     w, h = image.width(), image.height()
@@ -547,6 +564,7 @@ class Canvas(QWidget):
     status_message = pyqtSignal(str)
     repainted = pyqtSignal()
     brush_size_changed = pyqtSignal(int)   # [ / ] キーでブラシサイズが変わったとき
+    eraser_size_changed = pyqtSignal(int)  # Ctrl+ドラッグで消しゴムサイズが変わったとき
     zoom_changed = pyqtSignal(float)
     layer_opacity_changed = pyqtSignal(int)  # 数字キーで不透明度が変わったとき
     tool_shortcut_pressed = pyqtSignal(object)  # Tool — キーボードショートカットでツール切替
@@ -580,6 +598,14 @@ class Canvas(QWidget):
             "eraser": {"in": 0, "out": 0, "tip": 0},
         }
         self._taper_stroke: dict | None = None
+        # ペンの不透明度(%)。1本の線の中で重なっても濃くならないよう、
+        # 線はいったん別の画像に描き、この濃さでレイヤーに重ねる。
+        self.pen_opacity: int = 100
+        # 透明色で描く（ペンで描いた所が消える。ブラシの形のまま消せる）
+        self.pen_transparent: bool = False
+        self._pen_buf: dict | None = None
+        # Shift+クリックで直線を引くための、前の線の終わり (レイヤーuid, キャンバス座標)
+        self._last_stroke_end: tuple[int, QPoint] | None = None
 
         # 対称定規
         self.symmetry_enabled: bool = False
@@ -596,6 +622,15 @@ class Canvas(QWidget):
         # "ref_self"=参照レイヤー＋編集中レイヤー。編集中レイヤーに描いた
         # 囲み線で止めたいときは後者。
         self.fill_reference_mode: str = "ref_self"
+        # バケツ塗りの色の誤差(%)。色で判定するとき、これだけ違う色まで同じとみなす。
+        self.fill_tolerance: int = 0
+        # テキストツールのフォントと文字サイズ(px)。色はペンの色を使う。
+        self.text_font_family: str = "Arial"
+        self.text_size: int = 40
+        # 消しゴムのふちをぼかす
+        self.eraser_soft: bool = False
+        # Ctrl+ドラッグでブラシサイズを変えている途中の状態
+        self._size_drag: dict | None = None
         self.select_mode: str = "select"  # "select" | "transform"
 
         # ぼかしツール
@@ -780,7 +815,7 @@ class Canvas(QWidget):
                 continue
             self._stroke_segment(layer, self._last_pos, pt)
             self._last_pos = pt
-        self._apply_clip_to_selection()
+        self._after_stroke_draw(layer, None)
         self.update()
 
     def set_stabilization(self, value: int):
@@ -970,17 +1005,78 @@ class Canvas(QWidget):
         """
         self._clip_base_image = None
         self._clip_layer = None
-        if not self._selection_rect or layer is None or layer.is_group:
+        if layer is None or layer.is_group:
+            return
+        # 透明ピクセルのロックも「描く前の透明度に戻す」ので同じ控えを使う。
+        if not self._selection_rect and not self._is_alpha_locked(layer):
             return
         self._clip_layer = layer
         self._clip_base_image = layer.image.copy()
 
-    def _apply_clip_to_selection(self) -> None:
-        """選択範囲の外を、描画前の状態に戻す。"""
+    @staticmethod
+    def _is_alpha_locked(layer) -> bool:
+        return (layer is not None and not layer.is_group
+                and not getattr(layer, "is_vector", False)
+                and bool(getattr(layer, "alpha_locked", False)))
+
+    def _apply_clip_to_selection(self, dirty: QRect | None = None) -> None:
+        """選択範囲の外を、描画前の状態に戻す。
+
+        透明ピクセルがロックされたレイヤーでは、続けて透明度も描く前に戻す。
+        dirty は今回描き変えた範囲（レイヤーのローカル座標）。分かっていれば
+        透明度の戻しをその範囲だけで行い、大きなレイヤーでも軽くする。
+        """
         layer = self._clip_layer
         base = self._clip_base_image
         if layer is None or base is None:
             return
+        self._clip_to_selection_area(layer, base)
+        if self._is_alpha_locked(layer):
+            self._restore_alpha(layer, base, dirty)
+
+    @staticmethod
+    def _restore_alpha(layer, base: QImage, dirty: QRect | None = None) -> None:
+        """描いた後の色を残しつつ、透明度だけを描く前のものに戻す。
+
+        絵がなかった所（透明）は透明のまま、絵があった所は新しい色で塗られる。
+        消しゴムで薄くなった所は元に戻す（ロック中は透明にできない）。
+        """
+        img = layer.image
+        if base.size() != img.size():
+            return
+        if img.format() != QImage.Format.Format_ARGB32:
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
+            layer.image = img
+        if base.format() != QImage.Format.Format_ARGB32:
+            base = base.convertToFormat(QImage.Format.Format_ARGB32)
+        w, h = img.width(), img.height()
+        r = QRect(0, 0, w, h)
+        if dirty is not None:
+            r = dirty.intersected(r)
+            if r.isEmpty():
+                return
+        ptr = img.bits(); ptr.setsize(h * w * 4)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+        bptr = base.constBits(); bptr.setsize(h * w * 4)
+        barr = np.frombuffer(bptr, dtype=np.uint8).reshape(h, w, 4)
+        ys = slice(r.top(), r.bottom() + 1)
+        xs = slice(r.left(), r.right() + 1)
+        a = arr[ys, xs]
+        b = barr[ys, xs]
+        # 新しい絵が描かれなかった（消された）所は元の色を使う
+        lost = (a[:, :, 3] < b[:, :, 3])
+        a[lost] = b[lost]
+        a[:, :, 3] = b[:, :, 3]
+        a[b[:, :, 3] == 0] = 0
+
+    def _segment_dirty(self, a: QPoint, b: QPoint) -> QRect | None:
+        """a→b を描いたときに変わりうる範囲。左右対称のときは全体（None）。"""
+        if self.symmetry_enabled:
+            return None
+        m = int(self._tool_size()) + 4
+        return QRect(a, b).normalized().adjusted(-m, -m, m, m)
+
+    def _clip_to_selection_area(self, layer, base: QImage) -> None:
         sel = self._clip_sel_rect_local(layer)
         if sel is None:
             return
@@ -1027,12 +1123,8 @@ class Canvas(QWidget):
         """
         if self._clip_base_image is None:
             return
-        grown = QImage(layer.image.size(), QImage.Format.Format_ARGB32)
-        grown.fill(Qt.GlobalColor.transparent)
-        p = QPainter(grown)
-        p.drawImage(shift.x(), shift.y(), self._clip_base_image)
-        p.end()
-        self._clip_base_image = grown
+        self._clip_base_image = _shifted_image(self._clip_base_image,
+                                               layer.image.size(), shift)
 
     @staticmethod
     def _entry_bytes(entry) -> int:
@@ -1101,6 +1193,7 @@ class Canvas(QWidget):
             "uid": lyr.uid, "name": lyr.name, "visible": lyr.visible,
             "opacity": lyr.opacity, "clipping": lyr.clipping,
             "reference": lyr.reference, "locked": lyr.locked,
+            "alpha_locked": getattr(lyr, "alpha_locked", False),
             "image": lyr.image.copy(),
             "blend_mode": lyr.blend_mode,
             "offset_x": lyr.offset_x, "offset_y": lyr.offset_y,
@@ -1148,6 +1241,7 @@ class Canvas(QWidget):
                   "glow_size", "glow_strength", "blur_enabled", "blur_radius",
                   "blur_strength", "hsl_enabled", "hsl_hue", "hsl_saturation", "hsl_lightness"):
             setattr(lyr, k, snap[k])
+        lyr.alpha_locked = snap.get("alpha_locked", False)
         # 作り直しても同じ番号にしておけば、構造の undo/redo をまたいでも
         # 描画の履歴がそのレイヤーを指し続ける。
         if "uid" in snap:
@@ -2325,6 +2419,15 @@ class Canvas(QWidget):
 
         layer = self.layer_stack.active
 
+        # Ctrl+左右ドラッグ → ブラシ/消しゴムの太さを変える（描かない）
+        if (self.tool in (Tool.PEN, Tool.ERASER) and not self._panning
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            attr = "pen_size" if self.tool == Tool.PEN else "eraser_size"
+            self._size_drag = {"attr": attr, "x": wp.x(),
+                               "size": getattr(self, attr)}
+            event.accept()
+            return
+
         # Space+ドラッグ パンニング
         if self._panning:
             self._pan_start_widget = wp.toPoint()
@@ -2429,8 +2532,12 @@ class Canvas(QWidget):
         # 描く前にレイヤー画像を必要なだけ広げる（移動後などで筆跡が
         # バッファ外になり消えるのを防ぐ）。塗りつぶしは既存ピクセルの
         # 連結領域しか塗らないので拡張しない。
+        line_from = self._shift_line_start(event, layer)
         if self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
             self._grow_for_draw(layer, cp, self._draw_margin())
+            if line_from is not None:
+                # 直線の始点もはみ出さないよう広げておく
+                self._grow_for_draw(layer, line_from, self._draw_margin())
 
         # 選択範囲があるときは、描いた後で範囲外を元に戻せるよう控えておく。
         # ここは描画系ツールすべてが通るので、1か所で漏れなくクリップできる。
@@ -2450,25 +2557,42 @@ class Canvas(QWidget):
             self._stabilizer.reset()
             self._stabilizer.push(cp)
             self._vector_points = [(float(cp.x()), float(cp.y()))]
+            if line_from is not None:
+                self._vector_points.insert(0, (float(line_from.x()), float(line_from.y())))
             self.update()
 
         elif self.tool == Tool.PEN:
             self._save_history()
             self._begin_stroke_cache(layer)
+            self._begin_pen_buffer(layer)
             self._stabilizer.reset()
-            smooth_pt = self._stabilizer.push(lp).toPoint()
-            self._last_pos = smooth_pt
-            self._brush_stamp(layer.image, smooth_pt, self._taper_start_size(layer, smooth_pt))  # type: ignore
-            self._apply_clip_to_selection()
+            if line_from is not None:
+                dirty = self._press_line(layer, line_from, lp)
+            else:
+                smooth_pt = self._stabilizer.push(lp).toPoint()
+                self._last_pos = smooth_pt
+                self._brush_stamp(self._stroke_target(layer), smooth_pt,
+                                  self._taper_start_size(layer, smooth_pt))
+                dirty = self._segment_dirty(smooth_pt, smooth_pt)
+            self._after_stroke_draw(layer, dirty)
             self.update()
+
+        elif self.tool == Tool.ERASER and self._is_alpha_locked(layer):
+            # 透明ピクセルのロック中は透明にできないので、消しゴムは効かない。
+            self._drawing = False
+            self.status_message.emit(
+                "透明ピクセルがロックされているため消せません。レイヤーパネルの ▦ を解除してください。")
 
         elif self.tool == Tool.ERASER:
             self._save_history()
             self._begin_stroke_cache(layer)
             self._stabilizer.reset()
-            self._stabilizer.push(lp)
-            self._last_pos = lp
-            self._erase_point(layer.image, lp, self._taper_start_size(layer, lp))  # type: ignore
+            if line_from is not None:
+                self._press_line(layer, line_from, lp)
+            else:
+                self._stabilizer.push(lp)
+                self._last_pos = lp
+                self._erase_point(layer.image, lp, self._taper_start_size(layer, lp))  # type: ignore
             self._apply_clip_to_selection()
             self.update()
 
@@ -2479,14 +2603,20 @@ class Canvas(QWidget):
             # クリックが何も塗らないので、先にキャンバス全体を覆わせる。
             self._ensure_layer_bounds(
                 layer, QRect(0, 0, self.layer_stack.width, self.layer_stack.height))
+            self._begin_clip_to_selection(layer)
             lp = QPoint(cp.x() - layer.offset_x, cp.y() - layer.offset_y)  # type: ignore
             # 参照画像は _build_fill_reference が対象レイヤーの座標系に
             # 合わせて返す（offset のずれもここで吸収される）。
-            ref_img = self._build_fill_reference(layer)
             thr = _sensitivity_to_threshold(self.fill_line_sensitivity)
+            if self.fill_reference_mode == "all":
+                # 見えている絵全体の色で境界を決める
+                ref_img, color_judge = None, self._build_all_layers_image(layer)
+            else:
+                ref_img, color_judge = self._build_fill_reference(layer), None
             _flood_fill_expanded(layer.image, lp.x(), lp.y(), self.pen_color, ref_img,  # type: ignore
                                  self.fill_expand, self.fill_close_gap, thr,
-                                 self.fill_reference_mode == "ref_self")
+                                 self.fill_reference_mode == "ref_self",
+                                 self.fill_tolerance, color_judge)
             self._apply_clip_to_selection()
             self.update()
 
@@ -2659,6 +2789,11 @@ class Canvas(QWidget):
             event.accept()
             return
 
+        if self._size_drag is not None:
+            self._update_size_drag(wp.x())
+            event.accept()
+            return
+
         if self.tool in (Tool.PEN, Tool.ERASER):
             self._cursor_widget_pos = wp
             self.update()
@@ -2731,23 +2866,18 @@ class Canvas(QWidget):
                     self._last_pos = self._last_pos + shift
                 self._stabilizer.translate(shift)
                 self._shift_clip_base(layer, shift)
+                self._shift_pen_buffer(layer, shift)
 
         lox = getattr(layer, 'offset_x', 0)
         loy = getattr(layer, 'offset_y', 0)
         lp = QPoint(cp.x() - lox, cp.y() - loy)
 
-        if self.tool == Tool.PEN and self._last_pos is not None:
+        if self.tool in (Tool.PEN, Tool.ERASER) and self._last_pos is not None:
             smooth_pt = self._stabilizer.push(lp).toPoint()
+            dirty = self._segment_dirty(self._last_pos, smooth_pt)
             self._stroke_segment(layer, self._last_pos, smooth_pt)
             self._last_pos = smooth_pt
-            self._apply_clip_to_selection()
-            self.update()
-
-        elif self.tool == Tool.ERASER and self._last_pos is not None:
-            smooth_pt = self._stabilizer.push(lp).toPoint()
-            self._stroke_segment(layer, self._last_pos, smooth_pt)
-            self._last_pos = smooth_pt
-            self._apply_clip_to_selection()
+            self._after_stroke_draw(layer, dirty)
             self.update()
 
         elif self.tool == Tool.BLUR and self._last_pos is not None:
@@ -2770,10 +2900,16 @@ class Canvas(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        if self._size_drag is not None:
+            self._size_drag = None
+            event.accept()
+            return
         if self._drawing and not self._panning:
             self._finish_stabilized_stroke()
             self._taper_finish()
+            self._remember_stroke_end()
         self._taper_stroke = None
+        self._pen_buf = None
         self._end_stroke_cache()
         if self._panning:
             self._pan_start_widget = None
@@ -2833,6 +2969,8 @@ class Canvas(QWidget):
                 shape_rect = QRect(self._preview_start, cp).normalized()
                 shape_rect = shape_rect.adjusted(-pad, -pad, pad, pad)
                 self._ensure_layer_bounds(layer, shape_rect)
+                # 広げた後の画像で控え直す（大きさが変わると範囲外・透明度を戻せない）
+                self._begin_clip_to_selection(layer)
                 lox = getattr(layer, 'offset_x', 0)
                 loy = getattr(layer, 'offset_y', 0)
                 sa = QPoint(self._preview_start.x() - lox, self._preview_start.y() - loy)
@@ -2919,8 +3057,16 @@ class Canvas(QWidget):
             rp.setOpacity(r.opacity / 255)
             rp.drawImage(getattr(r, 'offset_x', 0), getattr(r, 'offset_y', 0), r.image)
         rp.end()
-        ref_img = ref_img.convertToFormat(QImage.Format.Format_ARGB32)
+        return self._to_layer_local(ref_img.convertToFormat(QImage.Format.Format_ARGB32),
+                                    layer)
 
+    def _build_all_layers_image(self, layer) -> QImage:
+        """「すべてのレイヤー」で塗るときの判定画像（見えている絵の合成）。"""
+        return self._to_layer_local(self.layer_stack.composite(), layer)
+
+    def _to_layer_local(self, ref_img: QImage, layer) -> QImage:
+        """キャンバス座標の画像を、対象レイヤーのローカル座標・大きさに置き直す。"""
+        w, h = self.layer_stack.width, self.layer_stack.height
         # 対象レイヤーのローカル座標系に合わせる。
         # QImage.copy() は範囲外を透明で埋めるので、レイヤーが移動や貼り付けで
         # ずれている（offset がマイナス、またはキャンバス幅を超える）場合、
@@ -2959,14 +3105,23 @@ class Canvas(QWidget):
             return
 
         self._save_history()
+        # 透明ピクセルのロックを効かせるため、塗る前の画像を控える
+        # （投げなわ自体が範囲なので、選択範囲のクリップはここでは関係しない）。
+        self._clip_mask = None
+        self._begin_clip_to_selection(layer)
         # 参照画像は _build_fill_reference が対象レイヤーの座標系・サイズに
         # 合わせて返すので、ここでの切り出しは不要。
-        ref_img = self._build_fill_reference(layer)
+        if self.fill_reference_mode == "all":
+            # 見えている絵全体を線画とみなす（自分のレイヤーも合成に入っている）
+            ref_img = self._build_all_layers_image(layer)
+        else:
+            ref_img = self._build_fill_reference(layer)
         filled = _fill_closed_regions_in_area(
             layer.image, area_mask, self.pen_color, ref_img,  # type: ignore
             self.fill_expand, self.fill_close_gap,
             _sensitivity_to_threshold(self.fill_line_sensitivity),
             self.fill_reference_mode == "ref_self")
+        self._apply_clip_to_selection()
         if filled == 0 and self._history and self._history[-1][0] == "pixel":
             # 何も塗られなかった場合は空の undo エントリを積まない
             self._history.pop()
@@ -3009,6 +3164,9 @@ class Canvas(QWidget):
                             self.pen_color, size)
 
     def _erase_point(self, img: QImage, p: QPoint, size: float | None = None):
+        if self.eraser_soft:
+            self._soft_erase(img, p, p, size)
+            return
         painter = QPainter(img)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
         painter.setPen(QPen(Qt.GlobalColor.transparent,
@@ -3018,6 +3176,9 @@ class Canvas(QWidget):
         painter.end()
 
     def _erase_line(self, img: QImage, a: QPoint, b: QPoint, size: float | None = None):
+        if self.eraser_soft:
+            self._soft_erase(img, a, b, size)
+            return
         painter = QPainter(img)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
         painter.setPen(QPen(Qt.GlobalColor.transparent,
@@ -3025,6 +3186,46 @@ class Canvas(QWidget):
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                             Qt.PenJoinStyle.RoundJoin))
         painter.drawLine(a, b)
+        painter.end()
+
+    def _update_size_drag(self, widget_x: float) -> None:
+        """Ctrl+ドラッグ中: 右へ動かすほど太く、左へ動かすほど細くする。"""
+        d = self._size_drag
+        hi = 200 if d["attr"] == "pen_size" else 300
+        # 画面上の移動量そのままにすると、拡大中は変化が鈍くなりすぎないよう
+        # ズームで割ってキャンバスの px 単位にそろえる（円カーソルの縁が指に付いてくる）
+        delta = (widget_x - d["x"]) / max(self.zoom, 0.01)
+        size = max(1, min(hi, int(round(d["size"] + delta))))
+        if size == getattr(self, d["attr"]):
+            return
+        setattr(self, d["attr"], size)
+        if d["attr"] == "pen_size":
+            self.brush_size_changed.emit(size)
+        else:
+            self.eraser_size_changed.emit(size)
+        self.status_message.emit(f"サイズ: {size}")
+        self.update()
+
+    def _soft_erase(self, img: QImage, a: QPoint, b: QPoint, size: float | None = None):
+        """中心ほど強く、ふちほど弱く消す（ソフトブラシの逆）。"""
+        size = self.eraser_size if size is None else size
+        r = max(0.5, size / 2.0)
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        dist = (dx * dx + dy * dy) ** 0.5
+        step = max(1.0, size * 0.15)
+        n = max(1, int(dist / step) + 1)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i in range(n):
+            t = i / (n - 1) if n > 1 else 0.0
+            pt = QPointF(a.x() + dx * t, a.y() + dy * t)
+            grad = QRadialGradient(pt, r)
+            grad.setColorAt(0.0, QColor(0, 0, 0, 90))
+            grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+            painter.setBrush(QBrush(grad))
+            painter.drawEllipse(pt, r, r)
         painter.end()
 
     # ── 入り抜き ──────────────────────────────────────────────────────────────
@@ -3083,8 +3284,9 @@ class Canvas(QWidget):
     def _stroke_segment(self, layer, a: QPoint, b: QPoint):
         """ペン・消しゴムの1区間を描く。入りがあれば始点からの距離で細くする。"""
         ts = self._taper_stroke
+        target = self._stroke_target(layer)
         if ts is None or ts["layer"] is not layer:
-            self._taper_draw_piece(layer.image, a, b, self._tool_size())
+            self._taper_draw_piece(target, a, b, self._tool_size())
             return
         ox = getattr(layer, 'offset_x', 0)
         oy = getattr(layer, 'offset_y', 0)
@@ -3094,7 +3296,7 @@ class Canvas(QWidget):
         ts["dist"] += math.hypot(b.x() - a.x(), b.y() - a.y())
         for pa, pb, w in _taper_pieces([QPointF(a), QPointF(b)], self._tool_size(),
                                        t["in"], 0, t["tip"], None, start):
-            self._taper_draw_piece(layer.image, pa, pb, w)
+            self._taper_draw_piece(target, pa, pb, w)
 
     def _taper_finish(self):
         """離したときに呼ぶ。描く前の絵に、入り抜き付きで線を描き直す。"""
@@ -3105,13 +3307,16 @@ class Canvas(QWidget):
             return
         ox = getattr(layer, 'offset_x', 0)
         oy = getattr(layer, 'offset_y', 0)
-        img = QImage(layer.image.size(), layer.image.format())
+        pen_buf = self._active_pen_buf(layer)
+        img = QImage(layer.image.size(), QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img)
-        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        bx, by = ts["base_off"]
-        p.drawImage(bx - ox, by - oy, ts["base"])
-        p.end()
+        if pen_buf is None:
+            # 不透明度つきのペンは別画像に線だけ描き直すので、元の絵は要らない
+            p = QPainter(img)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            bx, by = ts["base_off"]
+            p.drawImage(bx - ox, by - oy, ts["base"])
+            p.end()
 
         pts = [QPointF(q.x() - ox, q.y() - oy) for q in ts["pts"]]
         total = sum(math.hypot(b.x() - a.x(), b.y() - a.y()) for a, b in zip(pts, pts[1:]))
@@ -3123,9 +3328,117 @@ class Canvas(QWidget):
                 self._brush_stamp(img, pts[0], size)
         for a, b, w in _taper_pieces(pts, size, t["in"], t["out"], t["tip"], total):
             self._taper_draw_piece(img, a, b, w)
-        layer.image = img
+        if pen_buf is None:
+            layer.image = img
+        else:
+            pen_buf["buf"] = img
+            self._compose_pen_buffer(layer, None)
         self._apply_clip_to_selection()
         self.update()
+
+    # ── 不透明度つきペン・透明色 ─────────────────────────────────────────────
+
+    def _begin_pen_buffer(self, layer) -> None:
+        """不透明度 100% 未満や透明色のときは、線を別の画像に描く準備をする。
+
+        直接描くと、1本の線の中で重なった所（折り返しや点の重なり）が
+        濃くなってしまう。線だけを別画像に描き、毎回「描く前の絵＋線」を
+        作り直すことで、線全体が同じ濃さになる。
+        """
+        self._pen_buf = None
+        if layer is None or layer.is_vector:
+            return
+        if self.pen_opacity >= 100 and not self.pen_transparent:
+            return
+        buf = QImage(layer.image.size(), QImage.Format.Format_ARGB32)
+        buf.fill(Qt.GlobalColor.transparent)
+        self._pen_buf = {
+            "layer": layer, "base": layer.image.copy(), "buf": buf,
+            "opacity": max(1, min(100, int(self.pen_opacity))) / 100.0,
+            "erase": bool(self.pen_transparent),
+        }
+
+    def _active_pen_buf(self, layer) -> dict | None:
+        pb = self._pen_buf
+        if pb is None or pb["layer"] is not layer or self.tool != Tool.PEN:
+            return None
+        return pb
+
+    def _stroke_target(self, layer) -> QImage:
+        """今の線を描き込む画像。不透明度つきペンなら線だけの別画像。"""
+        pb = self._active_pen_buf(layer)
+        return pb["buf"] if pb is not None else layer.image
+
+    def _compose_pen_buffer(self, layer, dirty: QRect | None) -> None:
+        """描く前の絵に、線だけの画像を指定の濃さで重ねてレイヤーに戻す。"""
+        pb = self._active_pen_buf(layer)
+        if pb is None or pb["base"].size() != layer.image.size():
+            return
+        r = QRect(0, 0, layer.image.width(), layer.image.height())
+        if dirty is not None:
+            r = dirty.intersected(r)
+            if r.isEmpty():
+                return
+        p = QPainter(layer.image)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.drawImage(r.topLeft(), pb["base"], r)
+        p.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_DestinationOut if pb["erase"]
+            else QPainter.CompositionMode.CompositionMode_SourceOver)
+        p.setOpacity(pb["opacity"])
+        p.drawImage(r.topLeft(), pb["buf"], r)
+        p.end()
+
+    def _shift_pen_buffer(self, layer, shift) -> None:
+        pb = self._active_pen_buf(layer)
+        if pb is None:
+            return
+        for k in ("base", "buf"):
+            pb[k] = _shifted_image(pb[k], layer.image.size(), shift)
+
+    def _after_stroke_draw(self, layer, dirty: QRect | None) -> None:
+        """ペン・消しゴムで描いた後の仕上げ（線を重ねる → 選択範囲・ロックで戻す）。"""
+        self._compose_pen_buffer(layer, dirty)
+        self._apply_clip_to_selection(dirty)
+
+    # ── Shift+クリックで直線 ─────────────────────────────────────────────────
+
+    def _shift_line_start(self, event, layer) -> QPoint | None:
+        """Shift を押しながらのペン・消しゴムなら、前の線の終わり（キャンバス座標）。"""
+        if self.tool not in (Tool.PEN, Tool.ERASER) or self._last_stroke_end is None:
+            return None
+        if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            return None
+        if layer.is_vector and (self.tool != Tool.PEN or self._vector_editing()):
+            return None
+        uid, end = self._last_stroke_end
+        return QPoint(end) if uid == layer.uid else None
+
+    def _press_line(self, layer, start_canvas: QPoint, lp: QPoint) -> QRect | None:
+        """前の線の終わりから押した所まで直線を引き、そのまま続けて描けるようにする。"""
+        start = QPoint(start_canvas.x() - getattr(layer, 'offset_x', 0),
+                       start_canvas.y() - getattr(layer, 'offset_y', 0))
+        self._taper_begin(layer, start)
+        self._stroke_segment(layer, start, lp)
+        self._stabilizer.push(lp)
+        self._last_pos = lp
+        return self._segment_dirty(start, lp)
+
+    def _remember_stroke_end(self) -> None:
+        """線を描き終えたとき、次の Shift+クリック用に終わりの位置を控える。"""
+        layer = self.layer_stack.active
+        if layer is None or layer.is_group or self.tool not in (Tool.PEN, Tool.ERASER):
+            return
+        if layer.is_vector:
+            if (self.tool == Tool.PEN and self._vector_points
+                    and not self._vector_editing()):
+                x, y = self._vector_points[-1]
+                self._last_stroke_end = (layer.uid, QPoint(round(x), round(y)))
+            return
+        if self._last_pos is not None:
+            self._last_stroke_end = (layer.uid, QPoint(
+                self._last_pos.x() + getattr(layer, 'offset_x', 0),
+                self._last_pos.y() + getattr(layer, 'offset_y', 0)))
 
     def _commit_shape(self, img: QImage, a: QPoint, b: QPoint):
         painter = QPainter(img)
@@ -3168,19 +3481,15 @@ class Canvas(QWidget):
 
     def _ask_text(self):
         """クリック後に呼ばれる。_text_pos が確定している前提。"""
+        # フォント・サイズはツールオプションで、色はペンの色で決まるので
+        # ここでは文字だけを聞く（毎回ダイアログを3つ通らなくて済む）。
         text, ok = QInputDialog.getText(self, "テキスト入力", "テキスト:")
         if not (ok and text):
             self._text_pos = None
             return
-        font, ok2 = QFontDialog.getFont(QFont("Arial", 40), self)
-        if not ok2:
-            self._text_pos = None
-            return
-        color = QColorDialog.getColor(self.pen_color, self)
-        if color.isValid():
-            self.draw_text(text, font, color)
-        else:
-            self._text_pos = None
+        font = QFont(self.text_font_family)
+        font.setPixelSize(max(1, int(self.text_size)))
+        self.draw_text(text, font, QColor(self.pen_color))
 
     def draw_text(self, text: str, font: QFont, color: QColor):
         layer = self.layer_stack.active
@@ -4104,6 +4413,8 @@ class Canvas(QWidget):
         """新規/開くなどでキャンバスを差し替える前に一切の作業状態を破棄する。"""
         self._end_stroke_cache()
         self._taper_stroke = None
+        self._pen_buf = None
+        self._last_stroke_end = None
         self._move_base_image = None
         self._move_base_strokes = None
         self._vector_points = None
@@ -4149,7 +4460,9 @@ class Canvas(QWidget):
         delta = event.angleDelta().y()
         if mods & Qt.KeyboardModifier.ControlModifier:
             # Ctrl+スクロール → ズーム（カーソル下の点を固定する）
-            factor = 1.15 if delta > 0 else 1 / 1.15
+            # タッチパッドは小刻みな delta を大量に送るので、量に比例させる
+            # （1回ごとに 15% 動かすと速すぎて操作できない）。
+            factor = 1.15 ** (delta / 120)
             self.set_zoom(self.zoom * factor, event.position())
             event.accept()
         else:
@@ -4173,6 +4486,12 @@ class Canvas(QWidget):
         # メニューのショートカットは、受け取ったウィジェットが ShortcutOverride を
         # accept しない限り keyPressEvent より先に発火してキーを奪う。
         if ev.type() == QEvent.Type.ShortcutOverride and self._owns_key(ev.key()):
+            ev.accept()
+            return True
+        # タッチパッドの2本指ピンチ → ズーム（2本指ドラッグはスクロールで動く）
+        if (ev.type() == QEvent.Type.NativeGesture
+                and ev.gestureType() == Qt.NativeGestureType.ZoomNativeGesture):
+            self.set_zoom(self.zoom * (1.0 + ev.value()), ev.position())
             ev.accept()
             return True
         return super().event(ev)

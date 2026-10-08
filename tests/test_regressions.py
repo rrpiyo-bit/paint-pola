@@ -281,11 +281,10 @@ def fill(img, rect, color):
     p.end()
 
 
-def drag(canvas, pts):
+def drag(canvas, pts, mods=Qt.KeyboardModifier.NoModifier):
     def ev(typ, x, y, btns):
         wp = canvas._c2w().map(QPointF(x, y))
-        return QMouseEvent(typ, wp, Qt.MouseButton.LeftButton, btns,
-                           Qt.KeyboardModifier.NoModifier)
+        return QMouseEvent(typ, wp, Qt.MouseButton.LeftButton, btns, mods)
     x0, y0 = pts[0]
     canvas.mousePressEvent(ev(QEvent.Type.MouseButtonPress, x0, y0, Qt.MouseButton.LeftButton))
     for x, y in pts[1:]:
@@ -775,3 +774,370 @@ class TestTaper:
         assert win.canvas.taper["pen"]["out"] == 80
         assert win.canvas.taper["eraser"]["out"] == 30
         assert saved == {"taper/pen/out": 80, "taper/eraser/out": 30}
+
+
+def px(lyr, x, y):
+    """キャンバス座標 (x, y) のレイヤーの色。"""
+    return QColor.fromRgba(lyr.image.pixel(x - lyr.offset_x, y - lyr.offset_y))
+
+
+class TestAlphaLock:
+    """透明ピクセルをロック: 絵がある所にだけ描ける。"""
+
+    def _setup(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        fill(lyr.image, QRect(100, 100, 100, 100), QColor(0, 0, 255))
+        lyr.alpha_locked = True
+        c.set_stabilization(0)
+        c.pen_color = QColor(255, 0, 0)
+        c.pen_size = 20
+        return c, lyr
+
+    def test_pen_only_paints_existing_pixels(self, win):
+        c, lyr = self._setup(win)
+        c.tool = Tool.PEN
+        drag(c, [(50 + i * 10, 150) for i in range(21)])  # 50 → 250
+        assert px(lyr, 150, 150).red() == 255 and px(lyr, 150, 150).alpha() == 255
+        assert px(lyr, 70, 150).alpha() == 0
+        assert px(lyr, 230, 150).alpha() == 0
+
+    def test_eraser_does_nothing(self, win):
+        c, lyr = self._setup(win)
+        c.tool = Tool.ERASER
+        msgs = []
+        c.status_message.connect(msgs.append)
+        drag(c, [(120, 150), (180, 150)])
+        assert px(lyr, 150, 150).alpha() == 255
+        assert msgs
+
+    def test_fill_and_shapes_stay_inside(self, win):
+        c, lyr = self._setup(win)
+        c.tool = Tool.RECT
+        c.shape_fill = "fill"
+        drag(c, [(50, 50), (250, 250)])
+        assert px(lyr, 150, 150).red() == 255
+        assert px(lyr, 60, 60).alpha() == 0
+
+    def test_lasso_fill_respects_lock(self, win):
+        c, lyr = self._setup(win)
+        c.tool = Tool.LASSO_FILL
+        drag(c, [(50, 50), (250, 50), (250, 250), (50, 250)])
+        assert px(lyr, 60, 60).alpha() == 0
+
+    def test_undo_and_save_keep_flag(self, win, tmp_path):
+        lyr = new_layer(win)
+        win.layer_panel._on_alpha_locked(lyr, True)
+        assert lyr.alpha_locked
+        win.canvas.undo()
+        lyr2 = win.layer_stack.active
+        assert not lyr2.alpha_locked
+        win.canvas.redo()
+        assert win.layer_stack.active.alpha_locked
+
+    def test_copy_keeps_flag(self, win):
+        src = new_layer(win)
+        src.alpha_locked = True
+        dst = Layer("d", 10, 10)
+        win.layer_panel._copy_layer_props(src, dst)
+        assert dst.alpha_locked
+
+
+def visible_keys(win):
+    from tool_options_panel import _SliderSpin
+    return {getattr(w, "_opt_key", "") for w in win.tool_options.findChildren(_SliderSpin)
+            if w.isVisibleTo(win.tool_options)}
+
+
+class TestPenOpacityAndTransparent:
+    def _setup(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        c.set_stabilization(0)
+        c.tool = Tool.PEN
+        c.pen_color = QColor(255, 0, 0)
+        c.pen_size = 20
+        return c, lyr
+
+    def test_overlap_in_one_stroke_does_not_darken(self, win):
+        c, lyr = self._setup(win)
+        c.pen_opacity = 50
+        # 同じ所を往復しても、1本の線の中では濃くならない
+        drag(c, [(100, 150), (200, 150), (100, 150), (200, 150)])
+        a = px(lyr, 150, 150).alpha()
+        assert 115 <= a <= 140
+        assert px(lyr, 150, 150).red() == 255
+
+    def test_separate_strokes_build_up(self, win):
+        c, lyr = self._setup(win)
+        c.pen_opacity = 50
+        drag(c, [(100, 150), (200, 150)])
+        drag(c, [(100, 150), (200, 150)])
+        assert px(lyr, 150, 150).alpha() > 170
+
+    def test_transparent_pen_erases(self, win):
+        c, lyr = self._setup(win)
+        fill(lyr.image, QRect(0, 0, 300, 300), QColor(0, 0, 255))
+        c.pen_transparent = True
+        drag(c, [(100, 150), (200, 150)])
+        assert px(lyr, 150, 150).alpha() == 0
+        assert px(lyr, 150, 250).alpha() == 255
+
+    def test_options_shown_and_saved(self, win):
+        saved = {}
+        class FakeSettings:
+            def setValue(self, k, v): saved[k] = v
+        win._settings = FakeSettings()
+        win._on_tool_change(Tool.PEN)
+        assert "pen_opacity" in visible_keys(win)
+        win.tool_options.pen_opacity_changed.emit(40)
+        win.tool_options.pen_transparent_toggled.emit(True)
+        assert win.canvas.pen_opacity == 40 and win.canvas.pen_transparent
+        # 透明色は保存しない（次回起動時に描けなくなる事故を防ぐ）
+        assert saved == {"tool/pen_opacity": 40}
+
+
+class TestShiftLine:
+    def test_raster_shift_click_draws_line(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        c.set_stabilization(0)
+        c.tool = Tool.PEN
+        c.pen_color = QColor(255, 0, 0)
+        c.pen_size = 6
+        drag(c, [(100, 100), (100, 102)])
+        assert px(lyr, 150, 100).alpha() == 0
+        drag(c, [(200, 100)], mods=Qt.KeyboardModifier.ShiftModifier)
+        assert px(lyr, 150, 100).alpha() == 255
+
+    def test_without_previous_stroke_is_a_dot(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        c.set_stabilization(0)
+        c.tool = Tool.PEN
+        c.pen_size = 6
+        drag(c, [(200, 100)], mods=Qt.KeyboardModifier.ShiftModifier)
+        assert px(lyr, 200, 100).alpha() > 200
+        assert px(lyr, 150, 100).alpha() == 0
+
+    def test_eraser_shift_click(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        fill(lyr.image, QRect(0, 0, 300, 300), QColor(0, 0, 255))
+        c.set_stabilization(0)
+        c.tool = Tool.ERASER
+        c.eraser_size = 10
+        drag(c, [(100, 100), (100, 102)])
+        drag(c, [(200, 100)], mods=Qt.KeyboardModifier.ShiftModifier)
+        assert px(lyr, 150, 100).alpha() == 0
+
+    def test_vector_shift_click(self, win):
+        c = win.canvas
+        v = add_vector(win, y=300.0)
+        c.set_stabilization(0)
+        c.tool = Tool.PEN
+        drag(c, [(100, 100), (110, 100)])
+        n = len(v.strokes)
+        drag(c, [(200, 100)], mods=Qt.KeyboardModifier.ShiftModifier)
+        assert len(v.strokes) == n + 1
+        x0, y0 = v.strokes[-1].points[0]
+        assert abs(x0 - 110) <= 2 and abs(y0 - 100) <= 2
+
+
+class TestFillOptions:
+    def test_tolerance(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        fill(lyr.image, QRect(0, 0, 100, 100), QColor(100, 100, 100))
+        fill(lyr.image, QRect(100, 0, 100, 100), QColor(110, 110, 110))
+        c.tool = Tool.FILL
+        c.pen_color = QColor(255, 0, 0)
+        c.fill_tolerance = 0
+        click(c, 50, 50)
+        assert px(lyr, 50, 50).red() == 255
+        assert px(lyr, 150, 50).red() == 110
+        c.undo()
+        lyr = win.layer_stack.active
+        c.fill_tolerance = 10
+        click(c, 50, 50)
+        assert px(lyr, 150, 50).red() == 255
+        assert px(lyr, 250, 50).alpha() == 0  # 透明は 255 も違うので塗らない
+
+    def test_all_layers_mode(self, win):
+        c = win.canvas
+        below = new_layer(win, "below")
+        fill(below.image, QRect(100, 100, 100, 100), QColor(0, 0, 255))
+        top = new_layer(win, "top")
+        c.tool = Tool.FILL
+        c.pen_color = QColor(255, 0, 0)
+        c.fill_reference_mode = "all"
+        click(c, 150, 150)
+        assert px(top, 150, 150).red() == 255
+        assert px(top, 50, 50).alpha() == 0
+        assert px(top, 250, 250).alpha() == 0
+
+    def test_lasso_fill_all_layers(self, win):
+        c = win.canvas
+        below = new_layer(win, "below")
+        p = QPainter(below.image)
+        from PyQt6.QtGui import QPen
+        p.setPen(QPen(QColor(0, 0, 0), 4))
+        p.drawRect(100, 100, 100, 100)
+        p.end()
+        top = new_layer(win, "top")
+        c.tool = Tool.LASSO_FILL
+        c.pen_color = QColor(255, 0, 0)
+        c.fill_reference_mode = "all"
+        drag(c, [(50, 50), (250, 50), (250, 250), (50, 250)])
+        assert px(top, 150, 150).red() == 255
+        assert px(top, 60, 60).alpha() == 0
+
+    def test_tolerance_option_only_on_bucket(self, win):
+        win._on_tool_change(Tool.FILL)
+        assert "fill_tolerance" in visible_keys(win)
+        win._on_tool_change(Tool.LASSO_FILL)
+        assert "fill_tolerance" not in visible_keys(win)
+
+
+class TestTextTool:
+    def test_only_asks_text_and_uses_options(self, win, monkeypatch):
+        from PyQt6.QtWidgets import QInputDialog, QFontDialog, QColorDialog
+        c = win.canvas
+        new_layer(win)
+        asked = []
+        monkeypatch.setattr(QInputDialog, "getText",
+                            lambda *a, **k: (asked.append(1), ("あ", True))[1])
+        def _no_dialog(*a, **k):
+            raise AssertionError("フォント・色のダイアログは出さない")
+        monkeypatch.setattr(QFontDialog, "getFont", _no_dialog)
+        monkeypatch.setattr(QColorDialog, "getColor", _no_dialog)
+        got = {}
+        monkeypatch.setattr(c, "draw_text",
+                            lambda t, f, col: got.update(t=t, f=f, col=col))
+        c.pen_color = QColor(255, 0, 0)
+        c.text_font_family = "Courier New"
+        c.text_size = 72
+        c._text_pos = QPoint(100, 200)
+        c._ask_text()
+        assert asked == [1]
+        assert got["t"] == "あ"
+        assert got["f"].pixelSize() == 72
+        assert got["f"].family() == "Courier New"
+        assert got["col"] == QColor(255, 0, 0)
+
+    def test_options(self, win):
+        from PyQt6.QtWidgets import QFontComboBox
+        win._on_tool_change(Tool.TEXT)
+        assert "text_size" in visible_keys(win)
+        assert any(w.isVisibleTo(win.tool_options)
+                   for w in win.tool_options.findChildren(QFontComboBox))
+
+
+class TestSoftEraser:
+    def test_soft_leaves_partial_alpha(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        fill(lyr.image, QRect(0, 0, 300, 300), QColor(0, 0, 255))
+        c.set_stabilization(0)
+        c.tool = Tool.ERASER
+        c.eraser_size = 40
+        c.eraser_soft = True
+        click(c, 150, 150)
+        center = px(lyr, 150, 150).alpha()
+        edge = px(lyr, 150 + 17, 150).alpha()
+        assert 0 < center < 255
+        assert center < edge <= 255
+        assert px(lyr, 150 + 30, 150).alpha() == 255
+
+    def test_hard_eraser_unchanged(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        fill(lyr.image, QRect(0, 0, 300, 300), QColor(0, 0, 255))
+        c.set_stabilization(0)
+        c.tool = Tool.ERASER
+        c.eraser_size = 40
+        click(c, 150, 150)
+        assert px(lyr, 150, 150).alpha() == 0
+
+
+class TestBrushSize:
+    def _presets(self, win, key):
+        from PyQt6.QtWidgets import QPushButton
+        row = next(w for w in win.tool_options._widgets
+                   if getattr(w, "_preset_key", None) == key)
+        return {b._preset_size: b for b in row.findChildren(QPushButton)}
+
+    def _spin(self, win, key):
+        from tool_options_panel import _SliderSpin
+        return next(w for w in win.tool_options.findChildren(_SliderSpin)
+                    if getattr(w, "_opt_key", "") == key and w.isVisibleTo(win.tool_options))
+
+    def test_presets(self, win):
+        win._on_tool_change(Tool.PEN)
+        self._presets(win, "pen_size")[20].click()
+        assert win.canvas.pen_size == 20
+        assert self._spin(win, "pen_size").value() == 20
+        win._on_tool_change(Tool.ERASER)
+        self._presets(win, "eraser_size")[80].click()
+        assert win.canvas.eraser_size == 80
+
+    def test_ctrl_drag_changes_size_without_drawing(self, win):
+        c = win.canvas
+        lyr = new_layer(win)
+        win._on_tool_change(Tool.PEN)
+        c.pen_size = 10
+        drag(c, [(100, 100), (130, 100)], mods=Qt.KeyboardModifier.ControlModifier)
+        assert abs(c.pen_size - 40) <= 1
+        assert self._spin(win, "pen_size").value() == c.pen_size
+        assert px(lyr, 100, 100).alpha() == 0 and px(lyr, 120, 100).alpha() == 0
+        drag(c, [(100, 100), (0, 100)], mods=Qt.KeyboardModifier.ControlModifier)
+        assert c.pen_size == 1
+
+    def test_ctrl_drag_eraser(self, win):
+        c = win.canvas
+        win._on_tool_change(Tool.ERASER)
+        c.eraser_size = 20
+        drag(c, [(100, 100), (120, 100)], mods=Qt.KeyboardModifier.ControlModifier)
+        assert abs(c.eraser_size - 40) <= 1
+        assert self._spin(win, "eraser_size").value() == c.eraser_size
+
+
+class TestTouchpadZoom:
+    def test_small_wheel_delta_zooms_a_little(self, win):
+        from PyQt6.QtCore import QPoint as QP
+        from PyQt6.QtGui import QWheelEvent
+        c = win.canvas
+        c.set_zoom(1.0)
+        ev = QWheelEvent(QPointF(50, 50), QPointF(50, 50), QP(0, 0), QP(0, 12),
+                         Qt.MouseButton.NoButton, Qt.KeyboardModifier.ControlModifier,
+                         Qt.ScrollPhase.NoScrollPhase, False)
+        c.wheelEvent(ev)
+        assert c.zoom == pytest.approx(1.15 ** 0.1, rel=0.02)
+
+    def test_pinch_zooms(self, win):
+        from PyQt6.QtGui import QNativeGestureEvent, QPointingDevice
+        c = win.canvas
+        c.set_zoom(1.0)
+        ev = QNativeGestureEvent(Qt.NativeGestureType.ZoomNativeGesture,
+                                 QPointingDevice.primaryPointingDevice(), 2,
+                                 QPointF(50, 50), QPointF(50, 50), QPointF(50, 50),
+                                 0.25, QPointF(0, 0))
+        assert c.event(ev)
+        assert c.zoom == pytest.approx(1.25, rel=0.02)
+
+
+class TestToolSettingsRestore:
+    def test_restore_parses_and_clamps(self, win):
+        vals = {"tool/pen_opacity": "500", "tool/eraser_soft": "true",
+                "tool/fill_tolerance": "7", "tool/text_font_family": "",
+                "tool/text_size": "2"}
+        class FakeSettings:
+            def value(self, k, d=None): return vals.get(k, d)
+        win._settings = FakeSettings()
+        win._restore_tool_settings()
+        c = win.canvas
+        assert c.pen_opacity == 100
+        assert c.eraser_soft is True
+        assert c.fill_tolerance == 7
+        assert c.text_font_family == "Arial"
+        assert c.text_size == 4

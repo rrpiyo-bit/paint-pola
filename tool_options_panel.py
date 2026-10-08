@@ -9,6 +9,10 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from tools import Tool
 from brush import BRUSH_LABELS
 
+# ブラシサイズのプリセット（クリックでその太さにする）
+PEN_SIZE_PRESETS = (3, 5, 10, 20, 50)
+ERASER_SIZE_PRESETS = (10, 20, 40, 80, 150)
+
 
 class _SliderSpin(QWidget):
     """スライダーと数値入力を横に並べた複合ウィジェット。
@@ -82,6 +86,12 @@ class ToolOptionsPanel(QWidget):
     # 各設定の変更シグナル
     pen_size_changed      = pyqtSignal(int)
     eraser_size_changed   = pyqtSignal(int)
+    pen_opacity_changed   = pyqtSignal(int)   # ペンの不透明度 (1〜100 %)
+    pen_transparent_toggled = pyqtSignal(bool)  # 透明色で描く
+    eraser_soft_toggled   = pyqtSignal(bool)  # ふちをぼかして消す
+    fill_tolerance_changed = pyqtSignal(int)  # バケツ塗りの色の誤差 (%)
+    text_font_changed     = pyqtSignal(str)   # テキストのフォント名
+    text_size_changed     = pyqtSignal(int)   # テキストの文字サイズ (px)
     stabilization_changed = pyqtSignal(int)   # 手ブレ補正の強さ（0=なし）
     taper_changed = pyqtSignal(str, int)      # 入り抜き ("in"/"out"/"tip", 値)
     brush_changed         = pyqtSignal(str)
@@ -176,7 +186,13 @@ class ToolOptionsPanel(QWidget):
                  vector_selected=None,
                  vector_erase_mode: str = "cut",
                  stabilization: int = 5,
-                 taper: dict | None = None):
+                 taper: dict | None = None,
+                 pen_opacity: int = 100,
+                 pen_transparent: bool = False,
+                 eraser_soft: bool = False,
+                 fill_tolerance: int = 0,
+                 text_font: str = "Arial",
+                 text_size: int = 40):
         self._current_tool = tool
         self._clear()
 
@@ -205,6 +221,17 @@ class ToolOptionsPanel(QWidget):
         elif tool == Tool.PEN:
             self._add_spinbox("ブラシサイズ", pen_size, 1, 200,
                               lambda v: self.pen_size_changed.emit(v))
+            self._add_size_presets("pen_size", PEN_SIZE_PRESETS,
+                                   self.pen_size_changed)
+            self._add_spinbox("不透明度", pen_opacity, 1, 100,
+                              lambda v: self.pen_opacity_changed.emit(v),
+                              key="pen_opacity", suffix=" %",
+                              tooltip="線の濃さ。1本の線の中で重なっても濃くなりません。\n"
+                                      "重ね塗りしたいときは線を分けて描きます。")
+            self._add_toggle("透明色で描く", pen_transparent,
+                             lambda v: self.pen_transparent_toggled.emit(v),
+                             tooltip="ペンで描いた所が消えます。\n"
+                                     "ブラシの形・不透明度のまま消したいとき用。")
             self._add_stabilization(stabilization)
             self._add_taper(taper)
             self._add_brush_combo(brush_key)
@@ -217,6 +244,12 @@ class ToolOptionsPanel(QWidget):
         elif tool == Tool.ERASER:
             self._add_spinbox("消しゴムサイズ", eraser_size, 1, 300,
                               lambda v: self.eraser_size_changed.emit(v))
+            self._add_size_presets("eraser_size", ERASER_SIZE_PRESETS,
+                                   self.eraser_size_changed)
+            self._add_toggle("ソフト（ふちをぼかして消す）", eraser_soft,
+                             lambda v: self.eraser_soft_toggled.emit(v),
+                             tooltip="ふちほど弱く消えるので、\n"
+                                     "影やグラデーションを薄くするのに向いています。")
             self._add_stabilization(stabilization)
             self._add_taper(taper)
 
@@ -227,6 +260,14 @@ class ToolOptionsPanel(QWidget):
                                 "マウスを離すと自動で実行されます。\n"
                                 "下の設定はバケツ塗りと共通です。")
             self._add_fill_reference_combo(fill_reference_mode)
+            if tool == Tool.FILL:
+                self._add_spinbox("色の誤差", fill_tolerance, 0, 100,
+                                  lambda v: self.fill_tolerance_changed.emit(v),
+                                  key="fill_tolerance", suffix=" %",
+                                  tooltip="クリックした所と、どれくらい違う色まで\n"
+                                          "同じ色とみなして塗るか。\n"
+                                          "参照レイヤーがないとき・「すべてのレイヤー」\n"
+                                          "のときに効きます。")
             self._add_spinbox("拡張/縮小 (px)", fill_expand, -30, 30,
                               lambda v: self.fill_expand_changed.emit(v),
                               tooltip="正: 塗り範囲を広げる  負: 塗り範囲を縮める")
@@ -276,11 +317,20 @@ class ToolOptionsPanel(QWidget):
             self._add_label("Alt キーでも\n一時スポイトになります")
 
         elif tool == Tool.TEXT:
-            self._add_label("キャンバスをクリックして\nテキストを入力")
+            self._add_font_combo(text_font)
+            self._add_spinbox("文字サイズ", text_size, 4, 500,
+                              lambda v: self.text_size_changed.emit(v),
+                              key="text_size", suffix=" px")
+            self._add_label("キャンバスをクリックして文字を入力します。\n"
+                            "色は今のペンの色を使います。")
 
     def sync_pen_size(self, v: int):
+        self.sync_size("pen_size", v)
+
+    def sync_size(self, key: str, v: int):
+        """キーボードやプリセットで変えた値を、表示中の入力欄に反映する。"""
         for w in self._widgets:
-            if getattr(w, '_opt_key', None) == 'pen_size':
+            if getattr(w, '_opt_key', None) == key:
                 w.blockSignals(True)
                 w.setValue(v)
                 w.blockSignals(False)
@@ -386,7 +436,8 @@ class ToolOptionsPanel(QWidget):
         cb = QComboBox()
         cb.addItem("参照レイヤー＋編集レイヤー", "ref_self")
         cb.addItem("参照レイヤーのみ", "ref")
-        idx = {"ref_self": 0, "ref": 1}.get(current, 0)
+        cb.addItem("すべてのレイヤー", "all")
+        idx = {"ref_self": 0, "ref": 1, "all": 2}.get(current, 0)
         cb.setCurrentIndex(idx)
         cb.setToolTip(
             "塗りを止める境界をどのレイヤーから探すか。\n\n"
@@ -395,15 +446,51 @@ class ToolOptionsPanel(QWidget):
             "  自分で丸く囲ってその中だけ塗るとき用。\n\n"
             "参照レイヤーのみ:\n"
             "  線画レイヤーだけを境界にします。すでに塗った色は\n"
-            "  無視するので、隣り合う色を塗り分けるとき塗り漏れが出ません。")
+            "  無視するので、隣り合う色を塗り分けるとき塗り漏れが出ません。\n\n"
+            "すべてのレイヤー:\n"
+            "  見えている絵全体の色で境界を決めます。\n"
+            "  参照レイヤーを設定しなくても、線画の下のレイヤーに塗れます。")
         cb.currentIndexChanged.connect(
             lambda i: self.fill_reference_mode_changed.emit(cb.itemData(i)))
         self._add_row("複数参照", cb)
 
-    def _add_toggle(self, label: str, value: bool, callback):
+    def _add_size_presets(self, key: str, sizes, signal):
+        """よく使う太さをワンクリックで選ぶボタン列。"""
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(2)
+        for size in sizes:
+            btn = QPushButton(str(size))
+            btn.setFixedHeight(22)
+            btn.setStyleSheet("QPushButton { font-size:11px; padding:0 2px; }")
+            btn.setToolTip(f"太さを {size} にする")
+            btn._preset_size = size  # type: ignore
+
+            def _pick(_=False, v=size):
+                signal.emit(v)
+                self.sync_size(key, v)
+            btn.clicked.connect(_pick)
+            hl.addWidget(btn)
+        row._preset_key = key  # type: ignore
+        self._content_layout.insertWidget(self._content_layout.count() - 1, row)
+        self._widgets.append(row)
+
+    def _add_font_combo(self, family: str):
+        from PyQt6.QtWidgets import QFontComboBox
+        from PyQt6.QtGui import QFont
+        cb = QFontComboBox()
+        cb.setCurrentFont(QFont(family))
+        cb.currentFontChanged.connect(
+            lambda f: self.text_font_changed.emit(f.family()))
+        self._add_row("フォント", cb)
+
+    def _add_toggle(self, label: str, value: bool, callback, tooltip: str = ""):
         from PyQt6.QtWidgets import QCheckBox
         cb = QCheckBox(label)
         cb.setChecked(value)
+        if tooltip:
+            cb.setToolTip(tooltip)
         cb.toggled.connect(callback)
         self._content_layout.insertWidget(self._content_layout.count() - 1, cb)
         self._widgets.append(cb)

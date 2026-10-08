@@ -325,7 +325,11 @@ class TestSelectionClipsDrawing:
         _press(canvas, a.x(), a.y())
         _move(canvas, b.x(), b.y())
         _release(canvas, b.x(), b.y())
-        return (self._arr(layer.image) != before).any(axis=2)
+        # 図形は描く前にレイヤーを広げることがあるので、キャンバス座標でそろえて比べる
+        after = self._arr(layer.image)
+        ox, oy = -layer.offset_x, -layer.offset_y
+        after = after[oy:oy + before.shape[0], ox:ox + before.shape[1]]
+        return (after != before).any(axis=2)
 
     @pytest.mark.parametrize("tool", [
         Tool.PEN, Tool.ERASER, Tool.FILL, Tool.LINE, Tool.RECT,

@@ -1247,6 +1247,7 @@ class MainWindow(QMainWindow):
                         self._settings.value(f"taper/{key}/{field}", cur)))
                 except (TypeError, ValueError):
                     pass
+        self._restore_tool_settings()
         self._refresh_tool_options()
         # ウィンドウ表示・レイアウト確定後でないと表示領域が0のままフィットできない
         QTimer.singleShot(0, lambda: self.navigator._fit_view())
@@ -1334,8 +1335,23 @@ class MainWindow(QMainWindow):
             lambda v: setattr(self.canvas, 'blur_size', v))
         self.tool_options.blur_strength_changed.connect(
             lambda v: setattr(self.canvas, 'blur_strength', v / 100.0))
-        # [ ] でペンサイズ変更 → オプションパネルも同期
+        self.tool_options.pen_opacity_changed.connect(
+            lambda v: self._set_tool_setting("pen_opacity", int(v)))
+        # 透明色は描くつもりで消してしまう事故を防ぐため、次回起動時には戻す
+        self.tool_options.pen_transparent_toggled.connect(
+            lambda v: setattr(self.canvas, 'pen_transparent', bool(v)))
+        self.tool_options.eraser_soft_toggled.connect(
+            lambda v: self._set_tool_setting("eraser_soft", bool(v)))
+        self.tool_options.fill_tolerance_changed.connect(
+            lambda v: self._set_tool_setting("fill_tolerance", int(v)))
+        self.tool_options.text_font_changed.connect(
+            lambda v: self._set_tool_setting("text_font_family", str(v)))
+        self.tool_options.text_size_changed.connect(
+            lambda v: self._set_tool_setting("text_size", int(v)))
+        # [ ] や Ctrl+ドラッグでサイズ変更 → オプションパネルも同期
         self.canvas.brush_size_changed.connect(self.tool_options.sync_pen_size)
+        self.canvas.eraser_size_changed.connect(
+            lambda v: self.tool_options.sync_size("eraser_size", v))
         # ベクター
         self.tool_options.vector_pen_mode_changed.connect(
             self._on_vector_pen_mode_change)
@@ -1386,6 +1402,39 @@ class MainWindow(QMainWindow):
         self.canvas._tool_cursor = self._tool_cursors.get(tool)
         self.canvas._restore_tool_cursor()
 
+    # 次回起動時も同じ値で始める道具の設定（キャンバスの属性名 → 型）
+    _SAVED_TOOL_SETTINGS = {
+        "pen_opacity": int, "eraser_soft": bool, "fill_tolerance": int,
+        "text_font_family": str, "text_size": int,
+    }
+
+    def _set_tool_setting(self, attr: str, value) -> None:
+        setattr(self.canvas, attr, value)
+        self._settings.setValue(f"tool/{attr}", value)
+
+    def _restore_tool_settings(self) -> None:
+        for attr, typ in self._SAVED_TOOL_SETTINGS.items():
+            raw = self._settings.value(f"tool/{attr}", None)
+            if raw is None:
+                continue
+            try:
+                if typ is bool:
+                    # QSettings は bool を "true"/"false" の文字列で返すことがある
+                    value = raw if isinstance(raw, bool) else str(raw).lower() == "true"
+                else:
+                    value = typ(raw)
+            except (TypeError, ValueError):
+                continue
+            if attr == "pen_opacity":
+                value = max(1, min(100, value))
+            elif attr == "fill_tolerance":
+                value = max(0, min(100, value))
+            elif attr == "text_size":
+                value = max(4, min(500, value))
+            elif attr == "text_font_family" and not value:
+                continue
+            setattr(self.canvas, attr, value)
+
     def _on_stabilization_change(self, value: int):
         self.canvas.set_stabilization(value)
         self._settings.setValue("stabilization", self.canvas.stabilization)
@@ -1427,6 +1476,12 @@ class MainWindow(QMainWindow):
             vector_erase_mode=self.canvas.vector_erase_mode,
             stabilization=self.canvas.stabilization,
             taper=self.canvas.taper.get(_TAPER_TOOL_KEYS.get(self.canvas.tool, "")),
+            pen_opacity=self.canvas.pen_opacity,
+            pen_transparent=self.canvas.pen_transparent,
+            eraser_soft=self.canvas.eraser_soft,
+            fill_tolerance=self.canvas.fill_tolerance,
+            text_font=self.canvas.text_font_family,
+            text_size=self.canvas.text_size,
         )
 
     def _refresh_tool_options_if_kind_changed(self):
@@ -1865,6 +1920,7 @@ class MainWindow(QMainWindow):
                         info["clipping"] = lyr.clipping
                         info["reference"] = lyr.reference
                         info["locked"] = lyr.locked
+                        info["alpha_locked"] = bool(getattr(lyr, "alpha_locked", False))
                         info["blend_mode"] = lyr.blend_mode
                         info["offset_x"] = lyr.offset_x
                         info["offset_y"] = lyr.offset_y
@@ -2165,7 +2221,8 @@ class MainWindow(QMainWindow):
                         lyr.clipping = bool(info.get("clipping", False))
                         lyr.reference = bool(info.get("reference", False))
                         lyr.locked = bool(info.get("locked", False))
-                        bm = info.get("blend_mode", "normal")
+                        lyr.alpha_locked = bool(info.get("alpha_locked", False))
+                        bm =info.get("blend_mode", "normal")
                         from layer import BLEND_KEYS
                         lyr.blend_mode = bm if bm in BLEND_KEYS else "normal"
 
