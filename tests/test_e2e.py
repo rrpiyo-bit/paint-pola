@@ -2517,17 +2517,32 @@ class TestLineExtraction:
         assert np.array_equal(a, b)
 
     def test_dialog_preview_matches_full_result(self):
-        """プレビュー（縮小）と確定結果（フルサイズ）で線の比率がほぼ一致する。"""
+        """キャンバスに映すプレビューは原寸で、確定結果と線の位置が完全に一致する。"""
         from main import LineExtractionDialog
         src, _ = self._photo(size=300)
         dlg = LineExtractionDialog(src)
         dlg._mode_adaptive.setChecked(True)
         dlg._denoise.setValue(2)
-        full = dlg._mask_for(dlg._bgr, 1.0)
-        prev = dlg._mask_for(dlg._bgr_small, dlg._scale)
-        full_ratio = np.count_nonzero(full) / full.size
-        prev_ratio = np.count_nonzero(prev) / prev.size
-        assert abs(full_ratio - prev_ratio) < 0.02
+
+        def arr_of(img):
+            ptr = img.bits()
+            ptr.setsize(img.sizeInBytes())
+            return np.frombuffer(ptr, dtype=np.uint8).reshape(img.height(), img.width(), 4)
+        # QImage を変数に持っておかないと、配列が読み終わる前に画像が解放される
+        prev_img, full_img = dlg.preview_image(), dlg.extract()
+        prev, full = arr_of(prev_img), arr_of(full_img)
+        assert prev.shape == full.shape == (300, 300, 4)
+        # 線だけ表示: 白い紙に黒い線。黒の位置が確定結果の線と同じ
+        assert np.array_equal(prev[:, :, 0] == 0, full[:, :, 3] > 0)
+        assert (prev[:, :, 3] == 255).all()
+        # 元の絵に重ねる: 線のところだけ青、ほかは透明
+        dlg._overlay_check.setChecked(True)
+        over_img = dlg.preview_image()
+        over = arr_of(over_img)
+        assert np.array_equal(over[:, :, 3] > 0, full[:, :, 3] > 0)
+        assert tuple(over[full[:, :, 3] > 0][0][:3]) == LineExtractionDialog.OVERLAY_COLOR
+        dlg._preview_check.setChecked(False)
+        assert dlg.preview_image() is None
 
     def test_dialog_extract_returns_transparent_black_lines(self):
         """extract() は背景透過・線は黒の ARGB32 を返す。"""
@@ -2549,22 +2564,116 @@ class TestLineExtraction:
 
     def test_extract_line_menu_adds_layer(self, win):
         """メニューからの線画抽出が「線画」レイヤーを追加する。"""
-        from main import LineExtractionDialog
-        from PyQt6.QtWidgets import QDialog
         before = len(win.layer_stack.layers)
-        orig = LineExtractionDialog.exec
-
-        def fake_exec(self):
-            self._mode_adaptive.setChecked(True)
-            return QDialog.DialogCode.Accepted
-
-        LineExtractionDialog.exec = fake_exec
-        try:
-            win._extract_line()
-        finally:
-            LineExtractionDialog.exec = orig
+        win._extract_line()
+        dlg = win._line_dialog
+        dlg._mode_adaptive.setChecked(True)
+        dlg.accept()
         assert len(win.layer_stack.layers) == before + 1
         assert any(l.name == "線画" for l in win.layer_stack.layers)
+        assert win.canvas._overlay_preview is None
+
+    def test_preview_on_canvas_while_open(self, win):
+        """開いているあいだは結果をキャンバスに映し、見る操作以外は止める。"""
+        from PyQt6.QtGui import QAction
+        win._extract_line()
+        dlg = win._line_dialog
+        assert dlg is not None and not dlg.isModal()
+        assert win.canvas._overlay_preview is not None
+        assert win.canvas._view_only
+        assert not win.menuBar().isEnabled() and not win.layer_column.isEnabled()
+        assert win.navigator.isEnabled()  # ナビゲーターで見る場所は動かせる
+        undo = next(a for a in win.findChildren(QAction) if a.text() == "元に戻す")
+        assert not undo.isEnabled()
+        # 2回目はダイアログを増やさず、開いているものを前に出す
+        win._extract_line()
+        assert win._line_dialog is dlg
+        before = len(win.layer_stack.layers)
+        dlg.reject()
+        assert len(win.layer_stack.layers) == before  # キャンセルでは何も残らない
+        assert win.canvas._overlay_preview is None and not win.canvas._view_only
+        assert win.menuBar().isEnabled() and win.layer_column.isEnabled()
+
+    def test_view_only_drag_scrolls_instead_of_drawing(self, win):
+        from PyQt6.QtCore import QPointF
+        win.canvas.set_zoom(3.0)
+        QApplication.processEvents()
+        layer = win.layer_stack.active
+        snapshot = layer.image.copy()
+        win._extract_line()
+        hbar = win._scroll.horizontalScrollBar()
+        hbar.setValue(hbar.maximum() // 2)
+        start = hbar.value()
+        c = win.canvas
+        def ev(t, x, btn, btns):
+            p = QPointF(x, 100)
+            g = c.mapToGlobal(p)
+            return QMouseEvent(t, p, g, btn, btns, Qt.KeyboardModifier.NoModifier)
+        L = Qt.MouseButton.LeftButton
+        c.mousePressEvent(ev(QEvent.Type.MouseButtonPress, 300, L, L))
+        c.mouseMoveEvent(ev(QEvent.Type.MouseMove, 200, Qt.MouseButton.NoButton, L))
+        c.mouseReleaseEvent(ev(QEvent.Type.MouseButtonRelease, 200, L, Qt.MouseButton.NoButton))
+        assert hbar.value() == start + 100
+        assert layer.image == snapshot  # 描かれていない
+        win._line_dialog.reject()
+
+
+class TestBlackOnlyExtraction:
+    """カラー絵から黒い線だけを抜く「黒だけ」方式。"""
+
+    @staticmethod
+    def _color_art():
+        from PyQt6.QtGui import QImage, QColor
+        img = QImage(120, 40, QImage.Format.Format_ARGB32)
+        img.fill(QColor("#ffffff"))
+        # 左から: 黒い線 / 濃い青（髪の影） / 濃い赤 / 黄色の塗り
+        for x0, color in ((0, "#000000"), (30, "#102060"), (60, "#701010"), (90, "#ffe000")):
+            for x in range(x0 + 5, x0 + 25):
+                for y in range(5, 35):
+                    img.setPixelColor(x, y, QColor(color))
+        return img
+
+    def test_picks_black_but_not_dark_colors(self):
+        from main import LineExtractionDialog
+        dlg = LineExtractionDialog(self._color_art())
+        dlg._mode_black.setChecked(True)
+        mask = dlg._mask_for(dlg._bgr, 1.0) > 0
+        assert mask[20, 5:25].all()            # 黒は拾う
+        assert not mask[20, 35:55].any()       # 濃い青は拾わない
+        assert not mask[20, 65:85].any()       # 濃い赤も拾わない
+        assert not mask[20, 95:115].any()      # 明るい色・白は拾わない
+        assert not mask[0].any()
+        # 同じ絵でも明るさだけで判定する方式だと濃い色まで線になる（違いの確認）
+        dlg._mode_fixed.setChecked(True)
+        assert (dlg._mask_for(dlg._bgr, 1.0) > 0)[20, 35:55].all()
+
+    def test_tolerance_sliders(self):
+        from main import _extract_black_mask
+        bgr = np.array([[[60, 60, 60], [20, 20, 70]]], dtype=np.uint8)  # 濃いグレー / 黒っぽい赤
+        assert _extract_black_mask(bgr, 40, 40, 0).tolist() == [[0, 0]]
+        assert _extract_black_mask(bgr, 80, 40, 0).tolist() == [[255, 0]]
+        assert _extract_black_mask(bgr, 80, 60, 0).tolist() == [[255, 255]]
+
+    def test_only_relevant_controls_shown(self):
+        from main import LineExtractionDialog
+        dlg = LineExtractionDialog(self._color_art())
+        dlg._mode_black.setChecked(True)
+        assert dlg._corr_box.isHidden()
+        assert dlg._darkness.isHidden() is False and dlg._thresh.isHidden()
+        dlg._mode_fixed.setChecked(True)
+        assert not dlg._corr_box.isHidden() and dlg._darkness.isHidden()
+
+    def test_extract_gives_black_line_layer(self):
+        from main import LineExtractionDialog
+        dlg = LineExtractionDialog(self._color_art())
+        dlg._mode_black.setChecked(True)
+        out = dlg.extract()
+        ptr = out.bits()
+        ptr.setsize(out.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(40, 120, 4)
+        opaque = arr[:, :, 3] > 0
+        assert np.count_nonzero(opaque) == 20 * 30
+        assert arr[opaque][:, :3].max() == 0
 
 
 # ── ズームの中心維持・方眼・テーマ ────────────────────────────────────────────
@@ -2907,7 +3016,8 @@ class TestFlattenPaper:
         assert (arr[~ink][:, 3] == 0).all()
 
     def test_preview_and_full_agree_with_flatten(self):
-        """半径は px 指定なので、プレビューでも同じ見え方になること。"""
+        """半径は px 指定なので、プレビューでも同じ見え方になること。
+        プレビューはキャンバスに原寸で映すので、確定結果と完全に一致する。"""
         import cv2
         from PyQt6.QtGui import QImage
         from main import LineExtractionDialog
@@ -2919,10 +3029,13 @@ class TestFlattenPaper:
         dlg._mode_fixed.setChecked(True)
         dlg._thresh.setValue(175)
         dlg._flatten.setValue(120)
-        small = dlg._mask_for(dlg._bgr_small, dlg._scale)
-        full = dlg._mask_for(dlg._bgr, 1.0)
-        d = abs(float((small > 0).mean()) - float((full > 0).mean()))
-        assert d < 0.02, f"プレビューと確定結果がずれている ({d:.3f})"
+        prev_img, full_img = dlg.preview_image(), dlg.extract()  # 参照を保ったまま読む
+        def arr_of(img):
+            ptr = img.bits()
+            ptr.setsize(img.sizeInBytes())
+            return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)
+        prev, full = arr_of(prev_img), arr_of(full_img)
+        assert np.array_equal(prev[:, :, 0] == 0, full[:, :, 3] > 0)
 
 
 

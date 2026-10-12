@@ -54,6 +54,10 @@ class CollapsibleSection(QWidget):
         self._toggle_btn.setText(("▶ " if self._collapsed else "▼ ") + title)
 
 _SWATCH_SIZE = 16
+# パレットの1マスの大きさ。12列でパネル幅にちょうど収まる値。
+_PALETTE_CELL = 19
+# 方眼の線。明るい・暗いどちらのテーマでも見えるよう半透明の灰色にする。
+_GRID_LINE = QColor(128, 128, 128, 170)
 _PALETTE_COLS = 12
 
 _DEFAULT_PALETTE: list[str] = [
@@ -334,6 +338,10 @@ class MiniSwatch(QFrame):
         super().__init__(parent)
         self._color = color
         self._selected = False
+        # 方眼として並べるときに描く外周の辺 (左, 上)。None なら線を描かない。
+        # 右と下は常に描き、左と上は先頭の列・行だけ描くと、隣同士で線が
+        # 二重にならず全部 1px の方眼になる。
+        self._grid_edges: tuple[bool, bool] | None = None
         self.setFixedSize(size, size)
         self.setFrameStyle(QFrame.Shape.NoFrame)
         self._refresh()
@@ -354,6 +362,10 @@ class MiniSwatch(QFrame):
     def is_selected(self) -> bool:
         return self._selected
 
+    def set_grid_edges(self, left: bool, top: bool) -> None:
+        self._grid_edges = (left, top)
+        self.update()
+
     def _refresh(self):
         self.setStyleSheet(
             f"background-color: rgba({self._color.red()},{self._color.green()},"
@@ -362,13 +374,25 @@ class MiniSwatch(QFrame):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        if not self._selected and self._grid_edges is None:
+            return
+        p = QPainter(self)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        if self._grid_edges is not None:
+            left, top = self._grid_edges
+            p.setPen(_GRID_LINE)
+            p.drawLine(r.topRight(), r.bottomRight())
+            p.drawLine(r.bottomLeft(), r.bottomRight())
+            if left:
+                p.drawLine(r.topLeft(), r.bottomLeft())
+            if top:
+                p.drawLine(r.topLeft(), r.topRight())
         if not self._selected:
+            p.end()
             return
         # 枠はスタイルシートではなく自分で描く。border を付けると
         # 内側が狭まってスウォッチの大きさが変わり、並びがずれるため。
         # どんな色の上でも見えるよう白と黒の二重枠にする。
-        p = QPainter(self)
-        r = self.rect().adjusted(0, 0, -1, -1)
         p.setPen(QColor(255, 255, 255))
         p.drawRect(r)
         p.setPen(QColor(0, 0, 0))
@@ -843,6 +867,9 @@ class ColorPanel(QWidget):
         self._palette_grid = QGridLayout(self._palette_container)
         self._palette_grid.setSpacing(0)
         self._palette_grid.setContentsMargins(0, 0, 0, 0)
+        # 左上に詰めて方眼のように並べる。詰めないと列が横幅いっぱいに
+        # 広がり、行も縦の真ん中に寄って、色と色の間がまばらに空く。
+        self._palette_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self._palette_scroll.setWidget(self._palette_container)
         self._palette_swatches: list[MiniSwatch] = []
         self._sec_palette.add_widget(self._palette_scroll)
@@ -1126,7 +1153,7 @@ class ColorPanel(QWidget):
         for label, hex_color in entries:
             if hex_color is None:
                 if cols == 5:
-                    sw = MiniSwatch(QColor(0, 0, 0, 0), _SWATCH_SIZE)
+                    sw = MiniSwatch(QColor(0, 0, 0, 0), _PALETTE_CELL)
                     sw.setStyleSheet("background: transparent; border: none;")
                     sw.setEnabled(False)
                     self._palette_grid.addWidget(sw, row, col)
@@ -1140,7 +1167,11 @@ class ColorPanel(QWidget):
                         row += 1
                         col = 0
                 continue
-            sw = MiniSwatch(QColor(hex_color))
+            sw = MiniSwatch(QColor(hex_color), _PALETTE_CELL)
+            # 上や左が空き（区切り）のマスでも外周の線が欠けないようにする
+            above_empty = row == 0 or not self._palette_cell_filled(row - 1, col)
+            left_empty = col == 0 or not self._palette_cell_filled(row, col - 1)
+            sw.set_grid_edges(left_empty, above_empty)
             tip = f"{label} ({hex_color})" if label else hex_color
             sw.setToolTip(tip)
             sw.clicked.connect(self._on_swatch_click)
@@ -1151,6 +1182,12 @@ class ColorPanel(QWidget):
             if col >= cols:
                 col = 0
                 row += 1
+
+    def _palette_cell_filled(self, row: int, col: int) -> bool:
+        """方眼のそのマスに色が置かれているか（区切りの空きマスは False）。"""
+        item = self._palette_grid.itemAtPosition(row, col)
+        w = item.widget() if item else None
+        return isinstance(w, MiniSwatch) and w.isEnabled()
 
     def _register_to_palette(self):
         """現在色を自分のパレットの末尾に追加して保存する。

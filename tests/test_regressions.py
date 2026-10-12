@@ -25,7 +25,15 @@ from vector import VectorLayer, VectorStroke
 
 
 @pytest.fixture
-def win():
+def win(monkeypatch):
+    # 右の列のたたみ具合は実際の設定から復元されるので、使う人の状態に左右されないよう開いた状態で始める
+    from PyQt6.QtCore import QSettings
+    orig = QSettings.value
+    def value(self, key, default=None, *a, **k):
+        if str(key).startswith("layout/collapsed_"):
+            return default
+        return orig(self, key, default, *a, **k)
+    monkeypatch.setattr(QSettings, "value", value)
     w = MainWindow()
     w.show()
     w.activateWindow()
@@ -616,6 +624,7 @@ class TestStabilization:
     def test_line_reaches_release_point(self, win):
         """補正で遅れた分も、離したときに指の位置まで追いつく。"""
         pts = [(100 + i * 10, 100) for i in range(21)]  # 100 → 300
+        win.canvas.set_zoom(1.0)  # 縮小表示だと座標の丸めで端の1px がずれる
         c, lyr = self._draw(win, 30, pts)
         assert QColor.fromRgba(lyr.image.pixel(299 - lyr.offset_x, 100 - lyr.offset_y)).alpha() > 0
 
@@ -916,6 +925,7 @@ class TestShiftLine:
         c.set_stabilization(0)
         c.tool = Tool.PEN
         c.pen_size = 6
+        c.set_zoom(1.0)  # 縮小表示だと座標の丸めで点の位置がずれる
         drag(c, [(200, 100)], mods=Qt.KeyboardModifier.ShiftModifier)
         assert px(lyr, 200, 100).alpha() > 200
         assert px(lyr, 150, 100).alpha() == 0
@@ -1141,3 +1151,112 @@ class TestToolSettingsRestore:
         assert c.fill_tolerance == 7
         assert c.text_font_family == "Arial"
         assert c.text_size == 4
+
+
+class TestSideColumns:
+    """レイヤーはナビゲーター・カラーの横に並び、どちらの列も右へたためる。"""
+
+    def test_layers_beside_color_and_full_height(self, win):
+        win.resize(1400, 900)
+        QApplication.processEvents()
+        cc, lc = win.color_column, win.layer_column
+        assert lc.x() > cc.x()
+        assert lc.x() >= cc.x() + cc.width() - 1
+        # カラーを開いていてもレイヤーパネルは列の高さいっぱいに使える
+        assert win.layer_panel.height() >= lc.height() - 2
+        assert win.layer_panel.isVisible() and win.color_panel.isVisible()
+
+    def test_collapse_and_saved(self, win):
+        saved = {}
+        class FakeSettings:
+            def setValue(self, k, v): saved[k] = v
+        win._settings = FakeSettings()
+        win.resize(1400, 900)
+        QApplication.processEvents()
+        canvas_w = win._scroll.width()
+        win.layer_column.strip.click()
+        QApplication.processEvents()
+        assert win.layer_column.is_collapsed()
+        assert not win.layer_panel.isVisible()
+        assert win.layer_column.width() == win.layer_column.STRIP_WIDTH
+        assert win._scroll.width() > canvas_w  # たたんだ分キャンバスが広がる
+        win.color_column.strip.click()
+        assert saved == {"layout/collapsed_layer": True, "layout/collapsed_color": True}
+        win.layer_column.strip.click()
+        QApplication.processEvents()
+        assert win.layer_panel.isVisible()
+        assert saved["layout/collapsed_layer"] is False
+
+    def test_restored_on_start(self, monkeypatch):
+        from PyQt6.QtCore import QSettings
+        orig = QSettings.value
+        def fake_value(self, key, default=None, *a, **k):
+            if key == "layout/collapsed_color":
+                return "true"
+            if key == "layout/collapsed_layer":
+                return False
+            return orig(self, key, default, *a, **k)
+        monkeypatch.setattr(QSettings, "value", fake_value)
+        w = MainWindow()
+        try:
+            assert w.color_column.is_collapsed()
+            assert not w.layer_column.is_collapsed()
+        finally:
+            w.close()
+
+    def test_menu_reopens_and_stays_in_sync(self, win):
+        win._settings = type("S", (), {"setValue": lambda self, k, v: None})()
+        act = win._column_actions["layer"]
+        assert act.isChecked()
+        win.layer_column.strip.click()
+        assert not act.isChecked()  # 帯でたたんでもメニューのチェックが合う
+        act.trigger()  # 帯を見失ってもメニューから出し直せる
+        assert not win.layer_column.is_collapsed()
+        win._column_actions["color"].trigger()
+        assert win.color_column.is_collapsed()
+
+    def test_strip_does_not_blend_into_light_theme(self, win):
+        # 明るいテーマでも帯はテーマの色を継がず、背景と見分けがつく色で描かれる
+        win._settings = type("S", (), {"setValue": lambda self, k, v: None,
+                                       "sync": lambda self: None})()
+        win.resize(1400, 900)
+        win.layer_column.set_collapsed(True)
+        for key in ("google", "pastel", "default"):
+            win._apply_theme(key)
+            QApplication.processEvents()
+            img = win.layer_column.strip.grab().toImage()
+            c = img.pixelColor(img.width() // 2, 5)
+            assert c.lightness() < 140, (key, c.name())
+        win.layer_column.set_collapsed(False)
+
+
+class TestPaletteGrid:
+    """パレットの色は間を空けず、方眼のように左上から詰めて並ぶ。"""
+
+    def test_swatches_touch_and_start_top_left(self, win):
+        cp = win.color_panel
+        cp._user_palettes["grid"] = ["#ff0000", "#00ff00", "#0000ff"]
+        try:
+            cp._load_palette("grid")
+            win.resize(1400, 900)
+            QApplication.processEvents()
+            sws = cp._palette_swatches
+            assert [sw.pos().y() for sw in sws] == [0, 0, 0]
+            assert sws[0].pos().x() == 0
+            assert sws[1].pos().x() == sws[0].pos().x() + sws[0].width()
+            assert sws[2].pos().x() == sws[1].pos().x() + sws[1].width()
+            # 外周の線は先頭のマスだけが左を、1行目だけが上を描く（線が二重にならない）
+            assert sws[0]._grid_edges == (True, True)
+            assert sws[1]._grid_edges == (False, True)
+        finally:
+            del cp._user_palettes["grid"]
+
+    def test_rows_wrap_without_gap(self, win):
+        cp = win.color_panel
+        cp._load_palette("基本色")
+        win.resize(1400, 900)
+        QApplication.processEvents()
+        sws = cp._palette_swatches
+        assert len(sws) > 12
+        assert sws[12].pos().y() == sws[0].height()
+        assert sws[12]._grid_edges == (True, False)

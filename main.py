@@ -13,8 +13,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QFileDialog,
                               QColorDialog, QLabel, QStatusBar, QMessageBox,
                               QDialog, QDialogButtonBox, QSlider, QFormLayout,
                               QSpinBox, QRadioButton, QButtonGroup, QGroupBox,
-                              QVBoxLayout, QSplitter, QPushButton, QCheckBox)
-from PyQt6.QtCore import Qt, QSize, QRect, QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QRectF, QEvent, pyqtSignal, QSettings, QTimer
+                              QVBoxLayout, QSplitter, QPushButton, QCheckBox,
+                              QSizePolicy)
+from PyQt6.QtCore import Qt, QSize, QRect, QPoint,QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QRectF, QEvent, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
                           QFont, QPainter, QIcon, QImageReader)
 
@@ -100,17 +101,44 @@ def _extract_line_mask(gray: np.ndarray, adaptive: bool, threshold: int,
     return mask
 
 
+def _extract_black_mask(bgr: np.ndarray, darkness: int, chroma: int,
+                        denoise: int) -> np.ndarray:
+    """カラー絵から「黒」の画素だけを線のマスク（線=255）にする。
+
+    明るさだけで判定すると、濃い青の髪や赤い影まで線として拾ってしまう。
+    黒は「暗い」かつ「色みが無い」ので、RGB の最大値（明るさ）と
+    最大値−最小値（色みの強さ）の両方で絞る。
+    """
+    b = bgr.astype(np.int16)
+    mx = b.max(axis=2)
+    mn = b.min(axis=2)
+    mask = ((mx <= darkness) & (mx - mn <= chroma)).astype(np.uint8) * 255
+    if denoise > 0:
+        ksize = int(denoise) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+
 class LineExtractionDialog(QDialog):
     """線画抽出ダイアログ。
-    色彩補正（彩度・コントラスト・明るさ）＋しきい値／適応的しきい値による
-    線の抽出＋ノイズ除去。リアルタイムプレビュー付き。"""
+    色彩補正（彩度・コントラスト・明るさ）＋しきい値／適応的しきい値／黒だけによる
+    線の抽出＋ノイズ除去。
 
-    PREVIEW_MAX = 400  # プレビュー画像の最大辺 px
+    結果はダイアログの中ではなく、クリスタと同じくキャンバスに原寸で映す
+    （preview_changed を受けた側が表示する）。ダイアログ内の縮小プレビューでは
+    大きな絵の細い線がつぶれて、抜け具合を判断できなかったため。
+    """
+
+    # キャンバスにかぶせる画像。None は「プレビューしない（元の絵を見せる）」
+    preview_changed = pyqtSignal(object)
+    # 元の絵に重ねるときの線の色。元の黒い線と区別がつくよう青にする
+    OVERLAY_COLOR = (255, 100, 30)  # BGR
 
     def __init__(self, source: QImage, parent=None):
         super().__init__(parent)
         self.setWindowTitle("線画抽出")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(420)
 
         # --- numpy BGR をあらかじめ作成 ---
         self._source = source
@@ -128,37 +156,48 @@ class LineExtractionDialog(QDialog):
             0, 255).astype(np.uint8)
         self._bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
 
-        # プレビュー用縮小スケール
-        scale = min(1.0, self.PREVIEW_MAX / max(sw, sh))
-        pw = max(1, int(sw * scale))
-        ph = max(1, int(sh * scale))
-        self._bgr_small = cv2.resize(self._bgr, (pw, ph), interpolation=cv2.INTER_AREA)
-        self._preview_size = (pw, ph)
-        # プレビューは縮小されているので、px 単位の設定も同じ比率で縮める。
-        # そうしないとプレビューと確定結果で見え方がずれる。
-        self._scale = scale
+        # スライダーを動かすたびに原寸で計算し直すと重い絵では引っかかるので、
+        # 手を止めてから少しだけ待って1回だけ作り直す
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(80)
+        self._preview_timer.timeout.connect(self._emit_preview)
 
         # --- レイアウト ---
         root = QVBoxLayout(self)
 
-        # プレビュー
-        self._preview_label = QLabel()
-        self._preview_label.setFixedSize(pw, ph)
-        self._preview_label.setStyleSheet("background:#888; border:1px solid #555;")
-        self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(self._preview_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        # --- プレビューの見せ方 ---
+        view_row = QHBoxLayout()
+        self._preview_check = QCheckBox("プレビュー")
+        self._preview_check.setChecked(True)
+        self._preview_check.setToolTip("外すと元の絵に戻して見比べられます")
+        self._overlay_check = QCheckBox("元の絵に重ねる（線を青で表示）")
+        view_row.addWidget(self._preview_check)
+        view_row.addWidget(self._overlay_check)
+        view_row.addStretch(1)
+        root.addLayout(view_row)
+        self._preview_check.toggled.connect(lambda _: self._emit_preview())
+        self._overlay_check.toggled.connect(lambda _: self._emit_preview())
+        view_hint = QLabel("結果はキャンバスに原寸で表示されます。Ctrl+ホイールで拡大縮小、"
+                           "ドラッグでスクロールして細部を確認できます。")
+        view_hint.setWordWrap(True)
+        view_hint.setStyleSheet("color:#666; font-size:11px;")
+        root.addWidget(view_hint)
 
         # --- 抽出方式 ---
         mode_box = QGroupBox("抽出方式")
         mode_layout = QVBoxLayout(mode_box)
         self._mode_fixed = QRadioButton("しきい値（イラスト・スキャン向け）")
         self._mode_adaptive = QRadioButton("自動（写真・照明ムラに強い）")
+        self._mode_black = QRadioButton("黒だけ（カラー絵から黒い線を抜く）")
         self._mode_fixed.setChecked(True)
         self._mode_group = QButtonGroup(self)
         self._mode_group.addButton(self._mode_fixed, 0)
         self._mode_group.addButton(self._mode_adaptive, 1)
+        self._mode_group.addButton(self._mode_black, 2)
         mode_layout.addWidget(self._mode_fixed)
         mode_layout.addWidget(self._mode_adaptive)
+        mode_layout.addWidget(self._mode_black)
         root.addWidget(mode_box)
 
         # --- 色彩補正 ---
@@ -169,6 +208,7 @@ class LineExtractionDialog(QDialog):
         self._brightness = self._add_slider(corr_form, "明るさ", -100, 100, 0, "")
         self._flatten = self._add_slider(corr_form, "紙のムラを除去", 0, 300, 0, "px")
         root.addWidget(corr_box)
+        self._corr_box = corr_box
 
         # --- 抽出設定 ---
         ext_box = QGroupBox("抽出")
@@ -179,6 +219,10 @@ class LineExtractionDialog(QDialog):
         self._sens_row = ext_form.rowCount() - 1
         self._block = self._add_slider(ext_form, "線を探す範囲", 3, 61, 21, "px")
         self._block_row = ext_form.rowCount() - 1
+        self._darkness = self._add_slider(ext_form, "黒とみなす暗さ", 0, 255, 80, "")
+        self._dark_row = ext_form.rowCount() - 1
+        self._chroma = self._add_slider(ext_form, "色みの許容", 0, 255, 24, "")
+        self._chroma_row = ext_form.rowCount() - 1
         self._denoise = self._add_slider(ext_form, "ノイズ除去", 0, 6, 0, "px")
         self._ext_form = ext_form
         root.addWidget(ext_box)
@@ -233,10 +277,21 @@ class LineExtractionDialog(QDialog):
     def _sync_mode(self):
         """抽出方式に応じて関係のないスライダーを隠す。"""
         adaptive = self.adaptive()
-        self._set_row_visible(self._ext_form, self._thresh_row, not adaptive)
+        black = self.black_only()
+        self._set_row_visible(self._ext_form, self._thresh_row, not adaptive and not black)
         self._set_row_visible(self._ext_form, self._sens_row, adaptive)
         self._set_row_visible(self._ext_form, self._block_row, adaptive)
-        if adaptive:
+        self._set_row_visible(self._ext_form, self._dark_row, black)
+        self._set_row_visible(self._ext_form, self._chroma_row, black)
+        # 黒だけ方式は元の色そのものを見るので、明るさをいじる下ごしらえは使わない
+        self._corr_box.setVisible(not black)
+        if black:
+            self._hint.setText(
+                "カラー絵の中の黒い部分だけを線として抽出します。暗くても色のついた"
+                "部分（濃い青の髪・赤い影など）は拾いません。「黒とみなす暗さ」を"
+                "上げると濃いグレーも拾い、「色みの許容」を上げると色が少し混ざった"
+                "黒（線のふちのにじみなど）も拾います。")
+        elif adaptive:
             self._hint.setText(
                 "周囲の明るさと比べて暗いところを線として抽出します。影や照明ムラが"
                 "あっても線だけを拾えます。感度を上げると濃い線だけ、下げると薄い線も"
@@ -256,6 +311,9 @@ class LineExtractionDialog(QDialog):
     def adaptive(self) -> bool:
         return self._mode_adaptive.isChecked()
 
+    def black_only(self) -> bool:
+        return self._mode_black.isChecked()
+
     def threshold(self) -> int:
         return self._thresh.value()
 
@@ -266,25 +324,41 @@ class LineExtractionDialog(QDialog):
         # ぼかし半径も px 指定なので、プレビューでは同じ比率に縮める。
         return _flatten_paper(gray, int(round(self._flatten.value() * scale)))
 
-    def _mask_for(self, bgr: np.ndarray, scale: float) -> np.ndarray:
+    def _mask_for(self, bgr: np.ndarray, scale: float = 1.0) -> np.ndarray:
+        denoise = int(round(self._denoise.value() * scale))
+        if self.black_only():
+            return _extract_black_mask(bgr, self._darkness.value(),
+                                       self._chroma.value(), denoise)
         gray = self._gray_for(bgr, scale)
         block = max(3, int(round(self._block.value() * scale)))
-        denoise = int(round(self._denoise.value() * scale))
         return _extract_line_mask(gray, self.adaptive(), self.threshold(),
                                   self._sensitivity.value(), block, denoise)
 
     def _update_preview(self):
-        pw, ph = self._preview_size
-        mask = self._mask_for(self._bgr_small, self._scale)
-        # プレビュー: 白背景 + 黒線
-        preview = np.full((ph, pw, 3), 255, dtype=np.uint8)
-        preview[mask > 0] = [0, 0, 0]
-        img = QImage(preview.tobytes(), pw, ph, pw * 3, QImage.Format.Format_RGB888).copy()
-        self._preview_label.setPixmap(QPixmap.fromImage(img))
+        self._preview_timer.start()
+
+    def preview_image(self) -> QImage | None:
+        """キャンバスにかぶせる原寸の画像。プレビューを切っていれば None。"""
+        if not self._preview_check.isChecked():
+            return None
+        mask = self._mask_for(self._bgr) > 0
+        h, w = mask.shape
+        bgra = np.zeros((h, w, 4), dtype=np.uint8)
+        if self._overlay_check.isChecked():
+            bgra[mask] = [*self.OVERLAY_COLOR, 255]
+        else:
+            # 線画だけを白い紙の上に（確定後に線画レイヤーだけを見たときと同じ見え方）
+            bgra[:] = [255, 255, 255, 255]
+            bgra[mask] = [0, 0, 0, 255]
+        return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+
+    def _emit_preview(self):
+        self._preview_timer.stop()
+        self.preview_changed.emit(self.preview_image())
 
     def extract(self) -> QImage:
         """フルサイズで線画を生成して返す。"""
-        mask = self._mask_for(self._bgr, 1.0)
+        mask = self._mask_for(self._bgr)
         h, w = mask.shape
         bgra = np.zeros((h, w, 4), dtype=np.uint8)
         bgra[mask > 0] = [0, 0, 0, 255]
@@ -1166,6 +1240,59 @@ class _CanvasPad(QWidget):
         self._canvas.move(margin, margin)
 
 
+class _SideColumn(QWidget):
+    """右側に並べるパネルの列。左端の細い帯を押すと、帯だけ残して右へたたむ。
+
+    たたんでもパネル自体は作り直さないので、選択中のレイヤーや色はそのまま。
+    """
+    STRIP_WIDTH = 26
+    # テーマの色を継ぐと明るいテーマで背景に溶けて、たたんだ列の在りかが分からなくなる。
+    # 帯だけはテーマによらず目立つ色に固定する
+    _STRIP_STYLE = (
+        "QPushButton { background: #4a5a78; color: #ffffff; font-weight: bold;"
+        " padding: 6px 0; border: none; border-left: 1px solid #2c3648; border-radius: 0; }"
+        "QPushButton:hover { background: #6680b0; }"
+        "QPushButton:pressed { background: #36435c; }")
+    collapsed_changed = pyqtSignal(bool)
+
+    def __init__(self, title: str, content: QWidget, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self.content = content
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        self.strip = QPushButton()
+        self.strip.setFixedWidth(self.STRIP_WIDTH)
+        self.strip.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.strip.setStyleSheet(self._STRIP_STYLE)
+        self.strip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.strip.clicked.connect(lambda: self.set_collapsed(not self.is_collapsed()))
+        hl.addWidget(self.strip)
+        hl.addWidget(content)
+        self._update_strip()
+
+    def is_collapsed(self) -> bool:
+        return self.content.isHidden()
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        if collapsed == self.is_collapsed():
+            return
+        self.content.setVisible(not collapsed)
+        self._update_strip()
+        self.collapsed_changed.emit(collapsed)
+
+    def _update_strip(self) -> None:
+        # 縦書きの見出し。たたんだ後も何の列か分かるようにする。
+        # 中身はどれも幅固定なので、列の幅もはっきり決めてキャンバスに残りを渡す
+        self.setFixedWidth(self.STRIP_WIDTH +
+                           (0 if self.is_collapsed() else self.content.minimumWidth()))
+        arrow = "◀" if self.is_collapsed() else "▶"
+        self.strip.setText(arrow + "\n" + "\n".join(self._title))
+        self.strip.setToolTip(f"{self._title}を" +
+                              ("開く" if self.is_collapsed() else "右へたたむ"))
+
+
 # 入り抜きの設定をどのツールのものとして扱うか
 _TAPER_TOOL_KEYS = {Tool.PEN: "pen", Tool.ERASER: "eraser"}
 
@@ -1199,6 +1326,9 @@ class MainWindow(QMainWindow):
         self.anim_panel.frames_changed.connect(self._mark_dirty)
         self.canvas._get_onion_images = self.anim_panel.get_onion_images
         self._anim_mode = False
+        # 開いている線画抽出ダイアログと、そのあいだ止めているメニュー項目
+        self._line_dialog = None
+        self._paused_actions: list[QAction] = []
 
         self._connect_signals()
         self._build_layout()
@@ -1571,27 +1701,34 @@ class MainWindow(QMainWindow):
 
         root.addWidget(center, 1)
 
-        # 右: ナビゲーター（上）＋ カラーパネル（中）＋ レイヤーパネル（下）
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.setFixedWidth(260)
-        right_splitter.setChildrenCollapsible(False)
-
+        # 右: 「ナビゲーター＋カラー」の列と「レイヤー」の列を横に並べる。
+        # 縦に積むとカラーを開いたときにレイヤーが押し出されて見えなくなるため、
+        # 列を分けてどちらも縦いっぱいに使う。使わない列は右へたためる。
         self.navigator = NavigatorPanel(self.layer_stack, self.canvas, self._scroll,
                                          content_widget=self._canvas_pad)
-        right_splitter.addWidget(self.navigator)
+        nav_color = QWidget()
+        nc_layout = QVBoxLayout(nav_color)
+        nc_layout.setContentsMargins(0, 0, 0, 0)
+        nc_layout.setSpacing(0)
+        nc_layout.addWidget(self.navigator)
+        nc_layout.addWidget(self.color_panel)
+        nc_layout.addStretch(1)
+        # カラーを全部開くと縦に収まらない画面もあるので、列ごとスクロールさせる
+        nc_scroll = QScrollArea()
+        nc_scroll.setWidget(nav_color)
+        nc_scroll.setWidgetResizable(True)
+        nc_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nc_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        nc_scroll.setFixedWidth(260 + nc_scroll.verticalScrollBar().sizeHint().width())
 
-        right_splitter.addWidget(self.color_panel)
-
-        right_splitter.addWidget(self.layer_panel)
-
-        right_splitter.setStretchFactor(0, 0)
-        right_splitter.setStretchFactor(1, 0)
-        right_splitter.setStretchFactor(2, 1)
-
-        # ナビゲーター・カラーパネルを小さめに固定し、残りをレイヤーパネルに割り当てる
-        right_splitter.setSizes([160, 260, 9999])
-
-        root.addWidget(right_splitter)
+        self.color_column = _SideColumn("ナビゲーター・カラー", nc_scroll)
+        self.layer_column = _SideColumn("レイヤー", self.layer_panel)
+        for key, col in (("color", self.color_column), ("layer", self.layer_column)):
+            col.set_collapsed(self._settings.value(f"layout/collapsed_{key}", False)
+                              in (True, "true"))
+            col.collapsed_changed.connect(
+                lambda v, key=key: self._settings.setValue(f"layout/collapsed_{key}", v))
+            root.addWidget(col)
 
     def _build_menus(self):
         # 並びとショートカットはクリップスタジオに寄せている。
@@ -1701,6 +1838,20 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self._grid_action)
         # 方眼は表示だけで絵には描き込まれないので、表示メニューに置く
         self._add_action(view_menu, "方眼の設定...", self._grid_settings)
+        view_menu.addSeparator()
+        # 右の帯を見失っても、メニューから必ず列を出し直せるようにする
+        self._column_actions: dict[str, QAction] = {}
+        for key, label, col, shortcut in (
+                ("color", "ナビゲーター・カラーを表示", self.color_column, "F6"),
+                ("layer", "レイヤーを表示", self.layer_column, "F7")):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(not col.is_collapsed())
+            act.setShortcut(QKeySequence(shortcut))
+            act.triggered.connect(lambda checked, c=col: c.set_collapsed(not checked))
+            col.collapsed_changed.connect(lambda v, a=act: a.setChecked(not v))
+            view_menu.addAction(act)
+            self._column_actions[key] = act
         view_menu.addSeparator()
         theme_menu = view_menu.addMenu("テーマ")
         self._theme_actions: dict[str, QAction] = {}
@@ -2587,9 +2738,48 @@ class MainWindow(QMainWindow):
         self.navigator.refresh()
 
     def _extract_line(self):
+        if self._line_dialog is not None:
+            self._line_dialog.raise_()
+            self._line_dialog.activateWindow()
+            return
+        self.canvas.reset_state()
         composite = self.layer_stack.composite()
         dialog = LineExtractionDialog(composite, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        # 結果はキャンバスに映すので、ダイアログを開いたままキャンバスを
+        # 拡大・スクロールできるようモードレスにする。そのあいだ絵を変える操作は止める
+        dialog.setModal(False)
+        dialog.preview_changed.connect(self.canvas.set_overlay_preview)
+        dialog.finished.connect(lambda code: self._finish_extract_line(dialog, code))
+        self._line_dialog = dialog
+        self._set_view_only(True)
+        # キャンバスを隠さないよう、左上（ツールバーの右）に寄せて出す
+        tl = self.mapToGlobal(QPoint(self._left_area.width() + 16, 60))
+        dialog.move(tl)
+        dialog.show()
+        dialog._emit_preview()
+
+    def _set_view_only(self, on: bool) -> None:
+        """線画抽出中は見る操作（ズーム・スクロール・ナビゲーター）だけを許す。"""
+        self.canvas.set_view_only(on)
+        if on:
+            # 絵を変えるショートカットがキャンバス経由で効かないよう、いったん全部止める
+            self._paused_actions = [a for a in self.findChildren(QAction) if a.isEnabled()]
+            for a in self._paused_actions:
+                a.setEnabled(False)
+        else:
+            for a in self._paused_actions:
+                a.setEnabled(True)
+            self._paused_actions = []
+        for w in (self.menuBar(), self._left_area, self.color_panel,
+                  self.layer_column, self.anim_panel):
+            w.setEnabled(not on)
+
+    def _finish_extract_line(self, dialog, code):
+        self._line_dialog = None
+        self.canvas.set_overlay_preview(None)
+        self._set_view_only(False)
+        dialog.deleteLater()
+        if code != QDialog.DialogCode.Accepted:
             return
         result = dialog.extract()
         self.canvas.reset_state()

@@ -652,6 +652,12 @@ class Canvas(QWidget):
         self._pan_start_widget: QPoint | None = None
         self._scroll_area = None  # main から注入
 
+        # 線画抽出などのダイアログが結果をキャンバスに映している間は「見るだけ」にする。
+        # 描けないかわりに、左ドラッグでスクロール・Ctrl+ホイールでズームができる
+        self._view_only = False
+        self._view_pan_global: QPointF | None = None
+        self._overlay_preview: QImage | None = None
+
         # drawing state
         self._last_pos: QPoint | None = None
         self._drawing = False
@@ -1432,6 +1438,8 @@ class Canvas(QWidget):
             p.setOpacity(1.0)
 
         p.drawImage(0, 0, self._composite_with_floating())
+        if self._overlay_preview is not None:
+            p.drawImage(0, 0, self._overlay_preview)
 
         if self._show_grid:
             self._draw_grid(p)
@@ -1504,7 +1512,8 @@ class Canvas(QWidget):
         self._draw_vector_handles(p)
 
         # ブラシカーソル円
-        if self._cursor_widget_pos is not None and self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR):
+        if (self._cursor_widget_pos is not None and not self._view_only
+                and self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR)):
             self._draw_cursor_circle(p)
 
         p.end()
@@ -2405,8 +2414,30 @@ class Canvas(QWidget):
         if callback and len(points) >= 1:
             callback(points)
 
+    def set_view_only(self, on: bool) -> None:
+        """見るだけモード。描画・選択はせず、左ドラッグはスクロールになる。"""
+        self._view_only = on
+        self._view_pan_global = None
+        if on:
+            self._cursor_widget_pos = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self._restore_tool_cursor()
+        self.update()
+
+    def set_overlay_preview(self, img: QImage | None) -> None:
+        """絵の上にかぶせて見せるだけの画像（キャンバスと同じ大きさ）。レイヤーには入らない。"""
+        self._overlay_preview = img
+        self.update()
+
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._view_only:
+            # ウィジェット座標はスクロールで一緒に動くので、画面上の位置で差を取る
+            self._view_pan_global = event.globalPosition()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
             return
 
         wp = event.position()
@@ -2777,6 +2808,17 @@ class Canvas(QWidget):
         wp = event.position()
         cp = self._widget_to_canvas(wp.toPoint())
         self.status_message.emit(f"x:{cp.x()}  y:{cp.y()}")
+        if self._view_only:
+            if self._view_pan_global is not None and self._scroll_area is not None:
+                g = event.globalPosition()
+                delta = g - self._view_pan_global
+                hbar = self._scroll_area.horizontalScrollBar()
+                vbar = self._scroll_area.verticalScrollBar()
+                hbar.setValue(hbar.value() - round(delta.x()))
+                vbar.setValue(vbar.value() - round(delta.y()))
+                self._view_pan_global = g
+            event.accept()
+            return
         # パンニング
         if self._panning and self._pan_start_widget is not None:
             if self._scroll_area is not None:
@@ -2899,6 +2941,11 @@ class Canvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._view_only:
+            self._view_pan_global = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
             return
         if self._size_drag is not None:
             self._size_drag = None
@@ -4497,6 +4544,10 @@ class Canvas(QWidget):
         return super().event(ev)
 
     def keyPressEvent(self, event):
+        if self._view_only:
+            # 見るだけのあいだはキーで絵や状態を変えない
+            event.ignore()
+            return
         # パスピックモード中のキー操作
         if self._path_pick_active:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
