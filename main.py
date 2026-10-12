@@ -1500,7 +1500,7 @@ class MainWindow(QMainWindow):
 
     def _connect_navigator(self):
         self.canvas.edited.connect(self._mark_dirty)
-        self.canvas.repainted.connect(self.navigator.refresh)
+        self.canvas.repainted.connect(self.navigator.schedule_refresh)
         self.layer_panel.layers_changed.connect(self.navigator.refresh)
         self.navigator.refresh()
 

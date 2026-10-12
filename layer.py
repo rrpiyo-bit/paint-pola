@@ -891,14 +891,78 @@ class LayerStack:
                 vals[2] = max(vals[2], ox + child.image.width())
                 vals[3] = max(vals[3], oy + child.image.height())
 
+    @staticmethod
+    def _render_key(items) -> tuple:
+        """合成結果を決める値をすべて集めたキー。
+
+        レイヤー画像の変更は Layer._effect_key() の cacheKey で拾う。
+        render_items が見る属性を増やしたときはここにも足すこと。
+        """
+        key = []
+        for it in items:
+            if it.is_group:
+                key.append(("g", id(it), it.visible, it.opacity, it.clipping,
+                            getattr(it, 'pass_through', False),
+                            LayerStack._render_key(it.children)))
+            else:
+                key.append(("l", id(it), it.visible, it.opacity, it.clipping,
+                            getattr(it, 'blend_mode', 'normal'),
+                            getattr(it, 'offset_x', 0), getattr(it, 'offset_y', 0),
+                            it._effect_key()))
+        return tuple(key)
+
     def composite(self, skip: object = None) -> QImage:
         """全レイヤーを合成する。skip を指定すると、そのトップレベルレイヤー
         （通常レイヤーのみ・クリッピングと無関係なもの）の描画だけを省略する
-        （ストローク中の背景キャッシュ用）。"""
+        （ストローク中の背景キャッシュ用）。
+
+        skip なしの結果は、何も変わっていなければ前回のものを返す。カーソル円や
+        選択範囲の点線を動かすだけの再描画で、毎回全レイヤーを合成し直さないため。
+        QImage は書き込み時に複製されるので、受け取った側が描き込んでも
+        キャッシュは壊れない。
+        """
+        if skip is None:
+            key = (self.width, self.height, self._render_key(self.layers))
+            cache = getattr(self, '_composite_cache', None)
+            if cache is None or cache[0] != key:
+                cache = (key, self._composite_uncached(None))
+                self._composite_cache = cache
+            # 同じ QImage オブジェクトを渡すと描き込みがキャッシュに及ぶので、
+            # 中身を共有する別オブジェクトにして返す（書いた時点で複製される）。
+            return QImage(cache[1])
+        return self._composite_uncached(skip)
+
+    def _composite_uncached(self, skip: object) -> QImage:
         result = QImage(self.width, self.height, QImage.Format.Format_ARGB32_Premultiplied)
         result.fill(Qt.GlobalColor.transparent)
         render_items(result, self.layers, 0, 0, skip)
         return result.convertToFormat(QImage.Format.Format_ARGB32)
+
+    def stroke_preview_parts(self, layer: object):
+        """ストローク中の表示用に、layer より下と上をそれぞれ合成して返す。
+
+        (下, 上) の組で、上に何も無ければ上は None。下・layer・上の順に普通に
+        重ねれば全体の合成と同じ見た目になる。上のレイヤーに合成モードや
+        通過フォルダがあると、下の絵しだいで色が変わるので分けられない。
+        その場合と can_fast_preview が False の場合は None。
+        """
+        if not self.can_fast_preview(layer):
+            return None
+        i = self.layers.index(layer)  # type: ignore
+        above = self.layers[:i]
+        for it in above:
+            if it.is_group:
+                if getattr(it, 'pass_through', False):
+                    return None
+            elif BLEND_KEY_TO_MODE.get(getattr(it, 'blend_mode', 'normal')):
+                return None
+        below_img = _premul_buffer(self.width, self.height)
+        render_items(below_img, self.layers[i + 1:])
+        above_img = None
+        if any(it.visible for it in above):
+            above_img = _premul_buffer(self.width, self.height)
+            render_items(above_img, above)
+        return below_img, above_img
 
     def can_fast_preview(self, layer: object) -> bool:
         """layer が単独で（クリッピングの授受なしに）差し替え描画できるトップレベル

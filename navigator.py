@@ -3,7 +3,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QScrollArea
 from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QTransform, QPixmap,
                          QBrush)
-from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, QSize, QTimer, pyqtSignal
 
 from layer import LayerStack
 
@@ -207,11 +207,27 @@ class NavigatorPanel(QWidget):
         self._scroll.horizontalScrollBar().valueChanged.connect(self._sync_frame)
         self._scroll.verticalScrollBar().valueChanged.connect(self._sync_frame)
 
+        # キャンバスの再描画ごとに全レイヤーを合成し直すと、描いている最中の
+        # 1フレームの半分以上をサムネイル作りに取られる。再描画からの更新は
+        # まとめて REFRESH_INTERVAL_MS に1回にする。
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(self.REFRESH_INTERVAL_MS)
+        self._refresh_timer.timeout.connect(self.refresh)
+
+    REFRESH_INTERVAL_MS = 250
+
     # ── public ───────────────────────────────────────────────────────────────
 
+    def schedule_refresh(self):
+        """近いうちに refresh する。続けて呼んでも、待っているあいだは
+        タイマーを延ばさない（描き続けていても一定間隔で更新されるように）。"""
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
     def refresh(self):
-        """描画・レイヤー変更後に呼ぶ。composite は canvas の paintEvent で既に生成済みなので
-        ここでは軽量な scaled のみ行う。"""
+        """描画・レイヤー変更後に呼ぶ。全レイヤーを合成して縮小する。"""
+        self._refresh_timer.stop()
         composite = self._canvas.layer_stack.composite()
 
         rot = self._canvas._rotation

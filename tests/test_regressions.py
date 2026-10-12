@@ -1260,3 +1260,132 @@ class TestPaletteGrid:
         assert len(sws) > 12
         assert sws[12].pos().y() == sws[0].height()
         assert sws[12]._grid_edges == (True, False)
+
+
+class TestLongSessionSpeed:
+    """描き続けてもだんだん重くならないこと。"""
+
+    def _pen(self, win):
+        c = win.canvas
+        c.tool = Tool.PEN
+        c.pen_color = QColor(255, 0, 0)
+        c.pen_size = 6
+        return c
+
+    def test_history_keeps_only_changed_area_and_undo_redo_exact(self, win):
+        """描画の履歴はレイヤー丸ごとではなく変わった範囲だけを持ち、
+        それでも取り消し・やり直しで元の絵にぴったり戻る。"""
+        c = self._pen(win)
+        lyr = new_layer(win)
+        states = [lyr.image.copy()]
+        for i in range(3):
+            drag(c, [(100 + i * 40, 100), (120 + i * 40, 140), (130 + i * 40, 160)])
+            states.append(lyr.image.copy())
+        drag(c, [(400, 400), (420, 420)])
+        states.append(lyr.image.copy())
+
+        full = lyr.image.sizeInBytes()
+        # 縮めるのは次の履歴を積むとき。最後の1件だけは丸ごとのまま
+        assert [e[0] for e in c._history] == ["patch"] * 3 + ["pixel"]
+        patches = c._history[:-1]
+        assert all(c._entry_bytes(e) < full / 20 for e in patches)
+
+        for want in reversed(states[:-1]):
+            c.undo()
+            assert lyr.image == want
+        for want in states[1:]:
+            c.redo()
+            assert lyr.image == want
+
+    def test_composite_reused_until_something_changes(self, win):
+        ls = win.layer_stack
+        lyr = new_layer(win)
+        first = ls.composite()
+        assert ls.composite().cacheKey() == first.cacheKey()
+
+        fill(lyr.image, QRect(0, 0, 10, 10), QColor(0, 0, 255))
+        second = ls.composite()
+        assert second.cacheKey() != first.cacheKey()
+        assert QColor(second.pixel(5, 5)) == QColor(0, 0, 255)
+
+        lyr.visible = False
+        assert QColor(ls.composite().pixel(5, 5)) != QColor(0, 0, 255)
+        lyr.visible = True
+        lyr.opacity = 0
+        assert QColor(ls.composite().pixel(5, 5)) != QColor(0, 0, 255)
+
+        # 受け取った側が描き込んでもキャッシュは汚れない
+        lyr.opacity = 255
+        got = ls.composite()
+        fill(got, QRect(0, 0, 10, 10), QColor(0, 255, 0))
+        assert QColor(ls.composite().pixel(5, 5)) == QColor(0, 0, 255)
+
+    def test_navigator_not_rebuilt_on_every_repaint(self, win, monkeypatch):
+        nav = win.navigator
+        calls = []
+        orig = type(nav).refresh
+        monkeypatch.setattr(type(nav), "refresh",
+                            lambda self: (calls.append(1), orig(self)))
+        nav._refresh_timer.timeout.disconnect()
+        nav._refresh_timer.timeout.connect(nav.refresh)
+        for _ in range(20):
+            win.canvas.repainted.emit()
+        assert calls == []
+        assert nav._refresh_timer.isActive()
+        assert nav._refresh_timer.interval() == nav.REFRESH_INTERVAL_MS
+        for _ in range(100):
+            if calls:
+                break
+            QTest.qWait(30)
+        assert calls  # 少し待てば反映される
+
+    def test_stroke_on_lower_layer_stays_under_upper_layer(self, win):
+        """下のレイヤーに描いている最中も、線が上のレイヤーの上に出ない。"""
+        c = self._pen(win)
+        c.pen_size = 30
+        lower = new_layer(win, "下")
+        upper = new_layer(win, "上")
+        fill(upper.image, upper.image.rect(), QColor(0, 200, 0))
+        win.layer_stack.active_path = [win.layer_stack.layers.index(lower)]
+
+        def ev(typ, x, y, btns):
+            wp = c._c2w().map(QPointF(x, y))
+            return QMouseEvent(typ, wp, Qt.MouseButton.LeftButton, btns,
+                               Qt.KeyboardModifier.NoModifier)
+        c.mousePressEvent(ev(QEvent.Type.MouseButtonPress, 200, 200, Qt.MouseButton.LeftButton))
+        for i in range(10):
+            c.mouseMoveEvent(ev(QEvent.Type.MouseMove, 200 + i * 10, 200, Qt.MouseButton.LeftButton))
+        assert c._stroke_bg_cache is not None
+        shown = c._composite_with_floating()
+        c.mouseReleaseEvent(ev(QEvent.Type.MouseButtonRelease, 290, 200, Qt.MouseButton.NoButton))
+        assert QColor(lower.image.pixel(250, 200)).red() == 255
+        assert shown == win.layer_stack.composite()
+
+    def test_preview_parts_match_full_composite(self, win):
+        """下・描いているレイヤー・上を重ねた絵が、全体の合成と一致する。"""
+        ls = win.layer_stack
+        lower = new_layer(win, "下")
+        fill(lower.image, QRect(0, 0, 60, 60), QColor(255, 0, 0, 160))
+        mid = new_layer(win, "中")
+        fill(mid.image, QRect(20, 20, 60, 60), QColor(0, 0, 255, 200))
+        mid.opacity = 180
+        top = new_layer(win, "上")
+        fill(top.image, QRect(40, 0, 60, 60), QColor(0, 200, 0, 120))
+        below, above = ls.stroke_preview_parts(mid)
+        out = QImage(below)
+        p = QPainter(out)
+        p.setOpacity(mid.opacity / 255)
+        p.drawImage(0, 0, mid.image)
+        p.setOpacity(1.0)
+        p.drawImage(0, 0, above)
+        p.end()
+        out = out.convertToFormat(QImage.Format.Format_ARGB32)
+        full = ls.composite()
+        for x, y in [(10, 10), (30, 30), (50, 10), (70, 50), (90, 30)]:
+            a, b = QColor(out.pixel(x, y)), QColor(full.pixel(x, y))
+            assert max(abs(a.red() - b.red()), abs(a.green() - b.green()),
+                       abs(a.blue() - b.blue()), abs(a.alpha() - b.alpha())) <= 2, (x, y)
+
+        # 上に合成モードのレイヤーがあると分けられない
+        top.blend_mode = "multiply"
+        assert ls.stroke_preview_parts(mid) is None

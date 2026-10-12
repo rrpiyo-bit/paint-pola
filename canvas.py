@@ -246,6 +246,34 @@ def _alpha_array(img: QImage) -> np.ndarray:
     return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4)[:, :, 3].copy()
 
 
+def _changed_rect(before: QImage, after: QImage) -> QRect | None:
+    """2枚の画像で画素が違う範囲を囲む矩形を返す。
+
+    同じなら空の QRect、大きさや形式が違って比べられないなら None。
+    constBits で読むので、after（レイヤー画像）の cacheKey は変わらない。
+    """
+    if (before.size() != after.size() or before.format() != after.format()
+            or before.depth() != 32):
+        return None
+    w, h = after.width(), after.height()
+    if w == 0 or h == 0:
+        return QRect()
+
+    def _view(img):
+        bpl = img.bytesPerLine()
+        ptr = img.constBits()
+        ptr.setsize(h * bpl)
+        return np.frombuffer(ptr, dtype=np.uint32).reshape(h, bpl // 4)[:, :w]
+
+    diff = _view(before) != _view(after)
+    rows = np.flatnonzero(diff.any(axis=1))
+    if rows.size == 0:
+        return QRect()
+    cols = np.flatnonzero(diff[rows[0]:rows[-1] + 1].any(axis=0))
+    return QRect(int(cols[0]), int(rows[0]),
+                 int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1))
+
+
 def _shifted_image(img: QImage, size, shift) -> QImage:
     """img を shift だけずらして、size の透明な画像に置いたものを返す。"""
     out = QImage(size, QImage.Format.Format_ARGB32)
@@ -669,6 +697,8 @@ class Canvas(QWidget):
         # ストローク開始時に「描画中レイヤー以外」の合成結果を1回だけ作り、
         # ドラッグ中はそれに描画中レイヤーだけを重ねて使い回す。
         self._stroke_bg_cache: QImage | None = None
+        # 描いているレイヤーより上の合成（無ければ None）
+        self._stroke_fg_cache: QImage | None = None
         self._stroke_layer: object = None
 
         # selection
@@ -989,16 +1019,19 @@ class Canvas(QWidget):
         """ストローク開始時に「描画中レイヤー以外」の合成結果をキャッシュする。
         クリッピング等が絡み安全に省略できない場合はキャッシュしない
         （その場合 paintEvent は毎回フル合成にフォールバックする）。"""
-        if self.layer_stack.can_fast_preview(layer):
+        parts = self.layer_stack.stroke_preview_parts(layer)
+        if parts is not None:
             self._stroke_layer = layer
-            self._stroke_bg_cache = self.layer_stack.composite(skip=layer)
+            self._stroke_bg_cache, self._stroke_fg_cache = parts
         else:
             self._stroke_layer = None
             self._stroke_bg_cache = None
+            self._stroke_fg_cache = None
 
     def _end_stroke_cache(self) -> None:
         self._stroke_layer = None
         self._stroke_bg_cache = None
+        self._stroke_fg_cache = None
 
     # ── 選択範囲による描画のマスク ────────────────────────────────────────────
 
@@ -1139,6 +1172,10 @@ class Canvas(QWidget):
             img = entry[2]
             return img.sizeInBytes() if hasattr(img, "sizeInBytes") else 0
 
+        if entry[0] == "patch":
+            img = entry[3]
+            return img.sizeInBytes() if hasattr(img, "sizeInBytes") else 0
+
         if entry[0] == "vector":
             # 線は点の並びなので画像よりずっと軽い。1点あたり 24 バイト見当。
             return sum(len(s.points) * 24 for s in entry[2])
@@ -1161,11 +1198,37 @@ class Canvas(QWidget):
         while len(self._history) > HISTORY_MIN_ENTRIES and total > HISTORY_MEMORY_LIMIT:
             total -= self._entry_bytes(self._history.pop(0))
 
+    def _compact_history_top(self):
+        """末尾の "pixel" 履歴を、変わった範囲だけの "patch" に縮める。
+
+        "pixel" はレイヤー画像まるごとの控えなので、大きなキャンバスでは1件
+        25MB にもなる。描くたびに積むと 1GB 近くまで膨らみ、だんだん重くなる。
+        積んだ時点では何が変わるか分からないので、次の履歴を積むときに
+        今の画像と比べて、変わった矩形だけを残す。
+        大きさ・位置・形式が変わっていて比べられないときはそのまま残す。
+        """
+        if not self._history or self._history[-1][0] != "pixel":
+            return
+        entry = self._history[-1]
+        lid, before = entry[1], entry[2]
+        ox = entry[3] if len(entry) > 3 else 0
+        oy = entry[4] if len(entry) > 4 else 0
+        layer = self._find_layer_by_id(lid)
+        if layer is None or layer.is_group or layer.is_vector:
+            return
+        if (getattr(layer, 'offset_x', 0), getattr(layer, 'offset_y', 0)) != (ox, oy):
+            return
+        rect = _changed_rect(before, layer.image)  # type: ignore
+        if rect is None:
+            return
+        self._history[-1] = ("patch", lid, rect, before.copy(rect), ox, oy)
+
     def _save_history(self):
         lid = self._layer_id()
         layer = self.layer_stack.active
         if lid is None or layer is None:
             return
+        self._compact_history_top()
         ox = getattr(layer, 'offset_x', 0)
         oy = getattr(layer, 'offset_y', 0)
         if layer.is_vector:
@@ -1397,6 +1460,22 @@ class Canvas(QWidget):
                 layer.image = img
                 layer.offset_x = old_ox
                 layer.offset_y = old_oy
+            elif entry[0] == "patch":
+                _, lid, rect, img, old_ox, old_oy = entry
+                layer = self._find_layer_by_id(lid)
+                if (layer is None or layer.is_group or layer.is_vector
+                        or not layer.image.rect().contains(rect)  # type: ignore
+                        and not rect.isEmpty()):
+                    continue
+                dst.append(("patch", lid, rect, layer.image.copy(rect),  # type: ignore
+                            layer.offset_x, layer.offset_y))  # type: ignore
+                if not rect.isEmpty():
+                    p = QPainter(layer.image)  # type: ignore
+                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+                    p.drawImage(rect.topLeft(), img)
+                    p.end()
+                layer.offset_x = old_ox  # type: ignore
+                layer.offset_y = old_oy  # type: ignore
             elif entry[0] == "structure":
                 _, snap = entry
                 dst.append(("structure", {
@@ -1437,7 +1516,8 @@ class Canvas(QWidget):
                 p.drawImage(0, 0, onion_img)
             p.setOpacity(1.0)
 
-        p.drawImage(0, 0, self._composite_with_floating())
+        if not self._paint_stroke_layers(p):
+            p.drawImage(0, 0, self._composite_with_floating())
         if self._overlay_preview is not None:
             p.drawImage(0, 0, self._overlay_preview)
 
@@ -1763,6 +1843,27 @@ class Canvas(QWidget):
                             QImage.Format.Format_ARGB32).copy()
         return result_img, bb_min_x, bb_min_y
 
+    def _paint_stroke_layers(self, p: QPainter) -> bool:
+        """ストローク中、背景キャッシュと描いているレイヤーを画面へ直接重ねる。
+
+        通常の合成モードなら「キャッシュに重ねてから画面へ」と「画面へ
+        キャッシュ、その上にレイヤー」は同じ見た目になる。毎フレーム
+        キャンバス大の画像を複製せずに済む。できない場合は False。
+        """
+        layer = self._stroke_layer
+        if (self._stroke_bg_cache is None or layer is None
+                or (self._transform_image and self._transform_rect)
+                or BLEND_KEY_TO_MODE.get(getattr(layer, 'blend_mode', 'normal'))):
+            return False
+        p.drawImage(0, 0, self._stroke_bg_cache)
+        p.setOpacity(layer.opacity / 255)  # type: ignore
+        p.drawImage(getattr(layer, 'offset_x', 0), getattr(layer, 'offset_y', 0),
+                    layer.image_with_effects())  # type: ignore
+        p.setOpacity(1.0)
+        if self._stroke_fg_cache is not None:
+            p.drawImage(0, 0, self._stroke_fg_cache)
+        return True
+
     def _composite_with_floating(self) -> QImage:
         """レイヤー合成結果にフローティング画像を重ねた最終画像を返す。
         変形中は元の切り取り領域を消した状態でフローティング画像を合成して
@@ -1779,8 +1880,12 @@ class Canvas(QWidget):
                 ox = getattr(layer, 'offset_x', 0)
                 oy = getattr(layer, 'offset_y', 0)
                 p.drawImage(ox, oy, layer.image_with_effects())  # type: ignore
+                if self._stroke_fg_cache is not None:
+                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                    p.setOpacity(1.0)
+                    p.drawImage(0, 0, self._stroke_fg_cache)
                 p.end()
-                return result
+                return result.convertToFormat(QImage.Format.Format_ARGB32)
             return self.layer_stack.composite()
 
         # 変形元レイヤーから切り取り領域を消去したプレビュー用合成を作る
