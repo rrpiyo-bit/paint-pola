@@ -1472,6 +1472,10 @@ class MainWindow(QMainWindow):
             lambda v: setattr(self.canvas, 'pen_transparent', bool(v)))
         self.tool_options.eraser_soft_toggled.connect(
             lambda v: self._set_tool_setting("eraser_soft", bool(v)))
+        self.tool_options.pen_antialias_toggled.connect(
+            lambda v: self._set_tool_setting("pen_antialias", bool(v)))
+        self.tool_options.eraser_antialias_toggled.connect(
+            lambda v: self._set_tool_setting("eraser_antialias", bool(v)))
         self.tool_options.fill_tolerance_changed.connect(
             lambda v: self._set_tool_setting("fill_tolerance", int(v)))
         self.tool_options.text_font_changed.connect(
@@ -1535,6 +1539,7 @@ class MainWindow(QMainWindow):
     # 次回起動時も同じ値で始める道具の設定（キャンバスの属性名 → 型）
     _SAVED_TOOL_SETTINGS = {
         "pen_opacity": int, "eraser_soft": bool, "fill_tolerance": int,
+        "pen_antialias": bool, "eraser_antialias": bool,
         "text_font_family": str, "text_size": int,
     }
 
@@ -1609,6 +1614,8 @@ class MainWindow(QMainWindow):
             pen_opacity=self.canvas.pen_opacity,
             pen_transparent=self.canvas.pen_transparent,
             eraser_soft=self.canvas.eraser_soft,
+            pen_antialias=self.canvas.pen_antialias,
+            eraser_antialias=self.canvas.eraser_antialias,
             fill_tolerance=self.canvas.fill_tolerance,
             text_font=self.canvas.text_font_family,
             text_size=self.canvas.text_size,

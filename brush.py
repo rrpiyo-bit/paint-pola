@@ -31,12 +31,17 @@ def _lerp_points(a: QPoint, b: QPoint, step: float = 1.0) -> list[QPointF]:
 class BrushBase(ABC):
     @abstractmethod
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int) -> None:
-        """a → b へのストロークを img に描画する。"""
+                  color: QColor, size: int, antialias: bool = True) -> None:
+        """a → b へのストロークを img に描画する。
 
-    def stamp(self, img: QImage, pt: QPoint, color: QColor, size: int) -> None:
+        antialias=False なら線のふちをぼかさない（画素が「塗る／塗らない」の
+        どちらかになる）。ドット絵や、塗りつぶしで隙間を残したくない線画用。
+        ふちそのものがぼかしのブラシ（ソフト・ぼかし）は無視する。
+        """
+
+    def stamp(self, img: QImage, pt: QPoint, color: QColor, size: int, antialias: bool = True) -> None:
         """1点だけ描画。デフォルトは stroke_to(pt, pt)。"""
-        self.stroke_to(img, pt, pt, color, size)
+        self.stroke_to(img, pt, pt, color, size, antialias)
 
 
 # ── 丸ペン（デフォルト） ──────────────────────────────────────────────────────
@@ -44,9 +49,9 @@ class BrushBase(ABC):
 class RoundBrush(BrushBase):
     """アンチエイリアス付きの基本丸ペン。"""
 
-    def stamp(self, img: QImage, pt: QPoint, color: QColor, size: int) -> None:
+    def stamp(self, img: QImage, pt: QPoint, color: QColor, size: int, antialias: bool = True) -> None:
         p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, antialias)
         pen = QPen(color, size, Qt.PenStyle.SolidLine,
                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
@@ -54,9 +59,9 @@ class RoundBrush(BrushBase):
         p.end()
 
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int) -> None:
+                  color: QColor, size: int, antialias: bool = True) -> None:
         p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, antialias)
         pen = QPen(color, size, Qt.PenStyle.SolidLine,
                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
@@ -70,7 +75,7 @@ class SoftBrush(BrushBase):
     """中心が濃く周辺が薄いグラデーション円。重ね塗りで自然に濃くなる。"""
 
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int) -> None:
+                  color: QColor, size: int, antialias: bool = True) -> None:
         step = max(1.0, size * 0.15)
         pts = _lerp_points(a, b, step)
         p = QPainter(img)
@@ -99,10 +104,10 @@ class SprayBrush(BrushBase):
         self._density = density  # 1ストロークあたりの粒数
 
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int) -> None:
+                  color: QColor, size: int, antialias: bool = True) -> None:
         pts = _lerp_points(a, b, max(1.0, size * 0.3))
         p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, antialias)
         dot_color = QColor(color)
         dot_color.setAlpha(max(30, color.alpha() // 4))
         p.setPen(Qt.PenStyle.NoPen)
@@ -126,9 +131,9 @@ class MarkerBrush(BrushBase):
     """半透明の幅広フラットペン。重ね塗りでエッジが際立つ。"""
 
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int) -> None:
+                  color: QColor, size: int, antialias: bool = True) -> None:
         p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, antialias)
         c = QColor(color)
         c.setAlpha(min(255, int(color.alpha() * 0.55)))
         pen = QPen(c, size, Qt.PenStyle.SolidLine,
@@ -148,7 +153,7 @@ class BlurBrush(BrushBase):
         self.strength = max(0.0, min(1.0, strength))
 
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int) -> None:
+                  color: QColor, size: int, antialias: bool = True) -> None:
         import numpy as np
         import cv2
 
@@ -250,8 +255,8 @@ class StabilizedBrush(BrushBase):
         return out
 
     def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int) -> None:
-        self.inner.stroke_to(img, a, b, color, size)
+                  color: QColor, size: int, antialias: bool = True) -> None:
+        self.inner.stroke_to(img, a, b, color, size, antialias)
 
 
 # ── ブラシレジストリ ──────────────────────────────────────────────────────────

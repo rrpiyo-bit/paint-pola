@@ -657,6 +657,10 @@ class Canvas(QWidget):
         self.text_size: int = 40
         # 消しゴムのふちをぼかす
         self.eraser_soft: bool = False
+        # アンチエイリアス（線のふちのぼかし）。外すと画素が「描く／描かない」の
+        # どちらかになる。既定は今までの見た目（ペンはあり、消しゴムはなし）。
+        self.pen_antialias: bool = True
+        self.eraser_antialias: bool = False
         # Ctrl+ドラッグでブラシサイズを変えている途中の状態
         self._size_drag: dict | None = None
         self.select_mode: str = "select"  # "select" | "transform"
@@ -3302,38 +3306,55 @@ class Canvas(QWidget):
         """ブラシで1点描画（対称定規対応）。size 省略時はペンの太さ。"""
         size = self.pen_size if size is None else size
         brush = get_brush(self.brush_type)
-        brush.stamp(img, pt, self.pen_color, size)
+        aa = self.pen_antialias
+        brush.stamp(img, pt, self.pen_color, size, aa)
         if self.symmetry_enabled:
-            brush.stamp(img, self._mirror_x(pt), self.pen_color, size)
+            brush.stamp(img, self._mirror_x(pt), self.pen_color, size, aa)
 
     def _brush_stroke(self, img: QImage, a: QPoint, b: QPoint, size: float | None = None):
         """ブラシでストローク描画（対称定規対応）。size 省略時はペンの太さ。"""
         size = self.pen_size if size is None else size
         brush = get_brush(self.brush_type)
-        brush.stroke_to(img, a, b, self.pen_color, size)
+        aa = self.pen_antialias
+        brush.stroke_to(img, a, b, self.pen_color, size, aa)
         if self.symmetry_enabled:
             brush.stroke_to(img, self._mirror_x(a), self._mirror_x(b),
-                            self.pen_color, size)
+                            self.pen_color, size, aa)
 
     def _erase_point(self, img: QImage, p: QPoint, size: float | None = None):
         if self.eraser_soft:
             self._soft_erase(img, p, p, size)
             return
-        painter = QPainter(img)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-        painter.setPen(QPen(Qt.GlobalColor.transparent,
+        painter = self._eraser_painter(img)
+        painter.setPen(QPen(painter.pen().color(),
                             self.eraser_size if size is None else size,
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawPoint(p)
         painter.end()
 
+    def _eraser_painter(self, img: QImage) -> QPainter:
+        """消しゴム用の painter。アンチエイリアスありなら、ふちを少しだけ消す。
+
+        Clear は覆った割合に関係なく画素を丸ごと消すので、ふちをなめらかに
+        するときは不透明な色を DestinationOut で重ねる（覆った割合だけ薄くなる）。
+        """
+        painter = QPainter(img)
+        if self.eraser_antialias:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_DestinationOut)
+            painter.setPen(QColor(0, 0, 0, 255))
+        else:
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.setPen(QColor(Qt.GlobalColor.transparent))
+        return painter
+
     def _erase_line(self, img: QImage, a: QPoint, b: QPoint, size: float | None = None):
         if self.eraser_soft:
             self._soft_erase(img, a, b, size)
             return
-        painter = QPainter(img)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-        painter.setPen(QPen(Qt.GlobalColor.transparent,
+        painter = self._eraser_painter(img)
+        painter.setPen(QPen(painter.pen().color(),
                             self.eraser_size if size is None else size,
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                             Qt.PenJoinStyle.RoundJoin))

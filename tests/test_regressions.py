@@ -1389,3 +1389,108 @@ class TestLongSessionSpeed:
         # 上に合成モードのレイヤーがあると分けられない
         top.blend_mode = "multiply"
         assert ls.stroke_preview_parts(mid) is None
+
+
+def alphas(img):
+    """画像に出てくるアルファ値の集合。"""
+    import numpy as np
+    a = img.convertToFormat(QImage.Format.Format_ARGB32)
+    ptr = a.constBits()
+    ptr.setsize(a.height() * a.bytesPerLine())
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(a.height(), a.bytesPerLine())
+    return set(np.unique(arr[:, 3:a.width() * 4:4]).tolist())
+
+
+class TestAntialias:
+    """ペン・消しゴムのアンチエイリアス（ふちのぼかし）を切り替えられる。"""
+
+    STROKE = [(100, 100), (160, 130), (230, 110), (300, 190)]
+
+    def _pen(self, win, aa):
+        c = win.canvas
+        c.set_stabilization(0)
+        c.tool = Tool.PEN
+        c.pen_color = QColor(0, 0, 0)
+        c.pen_size = 9
+        c.pen_antialias = aa
+        return c
+
+    def test_pen_edges(self, win):
+        c = self._pen(win, True)
+        lyr = new_layer(win)
+        drag(c, self.STROKE)
+        assert len(alphas(lyr.image) - {0, 255}) > 0
+
+        c = self._pen(win, False)
+        lyr = new_layer(win)
+        drag(c, self.STROKE)
+        click(c, 400, 400)
+        assert alphas(lyr.image) == {0, 255}
+
+    def test_pen_off_with_taper_symmetry_and_marker(self, win):
+        """入り抜き・対称定規・ほかのブラシでも、外せばふちがぼけない。"""
+        c = self._pen(win, False)
+        c.set_taper("pen", "in", 40)
+        c.set_taper("pen", "out", 40)
+        c.symmetry_enabled = True
+        lyr = new_layer(win)
+        drag(c, self.STROKE)
+        assert alphas(lyr.image) == {0, 255}
+
+        # マーカーは重ねると濃くなるので、1本だけ引いて確かめる
+        from brush import get_brush
+        for key in ("marker",):
+            img = QImage(200, 200, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(Qt.GlobalColor.transparent)
+            get_brush(key).stroke_to(img, QPoint(20, 30), QPoint(170, 140),
+                                     QColor(0, 0, 0), 9, False)
+            assert len(alphas(img)) == 2, key
+
+    def test_pen_off_with_opacity(self, win):
+        """不透明度を下げても、線の中は1つの濃さだけ。"""
+        c = self._pen(win, False)
+        c.pen_opacity = 50
+        lyr = new_layer(win)
+        drag(c, self.STROKE)
+        assert len(alphas(lyr.image)) == 2
+
+    def test_eraser_edges(self, win):
+        c = win.canvas
+        c.set_stabilization(0)
+        c.tool = Tool.ERASER
+        c.eraser_size = 15
+        for aa in (False, True):
+            lyr = new_layer(win)
+            fill(lyr.image, QRect(0, 0, 400, 400), QColor(0, 0, 255))
+            c.eraser_antialias = aa
+            drag(c, self.STROKE)
+            assert px(lyr, 160, 130).alpha() == 0
+            partial = alphas(lyr.image.copy(QRect(0, 0, 400, 400))) - {0, 255}
+            assert bool(partial) is aa
+
+    def test_option_shown_and_saved(self, win):
+        from PyQt6.QtWidgets import QCheckBox
+        saved = {}
+        class FakeSettings:
+            def setValue(self, k, v): saved[k] = v
+            def value(self, k, d=None): return saved.get(k, d)
+        win._settings = FakeSettings()
+        for tool, attr in ((Tool.PEN, "pen_antialias"), (Tool.ERASER, "eraser_antialias")):
+            win.canvas.tool = tool
+            win._refresh_tool_options()
+            boxes = [w for w in win.tool_options._widgets
+                     if isinstance(w, QCheckBox) and w.text().startswith("アンチエイリアス")]
+            assert len(boxes) == 1
+            box = boxes[0]
+            assert box.isChecked() is getattr(win.canvas, attr)
+            box.setChecked(not box.isChecked())
+            assert getattr(win.canvas, attr) is box.isChecked()
+            assert saved[f"tool/{attr}"] is box.isChecked()
+
+        win.canvas.pen_antialias = True
+        win.canvas.eraser_antialias = False
+        saved["tool/pen_antialias"] = "false"
+        saved["tool/eraser_antialias"] = "true"
+        win._restore_tool_settings()
+        assert win.canvas.pen_antialias is False
+        assert win.canvas.eraser_antialias is True

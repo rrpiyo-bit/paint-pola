@@ -89,6 +89,8 @@ class ToolOptionsPanel(QWidget):
     pen_opacity_changed   = pyqtSignal(int)   # ペンの不透明度 (1〜100 %)
     pen_transparent_toggled = pyqtSignal(bool)  # 透明色で描く
     eraser_soft_toggled   = pyqtSignal(bool)  # ふちをぼかして消す
+    pen_antialias_toggled = pyqtSignal(bool)     # 線のふちをなめらかに
+    eraser_antialias_toggled = pyqtSignal(bool)  # 消したふちをなめらかに
     fill_tolerance_changed = pyqtSignal(int)  # バケツ塗りの色の誤差 (%)
     text_font_changed     = pyqtSignal(str)   # テキストのフォント名
     text_size_changed     = pyqtSignal(int)   # テキストの文字サイズ (px)
@@ -190,6 +192,8 @@ class ToolOptionsPanel(QWidget):
                  pen_opacity: int = 100,
                  pen_transparent: bool = False,
                  eraser_soft: bool = False,
+                 pen_antialias: bool = True,
+                 eraser_antialias: bool = False,
                  fill_tolerance: int = 0,
                  text_font: str = "Arial",
                  text_size: int = 40):
@@ -232,6 +236,12 @@ class ToolOptionsPanel(QWidget):
                              lambda v: self.pen_transparent_toggled.emit(v),
                              tooltip="ペンで描いた所が消えます。\n"
                                      "ブラシの形・不透明度のまま消したいとき用。")
+            self._add_toggle("アンチエイリアス（ふちをなめらかに）", pen_antialias,
+                             lambda v: self.pen_antialias_toggled.emit(v),
+                             tooltip="線のふちを少しぼかして、ギザギザを目立たなくします。\n"
+                                     "外すと、ふちがくっきりした線になります\n"
+                                     "（ドット絵や、バケツ塗りで線の際に隙間を残したくないとき）。\n"
+                                     "ソフトブラシは元からふちがぼけるので変わりません。")
             self._add_stabilization(stabilization)
             self._add_taper(taper)
             self._add_brush_combo(brush_key)
@@ -250,6 +260,11 @@ class ToolOptionsPanel(QWidget):
                              lambda v: self.eraser_soft_toggled.emit(v),
                              tooltip="ふちほど弱く消えるので、\n"
                                      "影やグラデーションを薄くするのに向いています。")
+            self._add_toggle("アンチエイリアス（ふちをなめらかに）", eraser_antialias,
+                             lambda v: self.eraser_antialias_toggled.emit(v),
+                             tooltip="消した所のふちを少しぼかして、ギザギザを目立たなくします。\n"
+                                     "外すと、ふちがくっきり消えます（ドット絵向け）。\n"
+                                     "ソフトにしているときは効きません。")
             self._add_stabilization(stabilization)
             self._add_taper(taper)
 
