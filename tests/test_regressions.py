@@ -210,10 +210,13 @@ class TestNewDocument:
                 return (800, 600)
 
         monkeypatch.setattr(M, "NewCanvasDialog", FakeDlg)
-        win.anim_panel.frames.append(win.layer_stack.composite())
+        import anim
+        win.anim_panel._on_new_folder()
+        anim.set_length(win.layer_stack, 20)
         win._new()
         assert win._status_canvas_size.text() == "800 x 600 px"
-        assert len(win.anim_panel.frames) == 0
+        assert anim.anim_folders(win.layer_stack.layers) == []
+        assert win.layer_stack.anim_length == anim.DEFAULT_LENGTH
 
 
 class TestTransformMenu:
@@ -456,13 +459,17 @@ class TestTools:
 
 class TestFileAndCanvas:
     def test_anim_frames_survive_save(self, win, tmp_path):
-        img = win.layer_stack.composite()
-        win.anim_panel.set_frames([img, img], 12)
+        import anim
+        win.anim_panel._on_new_folder()
+        win.anim_panel._on_new_cel()
+        win.anim_panel.set_fps(12)
         path = str(tmp_path / "a.pola")
         win._write_pola(path)
-        win.anim_panel.set_frames([], None)
+        win.anim_panel.set_fps(8)
         win._load_pola(path)
-        assert len(win.anim_panel.frames) == 2
+        folder = anim.anim_folders(win.layer_stack.layers)[0]
+        assert len(folder.children) == 2
+        assert anim.cel_at(folder, 1).name == "2"
         assert win.anim_panel.fps == 12
 
     def test_failed_save_keeps_old_file(self, win, tmp_path, monkeypatch):
@@ -1144,8 +1151,9 @@ class TestToolSettingsRestore:
         class FakeSettings:
             def value(self, k, d=None): return vals.get(k, d)
         win._settings = FakeSettings()
-        win._restore_tool_settings()
         c = win.canvas
+        c.text_font_family = "Arial"  # 実機の保存設定に左右されないよう固定
+        win._restore_tool_settings()
         assert c.pen_opacity == 100
         assert c.eraser_soft is True
         assert c.fill_tolerance == 7

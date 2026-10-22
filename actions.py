@@ -4805,6 +4805,115 @@ def execute_gacha(layer_stack: LayerStack, source_layer: Layer,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 30. 紙を重ねた絵風（各レイヤーの下にぼかした影）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PaperLayersDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("紙を重ねた絵風")
+        self.setMinimumWidth(300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._color_btn = _color_button(QColor(0, 0, 0), self)
+        form.addRow("影の色", self._color_btn)
+
+        self._blur = QSpinBox()
+        self._blur.setRange(0, 100)
+        self._blur.setValue(20)
+        self._blur.setSuffix(" px")
+        self._blur.setToolTip("大きいほど影がふんわり広がります。0 でぼかさない")
+        form.addRow("ぼかし", self._blur)
+        layout.addLayout(form)
+
+        desc = QLabel("選んだフォルダの中の色分けしたレイヤーそれぞれの下に、"
+                      "その形を影の色で塗ってぼかした影レイヤーを作ります。"
+                      "紙を重ねて作ったような立体感が出ます。\n"
+                      "非表示・クリッピング・空のレイヤーには作りません。"
+                      "数値を変えてやり直すときは、取り消し（Ctrl+Z）してから実行してください。")
+        desc.setStyleSheet("color: #666; font-size: 11px;")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        buttons = _std_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def params(self) -> dict:
+        return {"color": self._color_btn._color, "blur": self._blur.value()}
+
+
+def paper_target_folder(layer_stack: LayerStack, active) -> GroupLayer | None:
+    """影を作る対象のフォルダ。フォルダを選んでいればそれ、
+    フォルダの中のレイヤーを選んでいればそのフォルダ。どちらでもなければ None。"""
+    if active is None:
+        return None
+    if active.is_group:
+        return active
+    path = layer_stack.find_path(active)
+    if path and len(path) > 1:
+        return layer_stack._resolve_path(path[:-1])
+    return None
+
+
+def _paper_sources(group: GroupLayer) -> list[tuple[list, Layer]]:
+    """影を作るレイヤーと、それが入っている children の組。中のフォルダもたどる。
+
+    非表示（見えない紙に影は要らない）・クリッピング（下の紙の上に乗る模様で、
+    紙の形ではない）・何も描いていないレイヤーは除く。"""
+    out = []
+    for child in group.children:
+        if child.is_group:
+            out.extend(_paper_sources(child))
+        elif child.visible and not child.clipping and _has_alpha(child.image):
+            out.append((group.children, child))
+    return out
+
+
+def _has_alpha(img: QImage) -> bool:
+    return bool(_qimage_to_array(img)[:, :, 3].any())
+
+
+def _paper_shadow_image(image: QImage, color: QColor, blur: int,
+                        margin: int) -> QImage:
+    """image の形を color で塗ってぼかした画像（四方に margin の余白付き）。
+
+    色は一色なので、ぼかすのはアルファだけ。色ごとぼかすと、まわりの
+    透明（黒の透明）と混ざって、黒以外の影のふちが暗く濁るため。"""
+    arr = _qimage_to_array(_pad_image(image, margin))
+    alpha = arr[:, :, 3].astype(np.float32) * (color.alpha() / 255.0)
+    if blur > 0:
+        k = blur * 2 + 1
+        alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+    out = np.empty_like(arr)
+    out[:, :, :3] = _bgr(color)
+    out[:, :, 3] = np.clip(alpha + 0.5, 0, 255).astype(np.uint8)
+    return _array_to_qimage(out)
+
+
+def execute_paper_layers(layer_stack: LayerStack, folder: GroupLayer,
+                         params: dict) -> list[Layer]:
+    """folder の中の各レイヤーをコピーして影の色に塗り、ぼかして、
+    元のレイヤーのすぐ下に置く。作った影レイヤーを返す。
+
+    上の紙の影が下の紙に落ちるので、紙を重ねて作ったような立体感が出る。"""
+    color = QColor(params["color"])
+    blur = max(0, int(params["blur"]))
+    margin = blur * 2 + 2 if blur > 0 else 0
+    made = []
+    for container, src in _paper_sources(folder):
+        shadow = Layer(f"{src.name} の影", 1, 1)
+        shadow.image = _paper_shadow_image(src.image, color, blur, margin)
+        _copy_offset(src, shadow)
+        _offset_layer(shadow, margin)
+        container.insert(container.index(src) + 1, shadow)
+        made.append(shadow)
+    return made
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # アクションパネル
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -4854,6 +4963,8 @@ class ActionPanel(QWidget):
             ("🧩 ずれ縁取り", "縁取りをわざとずらす偶然アート", self._on_offset_border),
             ("🖨️ リソ風版ずれ", "色版をずらして重ねる印刷風", self._on_silkscreen),
             ("✂️ 切り絵コラージュ", "閉じた領域を色紙でランダムに塗る", self._on_collage),
+            ("📄 紙を重ねた絵風", "フォルダ内の各レイヤーの下にぼかした影を作り、紙を重ねたように",
+             self._on_paper_layers),
             ("〽️ 線の揺らぎ", "線を波打たせて別テイクを作る", self._on_wobble),
             ("🪧 スタンプ劣化", "はんこ風にかすれさせる", self._on_stamp),
             ("🗺️ 等高線", "外側に輪郭線を何重にも生成", self._on_contour),
@@ -4938,6 +5049,32 @@ class ActionPanel(QWidget):
 
     def _on_collage(self):
         self._run("切り絵コラージュ", CollageDialog, execute_collage)
+
+    def _on_paper_layers(self):
+        title = "紙を重ねた絵風"
+        active = self.layer_stack.active
+        folder = paper_target_folder(self.layer_stack, active)
+        if folder is None:
+            QMessageBox.warning(self, title,
+                                "色分けしたレイヤーが入ったフォルダ"
+                                "（またはその中のレイヤー）を選択してください。")
+            return
+        if not _paper_sources(folder):
+            QMessageBox.information(self, title,
+                                    "影を作れるレイヤーがありません。\n"
+                                    "（非表示・クリッピング・空のレイヤーは対象外です）")
+            return
+        dlg = PaperLayersDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.structure_will_change.emit()
+        made = execute_paper_layers(self.layer_stack, folder, dlg.params())
+        # 影を差し込むと番号がずれるので、選んでいたレイヤーを選び直す
+        path = self.layer_stack.find_path(active)
+        if path:
+            self.layer_stack.set_active_path(path)
+        if made:
+            self.action_executed.emit()
 
     def _on_wobble(self):
         self._run("線の揺らぎ", WobbleDialog, execute_wobble)

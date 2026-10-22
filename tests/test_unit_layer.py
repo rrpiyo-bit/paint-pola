@@ -162,6 +162,45 @@ class TestGroupLayer:
         assert child.image.height() == 50
 
 
+class TestPassThroughOpacity:
+    """通過フォルダの不透明度は「フォルダなし」と「フォルダあり」の間の補間になる。"""
+
+    @staticmethod
+    def _stack(bg: QColor, child: QColor, blend: str, opacity: int) -> LayerStack:
+        ls = LayerStack(W, H)
+        base = ls.add("下")
+        base.image.fill(bg)
+        g = GroupLayer("g", W, H)
+        g.pass_through = True
+        g.opacity = opacity
+        c = Layer("c", W, H)
+        c.image.fill(child)
+        c.blend_mode = blend
+        g.children.append(c)
+        ls.layers.insert(0, g)
+        return ls
+
+    @staticmethod
+    def _lerp(a: QColor, b: QColor, t: float) -> tuple:
+        return tuple(round(x * (1 - t) + y * t) for x, y in
+                     zip(a.getRgb()[:3], b.getRgb()[:3]))
+
+    @pytest.mark.parametrize("opacity", [0, 100, 200, 255])
+    def test_normal_child(self, opacity):
+        red, blue = QColor(255, 0, 0), QColor(0, 0, 255)
+        got = px(self._stack(red, blue, "normal", opacity).composite(), 50, 50)
+        exp = self._lerp(red, blue, opacity / 255)
+        assert got.alpha() == 255
+        assert all(abs(g - e) <= 1 for g, e in zip(got.getRgb()[:3], exp))
+
+    def test_multiply_child_blends_with_layer_below(self):
+        bg, mul = QColor(200, 100, 50), QColor(128, 255, 128)
+        got = px(self._stack(bg, mul, "multiply", 100).composite(), 50, 50)
+        after = QColor(200 * 128 // 255, 100, 50 * 128 // 255)
+        exp = self._lerp(bg, after, 100 / 255)
+        assert all(abs(g - e) <= 2 for g, e in zip(got.getRgb()[:3], exp))
+
+
 # ── LayerStack ───────────────────────────────────────────────────────────────
 
 class TestLayerStack:

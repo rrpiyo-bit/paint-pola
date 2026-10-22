@@ -190,6 +190,10 @@ class LayerRow(QWidget):
             badge = QLabel("📐")
             badge.setToolTip("ベクターレイヤー（線を後から編集できる）")
             icon_row.addWidget(badge)
+        if getattr(self._layer, "timeline", None) is not None:
+            badge = QLabel("🎞")
+            badge.setToolTip("アニメーションフォルダ（中のレイヤーが1枚1枚のセル）")
+            icon_row.addWidget(badge)
 
         icon_row.addStretch()
         right.addLayout(icon_row)
@@ -991,28 +995,31 @@ class LayerPanel(QWidget):
         return f"{prefix} {n}"
 
     def _add(self):
-        self.structure_will_change.emit()
-        ls = self.layer_stack
-        path = self._current_path()
-        container, idx = self._get_container_and_index(path)
-        new_layer = Layer(self._unique_name("レイヤー", len(container) + 1), ls.width, ls.height)
-        insert_at = min(idx, len(container))
-        container.insert(insert_at, new_layer)
-        new_path = path[:-1] + [insert_at]
-        ls.set_active_path(new_path)
-        self.refresh()
-        self.layers_changed.emit()
+        self._add_layer_of(Layer, "レイヤー")
 
     def _add_vector(self):
+        self._add_layer_of(VectorLayer, "ベクター")
+
+    def _add_layer_of(self, cls, prefix: str):
+        """新しいレイヤーを足して選択する。
+
+        フォルダを選んでいるときはそのフォルダの中の一番上に入れる
+        （CLIP STUDIO と同じ）。それ以外は選択中のレイヤーのすぐ上。
+        """
         self.structure_will_change.emit()
         ls = self.layer_stack
         path = self._current_path()
         container, idx = self._get_container_and_index(path)
-        new_layer = VectorLayer(self._unique_name("ベクター", len(container) + 1), ls.width, ls.height)
-        insert_at = min(idx, len(container))
+        if path and 0 <= idx < len(container) and container[idx].is_group:
+            folder = container[idx]
+            folder.collapsed = False  # 畳んだままだと足したレイヤーが見えない
+            container = folder.children
+            parent_path, insert_at = path, 0
+        else:
+            parent_path, insert_at = path[:-1], min(idx, len(container))
+        new_layer = cls(self._unique_name(prefix, len(container) + 1), ls.width, ls.height)
         container.insert(insert_at, new_layer)
-        new_path = path[:-1] + [insert_at]
-        ls.set_active_path(new_path)
+        ls.set_active_path(parent_path + [insert_at])
         self.refresh()
         self.layers_changed.emit()
 
@@ -1065,7 +1072,9 @@ class LayerPanel(QWidget):
         dst.hsl_saturation = src.hsl_saturation
         dst.hsl_lightness = src.hsl_lightness
 
-    def _deep_copy_layer(self, src, ls, is_root: bool = True) -> Layer | GroupLayer:
+    @staticmethod
+    def _deep_copy_layer(src, ls, is_root: bool = True) -> Layer | GroupLayer:
+        """レイヤー（フォルダなら中身ごと）を複製する。アニメのセルの貼り付けでも使う。"""
         suffix = " コピー" if is_root else ""
         if src.is_group:
             new_g = GroupLayer(src.name + suffix, ls.width, ls.height)
@@ -1077,7 +1086,12 @@ class LayerPanel(QWidget):
             new_g.collapsed = src.collapsed
             new_g.pass_through = getattr(src, "pass_through", False)
             for child in src.children:
-                new_g.children.append(self._deep_copy_layer(child, ls, False))
+                new_g.children.append(LayerPanel._deep_copy_layer(child, ls, False))
+            if getattr(src, "timeline", None) is not None:
+                # セルの uid は複製で変わるので、並び順で付け替える
+                uid_map = {a.uid: b.uid for a, b in zip(src.children, new_g.children)}
+                new_g.timeline = [v if v in (None, 0) else uid_map.get(v, 0)
+                                  for v in src.timeline]
             return new_g
         elif getattr(src, "is_vector", False):
             # ベクターレイヤーは線を持ったまま複製する。ここで Layer を作ると
@@ -1087,12 +1101,12 @@ class LayerPanel(QWidget):
             c._canvas_w = src._canvas_w
             c._canvas_h = src._canvas_h
             c.strokes = src.copy_strokes()
-            self._copy_layer_props(src, c)
+            LayerPanel._copy_layer_props(src, c)
             c.mark_dirty()
             return c
         else:
             c = Layer(src.name + suffix, ls.width, ls.height)
-            self._copy_layer_props(src, c)
+            LayerPanel._copy_layer_props(src, c)
             return c
 
     def _duplicate(self):

@@ -3,7 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QDialog
 from PyQt6.QtGui import QColor, QPainter, QImage
 from PyQt6.QtCore import Qt
 
@@ -1938,3 +1938,129 @@ class TestStyleEffectsKeepTransparency:
             assert result is not None
             out_a = _qimage_to_array_test(result.image)[:, :, 3]
             assert (out_a > 10).mean() < 0.95,                 f"{key}: ガチャ経由で全面が埋まっている {params}"
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 紙を重ねた絵風
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPaperLayers:
+    """フォルダ内の各レイヤーの下に、塗りつぶしてぼかした影を作る。"""
+
+    @staticmethod
+    def _paper(name, rect, color, size=200):
+        lyr = Layer(name, size, size)
+        p = QPainter(lyr.image)
+        p.fillRect(*rect, color)
+        p.end()
+        return lyr
+
+    def _setup(self):
+        from actions import execute_paper_layers, paper_target_folder
+        ls = LayerStack(200, 200)
+        folder = GroupLayer("紙", 200, 200)
+        red = self._paper("赤", (40, 40, 60, 60), QColor(255, 0, 0))
+        blue = self._paper("青", (20, 20, 160, 160), QColor(0, 0, 255))
+        folder.children = [red, blue]
+        bg = self._paper("背景", (0, 0, 200, 200), QColor(255, 255, 255))
+        ls.layers = [folder, bg]
+        ls.active_path = [0]
+        return ls, folder, red, blue, execute_paper_layers, paper_target_folder
+
+    def test_shadow_below_each_layer(self):
+        ls, folder, red, blue, run, _ = self._setup()
+        made = run(ls, folder, {"color": QColor(0, 0, 0), "blur": 20})
+        assert len(made) == 2
+        assert [c.name for c in folder.children] == ["赤", "赤 の影", "青", "青 の影"]
+        sh = folder.children[1]
+        # 元の形の中は影の色で濃く、ふちの外にもぼけて広がる
+        def at(lyr, x, y):
+            return lyr.image.pixelColor(x - lyr.offset_x, y - lyr.offset_y)
+        c = at(sh, 70, 70)
+        assert (c.red(), c.green(), c.blue()) == (0, 0, 0) and c.alpha() > 240
+        assert 0 < at(sh, 104, 70).alpha() < 128
+        assert at(sh, 140, 70).alpha() == 0
+        # 赤い紙の外、すぐそばの青い紙に影が落ちる
+        img = ls.composite()
+        near, far = img.pixelColor(104, 70), img.pixelColor(150, 150)
+        assert far == QColor(0, 0, 255)
+        assert near.blue() < far.blue()
+        # 赤い紙そのものは変わらない
+        assert img.pixelColor(70, 70) == QColor(255, 0, 0)
+
+    def test_shadow_not_cut_at_layer_edge(self):
+        """紙が画像の端まであっても、影は外へ広がる（余白を足してから作る）。"""
+        ls, folder, red, blue, run, _ = self._setup()
+        blue.offset_x, blue.offset_y = 30, -10
+        run(ls, folder, {"color": QColor(0, 0, 0), "blur": 10})
+        sh = folder.children[3]
+        assert sh.image.width() > blue.image.width()
+        assert sh.offset_x < blue.offset_x and sh.offset_y < blue.offset_y
+        # 位置がそろっている: 青い紙の中央はキャンバス上の同じ場所で影も濃い
+        cx, cy = 100 + 30, 100 - 10
+        assert sh.image.pixelColor(cx - sh.offset_x, cy - sh.offset_y).alpha() > 240
+
+    def test_color_and_no_blur(self):
+        ls, folder, red, blue, run, _ = self._setup()
+        run(ls, folder, {"color": QColor(10, 120, 30, 128), "blur": 0})
+        sh = folder.children[1]
+        assert sh.image.size() == red.image.size()
+        c = sh.image.pixelColor(70, 70)
+        assert (c.red(), c.green(), c.blue()) == (10, 120, 30)
+        assert abs(c.alpha() - 128) <= 1
+        assert sh.image.pixelColor(39, 70).alpha() == 0
+
+    def test_skips_hidden_clipping_empty_and_walks_subfolders(self):
+        ls, folder, red, blue, run, _ = self._setup()
+        hidden = self._paper("隠し", (0, 0, 10, 10), QColor(0, 255, 0))
+        hidden.visible = False
+        clip = self._paper("模様", (0, 0, 10, 10), QColor(0, 255, 0))
+        clip.clipping = True
+        empty = Layer("空", 200, 200)
+        sub = GroupLayer("中", 200, 200)
+        inner = self._paper("内", (5, 5, 20, 20), QColor(0, 255, 0))
+        sub.children = [inner]
+        folder.children = [clip, red, hidden, empty, sub, blue]
+        made = run(ls, folder, {"color": QColor(0, 0, 0), "blur": 5})
+        assert sorted(m.name for m in made) == sorted(["内 の影", "赤 の影", "青 の影"])
+        assert [c.name for c in folder.children] == [
+            "模様", "赤", "赤 の影", "隠し", "空", "中", "青", "青 の影"]
+        assert [c.name for c in sub.children] == ["内", "内 の影"]
+        # クリッピングは、影ではなく今までどおり赤い紙に乗る
+        assert folder.children[folder.children.index(clip) + 1] is red
+
+    def test_target_folder(self):
+        ls, folder, red, blue, _, target = self._setup()
+        assert target(ls, folder) is folder
+        assert target(ls, blue) is folder
+        assert target(ls, ls.layers[1]) is None
+        assert target(ls, None) is None
+
+    def test_panel_runs_and_keeps_selection(self, monkeypatch):
+        import actions
+        ls, folder, red, blue, _, _ = self._setup()
+        ls.active_path = [0, 1]  # 青を選んでいる
+        panel = actions.ActionPanel(ls)
+        events = []
+        panel.structure_will_change.connect(lambda: events.append("will"))
+        panel.action_executed.connect(lambda: events.append("done"))
+        monkeypatch.setattr(actions.PaperLayersDialog, "exec",
+                            lambda self: QDialog.DialogCode.Accepted)
+        panel._on_paper_layers()
+        assert events == ["will", "done"]
+        assert len(folder.children) == 4
+        assert ls.active is blue
+
+    def test_panel_warns_without_folder(self, monkeypatch):
+        import actions
+        from PyQt6.QtWidgets import QMessageBox
+        ls, folder, red, blue, _, _ = self._setup()
+        ls.active_path = [1]  # フォルダの外の背景
+        panel = actions.ActionPanel(ls)
+        warned = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
+        monkeypatch.setattr(actions.PaperLayersDialog, "exec",
+                            lambda self: pytest.fail("ダイアログを出してはいけない"))
+        panel._on_paper_layers()
+        assert warned and len(ls.layers) == 2

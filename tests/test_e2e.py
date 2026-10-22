@@ -19,6 +19,7 @@ app = QApplication.instance() or QApplication(sys.argv)
 from main import MainWindow
 from tools import Tool
 from layer import Layer
+from app_settings import open_settings
 
 
 def px(image, x, y) -> QColor:
@@ -95,6 +96,33 @@ class TestLayerAddDraw:
         initial_count = len(win.canvas.layer_stack.layers)
         win.layer_panel._add()
         assert len(win.canvas.layer_stack.layers) == initial_count + 1
+
+    def test_add_layer_with_folder_selected_goes_inside(self, win):
+        """フォルダを選んで新規レイヤーを押すと、そのフォルダの中の一番上にできること。"""
+        lp, ls = win.layer_panel, win.canvas.layer_stack
+        lp._add_group()
+        folder = ls.active
+        folder.collapsed = True
+        top = len(ls.layers)
+        lp._add()
+        assert len(ls.layers) == top, "フォルダの外にできている"
+        assert len(folder.children) == 1
+        assert ls.active is folder.children[0]
+        assert not folder.collapsed, "畳んだままで見えない"
+        lp._add_vector()
+        assert len(folder.children) == 2
+        assert ls.active is folder.children[0]
+        win.canvas.undo()
+        win.canvas.undo()
+        groups = [l for l in win.canvas.layer_stack.layers if l.is_group]
+        assert groups and all(not g.children for g in groups), "undo で消えない"
+
+    def test_add_layer_with_layer_selected_goes_above(self, win):
+        lp, ls = win.layer_panel, win.canvas.layer_stack
+        below = ls.active
+        lp._add()
+        assert ls.active is not below
+        assert ls.layers.index(ls.active) == ls.layers.index(below) - 1
 
     def test_draw_on_new_layer(self, win):
         win.layer_panel._add()
@@ -748,115 +776,140 @@ class TestScenarioSaveLoadCycle:
             os.unlink(path)
 
 
+def gif_frames(path) -> int:
+    from PIL import Image
+    with Image.open(path) as gif:
+        return gif.n_frames
+
+
+def export_gif(ap) -> int:
+    """GIF に書き出してコマ数を返す。"""
+    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
+        gif_path = f.name
+    try:
+        assert ap._export_gif_to(gif_path)
+        assert os.path.getsize(gif_path) > 100, "GIFファイルが小さすぎる"
+        return gif_frames(gif_path)
+    finally:
+        os.unlink(gif_path)
+
+
+def anim_folder(win):
+    import anim
+    return anim.anim_folders(win.layer_stack.layers)[0]
+
+
+def frame_px(win, f, x, y) -> QColor:
+    """コマ f を書き出したときの、画面座標 (x, y) の色。"""
+    import anim
+    cp = win.canvas._widget_to_canvas(QPoint(x, y))
+    return px(anim.render_frame(win.layer_stack, f), cp.x(), cp.y())
+
+
 class TestScenarioAnimation:
-    """アニメーションモードでフレーム追加・再生・GIF出力の一連の流れ。"""
+    """アニメーションフォルダにセルを描き、タイムラインで並べて GIF にする流れ。"""
 
     def test_animation_full_workflow(self, win):
+        import anim
         c = win.canvas
         ap = win.anim_panel
+        ls = c.layer_stack
 
-        # 1. アニメーションモード有効化
+        # 1. アニメーションモード → アニメーションフォルダ（セル1入り）
         win._toggle_anim_mode(True)
         assert ap.isVisible()
+        ap._on_new_folder()
+        folder = anim_folder(win)
+        assert ls.active is folder.children[0]
 
-        # 2. フレーム1: 赤い丸を描いてフレーム追加
+        # 2. セル1（コマ1）: 赤
         c.tool = Tool.PEN
         c.pen_color = QColor(255, 0, 0, 255)
         c.pen_size = 30
         draw_stroke(c, 100, 100, 120, 100)
-        ap._on_add_frame()
-        assert len(ap.frames) == 1
 
-        # 3. フレーム2: 消しゴムで消してから青を描いてフレーム追加
-        c.tool = Tool.ERASER
-        c.eraser_size = 100
-        draw_stroke(c, 50, 50, 200, 200)
-        c.tool = Tool.PEN
+        # 3. セル2（コマ2）: 青。前のセルを消さなくても新しいセルは白紙
+        ap._on_new_cel()
+        assert ls.anim_frame == 1
         c.pen_color = QColor(0, 0, 255, 255)
-        c.pen_size = 30
-        draw_stroke(c, 150, 100, 170, 100)
-        ap._on_add_frame()
-        assert len(ap.frames) == 2
+        draw_stroke(c, 100, 100, 120, 100)
 
-        # 4. フレーム3: 緑を描いて追加
-        c.tool = Tool.ERASER
-        c.eraser_size = 100
-        draw_stroke(c, 50, 50, 200, 200)
-        c.tool = Tool.PEN
+        # 4. セル3（コマ3）: 緑
+        ap._on_new_cel()
         c.pen_color = QColor(0, 255, 0, 255)
-        c.pen_size = 30
-        draw_stroke(c, 100, 150, 120, 150)
-        ap._on_add_frame()
-        assert len(ap.frames) == 3
+        draw_stroke(c, 100, 100, 120, 100)
+        ap._len_spin.setValue(3)
 
-        # 5. フレームを選択し差し替え
-        ap._on_frame_clicked(1)
-        assert ap.current_frame == 1
+        assert frame_px(win, 0, 110, 100).red() > 200
+        assert frame_px(win, 1, 110, 100).blue() > 200
+        assert frame_px(win, 2, 110, 100).green() > 200
+
+        # 5. コマ2をクリック → セル2が選ばれて、そのまま描き直せる
+        ap._on_cell_clicked(folder, 1)
+        assert ls.active.name == "2"
         c.pen_color = QColor(255, 255, 0, 255)
-        draw_stroke(c, 80, 80, 100, 80)
-        ap._on_replace_frame()
-        assert len(ap.frames) == 3
+        draw_stroke(c, 100, 100, 120, 100)
+        assert frame_px(win, 1, 110, 100).green() > 200   # 黄
+        assert frame_px(win, 0, 110, 100).green() < 50    # 他のコマはそのまま
 
-        # 6. フレーム順序入れ替え
-        ap._on_frame_clicked(2)
-        ap._on_move_left()
-        assert ap.current_frame == 1
+        # 6. コマ3のセルをドラッグでコマ1へ移動（元の場所は空きコマ）→ 取り消し
+        ap._on_cell_clicked(folder, 2)
+        ap._on_cell_dragged(folder, 0)
+        assert anim.cel_at(folder, 0).name == "3"
+        assert anim.cel_at(folder, 1).name == "2"
+        assert anim.cel_at(folder, 2) is None
+        c.undo()
+        assert [anim.cel_at(folder, f).name for f in range(3)] == ["1", "2", "3"]
 
-        # 7. フレーム削除
-        ap._on_frame_clicked(0)
-        ap._on_delete_frame()
-        assert len(ap.frames) == 2
+        # 7. オニオンスキン: コマ2で前（青）と後（緑）が出る
+        ap.go_to(1)
+        assert ap.onion_overlay() is not None
 
-        # 8. オニオンスキン
-        onion = ap.get_onion_images()
-        # current_frame=0なら前フレームがないので空
-        ap._on_frame_clicked(1)
-        onion = ap.get_onion_images()
-        assert len(onion) >= 1, "オニオンスキンが取得できていない"
-
-        # 9. 再生→停止
+        # 8. 再生 → 停止
         ap._start_play()
         assert ap._playing
+        ap._play_next()
+        c.grab()   # 再生中の絵を描ける
         ap._stop_play()
         assert not ap._playing
 
-        # 10. GIF書き出し
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-            gif_path = f.name
-        try:
-            ap._export_gif_to(gif_path)
-            assert os.path.exists(gif_path)
-            assert os.path.getsize(gif_path) > 100, "GIFファイルが小さすぎる"
-        finally:
-            os.unlink(gif_path)
+        # 9. GIF
+        assert export_gif(ap) == 3
 
-        # 11. アニメーションモード解除
+        # 10. モード解除してもセルはレイヤーとして残る
         win._toggle_anim_mode(False)
         assert not ap.isVisible()
+        assert len(folder.children) == 3
 
     def test_animation_onion_skin_multiple_frames(self, win):
+        import anim
         c = win.canvas
         ap = win.anim_panel
         win._toggle_anim_mode(True)
-
-        # 5フレーム追加
+        ap._on_new_folder()
         for i in range(5):
+            if i:
+                ap._on_new_cel()
             c.tool = Tool.PEN
             c.pen_color = QColor(50 * i, 0, 0, 255)
             c.pen_size = 10
             draw_stroke(c, 100 + i * 10, 100, 120 + i * 10, 100)
-            ap._on_add_frame()
-        assert len(ap.frames) == 5
+        ls = win.layer_stack
+        assert len(anim_folder(win).children) == 5
 
-        # オニオンスキン数を3に設定して最後のフレームを選択
-        ap._onion_count = 3
-        ap._on_frame_clicked(4)
-        onion = ap.get_onion_images()
-        assert len(onion) == 3, f"オニオンスキン3枚のはずが{len(onion)}枚"
+        # 前3枚・後0枚にして最後のコマ
+        ap._onion_before_spin.setValue(3)
+        ap._onion_after_spin.setValue(0)
+        ap.go_to(4)
+        items = anim.onion_items(ls, 4, ap._onion_before, ap._onion_after)
+        assert len(items) == 3
+        assert all(col == anim.ONION_PREV for _, col, _ in items)
+        # 近いコマほど濃い
+        assert items[0][2] > items[1][2] > items[2][2]
 
-        # オニオンスキンOFFにすると空
-        ap._onion_enabled = False
-        assert ap.get_onion_images() == []
+        # オニオンスキンOFF
+        ap._onion_check.setChecked(False)
+        assert ap.onion_overlay() is None
 
         win._toggle_anim_mode(False)
 
@@ -1580,121 +1633,64 @@ class TestIllustMaking_EffectsAndBlendModes:
 class TestIllustMaking_AnimationFromIllust:
     """
     イラスト完成後にアニメーション化する工程。
-    完成絵をベースに表情差分でパラパラ漫画を作る。
+    顔の輪郭は背景（フォルダの外）に1回だけ描き、表情だけをセルにする。
     """
 
     def test_expression_animation_workflow(self, win):
         """表情差分3枚 → GIF書き出しのフロー。"""
+        import anim
         c = win.canvas
-        ls = c.layer_stack
         ap = win.anim_panel
 
-        # --- ベースの顔を描く ---
+        # --- ベースの顔（全コマ共通）を描く ---
         c.tool = Tool.PEN
         c.pen_color = QColor(0, 0, 0, 255)
         c.pen_size = 3
-        # 輪郭
         draw_stroke(c, 100, 50, 100, 150)
         draw_stroke(c, 200, 50, 200, 150)
         draw_stroke(c, 100, 50, 200, 50)
-        draw_stroke(c, 100, 150, 150, 180)
-        draw_stroke(c, 200, 150, 150, 180)
 
-        # アニメーションモードON
         win._toggle_anim_mode(True)
+        ap._on_new_folder()
 
         # --- 表情1: 笑顔 ---
-        # 目（上向きアーチ）
         draw_stroke(c, 125, 95, 135, 85)
-        draw_stroke(c, 135, 85, 145, 95)
-        draw_stroke(c, 160, 95, 170, 85)
-        draw_stroke(c, 170, 85, 180, 95)
-        # 口（笑い）
-        draw_stroke(c, 135, 130, 150, 140)
-        draw_stroke(c, 150, 140, 165, 130)
-        ap._on_add_frame()
+        draw_stroke(c, 135, 130, 165, 130)
 
-        # --- 表情2: 普通 ---
-        # 目を消して描き直す
-        c.tool = Tool.ERASER
-        c.eraser_size = 20
-        draw_stroke(c, 120, 80, 185, 100)  # 目を消す
-        draw_stroke(c, 130, 125, 170, 145) # 口を消す
-        c.tool = Tool.PEN
-        c.pen_color = QColor(0, 0, 0, 255)
-        c.pen_size = 3
-        # 目（普通）
+        # --- 表情2: 普通（消さずに新しいセルへ） ---
+        ap._on_new_cel()
         draw_stroke(c, 125, 90, 145, 90)
-        draw_stroke(c, 160, 90, 180, 90)
-        # 口（一文字）
         draw_stroke(c, 140, 135, 160, 135)
-        ap._on_add_frame()
 
         # --- 表情3: 驚き ---
-        c.tool = Tool.ERASER
-        c.eraser_size = 20
-        draw_stroke(c, 120, 80, 185, 100)
-        draw_stroke(c, 130, 125, 170, 145)
-        c.tool = Tool.PEN
-        c.pen_color = QColor(0, 0, 0, 255)
-        c.pen_size = 3
-        # 目（大きく）
-        c.pen_size = 5
-        draw_stroke(c, 125, 85, 145, 85)
-        draw_stroke(c, 125, 85, 125, 95)
-        draw_stroke(c, 145, 85, 145, 95)
-        draw_stroke(c, 125, 95, 145, 95)
-        draw_stroke(c, 160, 85, 180, 85)
-        draw_stroke(c, 160, 85, 160, 95)
-        draw_stroke(c, 180, 85, 180, 95)
-        draw_stroke(c, 160, 95, 180, 95)
-        # 口（O型）
+        ap._on_new_cel()
         c.tool = Tool.ELLIPSE
         c.pen_size = 2
         press(c, 143, 128)
         move(c, 158, 148)
         release(c, 158, 148)
-        ap._on_add_frame()
+        ap._len_spin.setValue(3)
 
-        assert len(ap.frames) == 3
+        folder = anim_folder(win)
+        assert len(folder.children) == 3
+        # 輪郭は3コマすべてに出る、表情はそのコマだけ
+        for f in range(3):
+            assert frame_px(win, f, 100, 100).alpha() > 0
+            assert frame_px(win, f, 100, 100).red() < 80
+        assert frame_px(win, 1, 135, 90).red() < 80
+        assert frame_px(win, 0, 135, 90).red() > 200
 
-        # オニオンスキンで確認
-        ap._on_frame_clicked(2)
-        onion = ap.get_onion_images()
-        assert len(onion) >= 1, "オニオンスキンで前フレームが見えない"
+        # オニオンスキンで前のコマが見える
+        ap.go_to(2)
+        assert ap.onion_overlay() is not None
 
-        # 再生テスト
         ap._start_play()
-        assert ap._playing
-        # 数フレーム進める
         ap._play_next()
         ap._play_next()
         ap._stop_play()
         assert not ap._playing
 
-        # GIF書き出し
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-            gif_path = f.name
-        try:
-            ap._export_gif_to(gif_path)
-            assert os.path.exists(gif_path)
-            assert os.path.getsize(gif_path) > 200, "GIFが小さすぎる"
-
-            # GIFの中身を検証
-            from PIL import Image
-            with Image.open(gif_path) as gif:
-                frame_count = 0
-                try:
-                    while True:
-                        frame_count += 1
-                        gif.seek(gif.tell() + 1)
-                except EOFError:
-                    pass
-                assert frame_count == 3, \
-                    f"GIFのフレーム数が3ではない: {frame_count}"
-        finally:
-            os.unlink(gif_path)
-
+        assert export_gif(ap) == 3
         win._toggle_anim_mode(False)
 
 
@@ -1754,23 +1750,21 @@ class TestIllustMaking_LongSession:
 # クリスタ風 GIFアニメーション制作工程の再現テスト
 #
 # 参考: CLIP STUDIO PAINT のアニメーション制作フロー
-#   1. キャンバス作成・FPS設定
+#   1. アニメーションフォルダを作る（背景・用紙はフォルダの外）
 #   2. セル1（キーフレーム: 動きの起点）を描く
-#   3. セル3（キーフレーム: 動きの終点）を描く
-#   4. オニオンスキンON → セル2（中割り）を描く
-#   5. 再生して動きを確認
-#   6. 修正（差し替え・順序変更）
-#   7. GIF書き出し
+#   3. セル3（キーフレーム: 動きの終点）を先に描く
+#   4. オニオンスキンで前後を見ながらセル2（中割り）を描く
+#   5. セル番号を振り直し、2コマ打ちにタイミングを直す
+#   6. 再生して動きを確認 → GIF書き出し
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestClipStudioStyle_BounceAnimation:
     """
-    クリスタ風: ボールが跳ねるループアニメーション。
-    キーフレーム→中割り→再生確認→修正→GIF出力の全工程。
+    クリスタ風: ボールが跳ねるアニメーション。
+    キーフレーム→中割り→番号振り直し→コマ打ち→GIF出力の全工程。
     """
 
     def _draw_ball(self, canvas, x, y, size=20):
-        """指定位置にボール（丸）を描く。"""
         canvas.tool = Tool.ELLIPSE
         canvas.pen_size = 2
         canvas.shape_fill = "fill"
@@ -1778,608 +1772,315 @@ class TestClipStudioStyle_BounceAnimation:
         move(canvas, x + size, y + size)
         release(canvas, x + size, y + size)
 
-    def _clear_canvas(self, canvas):
-        """キャンバスを消しゴムで全消し。"""
-        canvas.tool = Tool.ERASER
-        canvas.eraser_size = 200
-        for y in range(50, 350, 80):
-            draw_stroke(canvas, 10, y, 290, y)
-
     def test_bounce_ball_keyframe_workflow(self, win):
-        """
-        工程:
-        1. セル1: ボール上（キーフレーム）
-        2. セル3: ボール下（キーフレーム）
-        3. オニオンスキンON → セル2: ボール中間（中割り）
-        4. 再生で確認
-        5. セル2を微修正（差し替え）
-        6. フレーム順確認
-        7. GIF書き出し
-        """
+        import anim
         c = win.canvas
         ap = win.anim_panel
-
-        # アニメーションモードON
+        ls = win.layer_stack
         win._toggle_anim_mode(True)
-        assert ap.isVisible()
+        ap._on_new_folder()
+        folder = anim_folder(win)
 
-        # --- セル1: ボール上 (キーフレーム) ---
-        c.pen_color = QColor(255, 80, 80, 255)  # 赤いボール
+        # --- セル1: ボール上（コマ1） ---
+        c.pen_color = QColor(255, 80, 80, 255)
         self._draw_ball(c, 150, 80)
-        ap._on_add_frame()
-        assert len(ap.frames) == 1
-        assert ap.current_frame == 0
 
-        # --- セル3: ボール下 (キーフレーム) ---
-        # クリスタ流: 中割りを飛ばして終点を先に描く
-        self._clear_canvas(c)
-        c.pen_color = QColor(255, 80, 80, 255)
+        # --- 終点を先に: コマ3に新しいセル ---
+        ap._new_cel_at(folder, 2)
+        assert ls.anim_frame == 2
         self._draw_ball(c, 150, 250)
-        # 影を追加（地面に接してるから影が濃い）
-        c.tool = Tool.PEN
-        c.pen_color = QColor(100, 100, 100, 80)
-        c.pen_size = 25
-        draw_stroke(c, 130, 275, 170, 275)
-        ap._on_add_frame()
-        assert len(ap.frames) == 2
+        top_cel_name = ls.active.name
+        assert top_cel_name == "2"   # 作った順に番号が付く
 
-        # --- オニオンスキンON → セル2: 中割り ---
-        # クリスタのオニオンスキン: 前のセルを薄く表示して中間の位置を確認
-        ap._onion_enabled = True
-        ap._onion_count = 2
+        # コマ2はまだセル1を出し続けている（指定なし）
+        assert anim.cel_at(folder, 1).name == "1"
 
-        # セル1を選択してから中間フレームを挿入
-        # (current_frame=0の次に挿入される)
-        ap._on_frame_clicked(0)
-        onion = ap.get_onion_images()
-        # frame 0が選択中なので前フレームはない
-        assert len(onion) == 0  # 先頭なので前がない
+        # --- 中割り: コマ2にセルを作る。オニオンスキンで前後が見える ---
+        ap._new_cel_at(folder, 1)
+        items = anim.onion_items(ls, 1, 2, 1)
+        assert {col.rgb() for _, col, _ in items} == {
+            anim.ONION_PREV.rgb(), anim.ONION_NEXT.rgb()}
+        assert ap.onion_overlay() is not None
+        self._draw_ball(c, 150, 160)
 
-        # キャンバスを消して中間位置に描く
-        self._clear_canvas(c)
-        c.pen_color = QColor(255, 80, 80, 255)
-        self._draw_ball(c, 150, 160)  # 上と下の中間
-        # 影（中間なので薄め）
-        c.tool = Tool.PEN
-        c.pen_color = QColor(100, 100, 100, 40)
-        c.pen_size = 18
-        draw_stroke(c, 135, 275, 165, 275)
-        ap._on_add_frame()
-        assert len(ap.frames) == 3
-        # 挿入位置: frame 0の後 → current_frame=1
+        # --- 番号が出てくる順と違うので振り直す ---
+        assert [anim.cel_at(folder, f).name for f in range(3)] == ["1", "3", "2"]
+        ap._renumber(folder)
+        assert [anim.cel_at(folder, f).name for f in range(3)] == ["1", "2", "3"]
 
-        # オニオンスキンで前フレームが見えるか確認
-        ap._on_frame_clicked(1)
-        onion = ap.get_onion_images()
-        assert len(onion) >= 1, "中割り描画時にオニオンスキンが機能していない"
+        # --- 2コマ打ちにしてゆっくりに ---
+        ap._edit(lambda: anim.retime(ls, folder, 2))
+        assert [anim.cel_at(folder, f).name for f in range(6)] == [
+            "1", "1", "2", "2", "3", "3"]
+        ap._len_spin.setValue(6)
 
-        # --- 再生して確認 ---
+        # ボールの位置
+        assert frame_px(win, 0, 150, 80).alpha() > 0
+        assert frame_px(win, 2, 150, 160).alpha() > 0
+        assert frame_px(win, 4, 150, 250).alpha() > 0
+        assert frame_px(win, 4, 150, 80).red() == 255 and \
+            frame_px(win, 4, 150, 80).green() == 255   # 上には何もない（白い背景）
+
+        # --- 再生（ループで2周） ---
         ap._start_play()
-        assert ap._playing
-        # 数フレーム進める（ループ確認）
-        for _ in range(6):  # 3フレーム x 2周
+        for _ in range(12):
             ap._play_next()
-        # ループして先頭に戻っているはず
-        assert 0 <= ap.current_frame < 3
+        assert 0 <= ap.playing_frame() < 6
         ap._stop_play()
-        assert not ap._playing
 
-        # --- 修正: 中割りフレームの差し替え ---
-        # 「ちょっとボールの位置が高すぎた」ので修正
-        ap._on_frame_clicked(1)  # 中割りフレーム
-        self._clear_canvas(c)
-        c.pen_color = QColor(255, 80, 80, 255)
-        self._draw_ball(c, 150, 180)  # もう少し下に修正
-        c.tool = Tool.PEN
-        c.pen_color = QColor(100, 100, 100, 50)
-        c.pen_size = 20
-        draw_stroke(c, 133, 275, 167, 275)
-        ap._on_replace_frame()
-        assert len(ap.frames) == 3  # フレーム数は変わらない
-
-        # --- フレーム順序の確認 ---
-        # フレームの画像がそれぞれ異なることを確認
-        f0 = ap.frames[0]
-        f1 = ap.frames[1]
-        f2 = ap.frames[2]
-        # ボールの位置が違うのでピクセルが異なるはず
-        center_pixel_0 = f0.pixel(150, 80)
-        center_pixel_1 = f1.pixel(150, 180)
-        center_pixel_2 = f2.pixel(150, 250)
-        # 各フレームのボール位置付近にピクセルがある（完全透明ではない）
-        assert QColor.fromRgba(center_pixel_0).alpha() > 0 or \
-               QColor.fromRgba(f0.pixel(150, 90)).alpha() > 0, \
-            "フレーム0のボール位置にピクセルがない"
-
-        # --- GIF書き出し ---
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-            gif_path = f.name
-        try:
-            ap._export_gif_to(gif_path)
-            assert os.path.exists(gif_path)
-            size = os.path.getsize(gif_path)
-            assert size > 200, f"GIFが小さすぎる: {size} bytes"
-
-            from PIL import Image
-            with Image.open(gif_path) as gif:
-                frame_count = 0
-                try:
-                    while True:
-                        frame_count += 1
-                        gif.seek(gif.tell() + 1)
-                except EOFError:
-                    pass
-                assert frame_count == 3, \
-                    f"GIFフレーム数が3ではない: {frame_count}"
-        finally:
-            os.unlink(gif_path)
-
+        # 同じ絵が続くコマは GIF では1枚にまとまる（表示時間が2倍になる）
+        assert export_gif(ap) == 3
+        assert len(ap._all_frames()) == 6
         win._toggle_anim_mode(False)
 
 
 class TestClipStudioStyle_WalkCycle:
     """
-    クリスタ風: 歩行サイクルアニメーション。
-    4コマで1歩のループ → 再生 → 修正 → 再生確認 → GIF出力。
+    クリスタ風: 歩行サイクル。地面は背景に1回描くだけで全コマに出る。
     """
 
+    def _figure(self, c, head_y, l_foot, r_foot):
+        c.tool = Tool.ELLIPSE
+        c.pen_size = 2
+        c.shape_fill = "none"
+        press(c, 140, head_y - 10)
+        move(c, 160, head_y + 10)
+        release(c, 160, head_y + 10)
+        c.tool = Tool.LINE
+        c.pen_size = 3
+        for a, b in (((150, head_y + 10), (150, head_y + 100)),
+                     ((150, head_y + 100), l_foot), ((150, head_y + 100), r_foot)):
+            press(c, *a)
+            move(c, *b)
+            release(c, *b)
+
     def test_walk_cycle_4frames(self, win):
-        """
-        棒人間の歩行4コマ:
-        フレーム1: 直立（接地）
-        フレーム2: 右足前（通過）
-        フレーム3: 右足接地
-        フレーム4: 左足前（通過）
-        """
+        import anim
         c = win.canvas
         ap = win.anim_panel
+        ls = win.layer_stack
+
+        # 地面（背景レイヤー）
+        c.tool = Tool.LINE
+        c.pen_color = QColor(100, 80, 60, 255)
+        c.pen_size = 2
+        press(c, 50, 280)
+        move(c, 250, 280)
+        release(c, 250, 280)
+
         win._toggle_anim_mode(True)
-        ap._onion_enabled = True
-        ap._onion_count = 2
-
-        # 共通: 地面の線
-        def draw_ground():
-            c.tool = Tool.LINE
-            c.pen_color = QColor(100, 80, 60, 255)
-            c.pen_size = 2
-            press(c, 50, 280)
-            move(c, 250, 280)
-            release(c, 250, 280)
-
-        def clear():
-            c.tool = Tool.ERASER
-            c.eraser_size = 200
-            for y in range(50, 350, 80):
-                draw_stroke(c, 10, y, 290, y)
-
-        # --- フレーム1: 直立 ---
-        c.tool = Tool.PEN
+        ap._on_new_folder()
         c.pen_color = QColor(0, 0, 0, 255)
-        c.pen_size = 3
-        # 頭
-        draw_stroke(c, 150, 100, 150, 100)
-        c.tool = Tool.ELLIPSE
-        c.pen_size = 2
-        c.shape_fill = "none"
-        press(c, 140, 90)
-        move(c, 160, 110)
-        release(c, 160, 110)
-        # 体
-        c.tool = Tool.LINE
-        c.pen_size = 3
-        press(c, 150, 110)
-        move(c, 150, 200)
-        release(c, 150, 200)
-        # 左足
-        press(c, 150, 200)
-        move(c, 140, 275)
-        release(c, 140, 275)
-        # 右足
-        press(c, 150, 200)
-        move(c, 160, 275)
-        release(c, 160, 275)
-        draw_ground()
-        ap._on_add_frame()
+        poses = [(100, (140, 275), (160, 275)), (95, (135, 275), (175, 260)),
+                 (100, (130, 275), (170, 275)), (95, (170, 275), (130, 260))]
+        for i, pose in enumerate(poses):
+            if i:
+                ap._on_new_cel()
+            self._figure(c, *pose)
+        ap._len_spin.setValue(4)
+        assert len(anim_folder(win).children) == 4
 
-        # --- フレーム2: 右足前 ---
-        clear()
-        c.tool = Tool.PEN
-        c.pen_color = QColor(0, 0, 0, 255)
-        c.pen_size = 3
-        # 頭（少し上）
-        c.tool = Tool.ELLIPSE
-        c.pen_size = 2
-        c.shape_fill = "none"
-        press(c, 140, 85)
-        move(c, 160, 105)
-        release(c, 160, 105)
-        # 体
-        c.tool = Tool.LINE
-        c.pen_size = 3
-        press(c, 150, 105)
-        move(c, 150, 195)
-        release(c, 150, 195)
-        # 左足（後ろ）
-        press(c, 150, 195)
-        move(c, 135, 275)
-        release(c, 135, 275)
-        # 右足（前）
-        press(c, 150, 195)
-        move(c, 175, 260)
-        release(c, 175, 260)
-        draw_ground()
-        ap._on_add_frame()
+        # 地面は全コマに出る
+        for f in range(4):
+            assert frame_px(win, f, 60, 280).red() < 200
 
-        # オニオンスキンで前フレームが見える
-        ap._on_frame_clicked(1)
-        onion = ap.get_onion_images()
-        assert len(onion) >= 1, "フレーム2でオニオンスキンが効いていない"
-
-        # --- フレーム3: 右足接地 ---
-        clear()
-        c.tool = Tool.ELLIPSE
-        c.pen_size = 2
-        c.shape_fill = "none"
-        press(c, 140, 90)
-        move(c, 160, 110)
-        release(c, 160, 110)
-        c.tool = Tool.LINE
-        c.pen_size = 3
-        press(c, 150, 110)
-        move(c, 150, 200)
-        release(c, 150, 200)
-        press(c, 150, 200)
-        move(c, 130, 275)
-        release(c, 130, 275)
-        press(c, 150, 200)
-        move(c, 170, 275)
-        release(c, 170, 275)
-        draw_ground()
-        ap._on_add_frame()
-
-        # --- フレーム4: 左足前 ---
-        clear()
-        c.tool = Tool.ELLIPSE
-        c.pen_size = 2
-        c.shape_fill = "none"
-        press(c, 140, 85)
-        move(c, 160, 105)
-        release(c, 160, 105)
-        c.tool = Tool.LINE
-        c.pen_size = 3
-        press(c, 150, 105)
-        move(c, 150, 195)
-        release(c, 150, 195)
-        press(c, 150, 195)
-        move(c, 170, 275)
-        release(c, 170, 275)
-        press(c, 150, 195)
-        move(c, 130, 260)
-        release(c, 130, 260)
-        draw_ground()
-        ap._on_add_frame()
-
-        assert len(ap.frames) == 4
-
-        # --- 再生して確認 (ループ2周) ---
+        # 再生してループ
         ap._start_play()
-        assert ap._playing
-        for _ in range(8):  # 4フレーム x 2周
+        for _ in range(8):
             ap._play_next()
         ap._stop_play()
 
-        # --- 修正: フレーム2の位置微調整 ---
-        ap._on_frame_clicked(1)
-        # 描き直すのではなく差し替え（実制作ではよくある）
-        clear()
-        c.tool = Tool.ELLIPSE
-        c.pen_size = 2
-        c.shape_fill = "none"
-        press(c, 140, 87)
-        move(c, 160, 107)
-        release(c, 160, 107)
-        c.tool = Tool.LINE
-        c.pen_size = 3
-        press(c, 150, 107)
-        move(c, 150, 197)
-        release(c, 150, 197)
-        press(c, 150, 197)
-        move(c, 133, 275)
-        release(c, 133, 275)
-        press(c, 150, 197)
-        move(c, 178, 258)
-        release(c, 178, 258)
-        draw_ground()
-        ap._on_replace_frame()
-        assert len(ap.frames) == 4
+        # --- 修正: コマ2のセルを選んで描き足す（差し替え操作は要らない） ---
+        ap._on_cell_clicked(anim_folder(win), 1)
+        assert ls.active.name == "2"
+        before = frame_px(win, 1, 200, 150)
+        c.tool = Tool.PEN
+        c.pen_size = 6
+        draw_stroke(c, 195, 150, 205, 150)
+        assert frame_px(win, 1, 200, 150) != before
+        assert frame_px(win, 0, 200, 150) == before
 
-        # --- 再生して修正を確認 ---
-        ap._start_play()
-        for _ in range(4):
-            ap._play_next()
-        ap._stop_play()
-
-        # --- GIF書き出し ---
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-            gif_path = f.name
-        try:
-            ap._export_gif_to(gif_path)
-            assert os.path.exists(gif_path)
-
-            from PIL import Image
-            with Image.open(gif_path) as gif:
-                frame_count = 0
-                try:
-                    while True:
-                        frame_count += 1
-                        gif.seek(gif.tell() + 1)
-                except EOFError:
-                    pass
-                assert frame_count == 4, \
-                    f"歩行サイクルGIFが4フレームではない: {frame_count}"
-        finally:
-            os.unlink(gif_path)
-
+        assert export_gif(ap) == 4
         win._toggle_anim_mode(False)
 
 
 class TestClipStudioStyle_FrameManipulation:
     """
-    クリスタ風: タイムライン操作の再現。
-    フレーム追加→並べ替え→削除→追加し直し→再生確認。
-    制作中に「この順番じゃない」「このフレームいらない」をやるフロー。
+    クリスタ風: タイムライン操作。入れ替え・空きコマ・同じセルの使い回し・
+    コマの挿入と削除、それぞれの取り消し。
     """
 
     def test_reorder_delete_reinsert(self, win):
-        """
-        5フレーム追加 → 順番入れ替え → 不要フレーム削除
-        → 新フレーム追加 → 再生確認 → GIF出力。
-        """
+        import anim
         c = win.canvas
         ap = win.anim_panel
+        ls = win.layer_stack
         win._toggle_anim_mode(True)
+        ap._on_new_folder()
+        folder = anim_folder(win)
 
-        # 5フレーム追加（各フレーム異なる位置に丸を描く）
         positions = [(80, 100), (120, 130), (160, 160), (200, 130), (240, 100)]
         for i, (bx, by) in enumerate(positions):
-            c.tool = Tool.ERASER
-            c.eraser_size = 200
-            for y in range(50, 350, 80):
-                draw_stroke(c, 10, y, 290, y)
-
+            if i:
+                ap._on_new_cel()
             c.tool = Tool.PEN
             c.pen_color = QColor(50 + i * 40, 100, 200 - i * 30, 255)
             c.pen_size = 15
             draw_stroke(c, bx - 10, by, bx + 10, by)
-            draw_stroke(c, bx, by - 10, bx, by + 10)
-            ap._on_add_frame()
+        ap._len_spin.setValue(5)
 
-        assert len(ap.frames) == 5
+        def names():
+            return [(anim.cel_at(folder, f).name if anim.cel_at(folder, f) else "×")
+                    for f in range(ls.anim_length)]
 
-        # --- 順番入れ替え: フレーム4を前に移動 ---
-        ap._on_frame_clicked(3)
-        ap._on_move_left()
-        assert ap.current_frame == 2
-        ap._on_move_left()
-        assert ap.current_frame == 1
+        assert names() == ["1", "2", "3", "4", "5"]
 
-        # --- 不要なフレーム削除: 最後のフレーム ---
-        ap._on_frame_clicked(4)
-        ap._on_delete_frame()
-        assert len(ap.frames) == 4
+        # セル4をコピー → セル2を Ctrl+ドラッグでコマ4へ写す → コマ2にセル4を使い回して貼る
+        ap._on_cell_clicked(folder, 3)
+        ap.copy_frames()
+        ap._on_cell_clicked(folder, 1)
+        ap._on_cell_dragged(folder, 3, True)
+        assert names() == ["1", "2", "3", "2", "5"]
+        ap.go_to(1, folder)
+        ap.paste_frames(reuse=True)
+        assert names() == ["1", "4", "3", "2", "5"]
+        assert len(folder.children) == 5   # 使い回しなのでセルは増えない
 
-        # --- フレーム追加し直し ---
-        c.tool = Tool.ERASER
-        c.eraser_size = 200
-        for y in range(50, 350, 80):
-            draw_stroke(c, 10, y, 290, y)
-        c.tool = Tool.PEN
-        c.pen_color = QColor(255, 200, 50, 255)
-        c.pen_size = 20
-        draw_stroke(c, 150, 200, 160, 200)
-        ap._on_add_frame()
-        assert len(ap.frames) == 5
+        # 最後のコマを削除
+        ap._edit(lambda: anim.delete_frame(ls, 4))
+        assert names() == ["1", "4", "3", "2"]
 
-        # --- 再生確認 ---
+        # セル1を最後にもう一度使う（往復の動き）
+        ap._edit(lambda: anim.insert_frame(ls, 4))
+        ap._edit(lambda: anim.set_spec(folder, 4, folder.children[-1].uid))
+        assert names() == ["1", "4", "3", "2", "1"]
+
+        # 空きコマ
+        ap._edit(lambda: anim.set_spec(folder, 2, anim.BLANK))
+        assert names() == ["1", "4", "×", "2", "1"]
+        assert frame_px(win, 2, 160, 160).red() == 255   # 背景だけ
+
+        # 取り消しで1つずつ戻る
+        c.undo()
+        assert names() == ["1", "4", "3", "2", "1"]
+        c.undo()
+        c.undo()
+        assert names() == ["1", "4", "3", "2"]
+        c.redo()
+        c.redo()
+        assert names() == ["1", "4", "3", "2", "1"]
+
         ap._start_play()
-        assert ap._playing
-        for _ in range(10):  # 2周
+        for _ in range(10):
             ap._play_next()
         ap._stop_play()
 
-        # --- GIF書き出し ---
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-            gif_path = f.name
-        try:
-            ap._export_gif_to(gif_path)
-            from PIL import Image
-            with Image.open(gif_path) as gif:
-                count = 0
-                try:
-                    while True:
-                        count += 1
-                        gif.seek(gif.tell() + 1)
-                except EOFError:
-                    pass
-                assert count == 5
-        finally:
-            os.unlink(gif_path)
-
+        assert export_gif(ap) == 5
         win._toggle_anim_mode(False)
 
 
 class TestClipStudioStyle_OnionSkinDrawing:
     """
-    クリスタのオニオンスキン機能を活用した作画フロー。
-    前のフレームを透かして見ながら次を描く。
+    オニオンスキンをON/OFF・枚数を変えながら描くフロー。
     """
 
     def test_onion_skin_progressive_drawing(self, win):
-        """
-        オニオンスキンをON/OFFしながら6フレームのアニメを描く。
-        途中でオニオンスキン枚数を変えて確認する。
-        """
+        import anim
         c = win.canvas
         ap = win.anim_panel
+        ls = win.layer_stack
         win._toggle_anim_mode(True)
+        ap._onion_check.setChecked(False)
+        ap._on_new_folder()
 
-        # 最初はオニオンスキンOFF（1枚目はガイドなしで描く）
-        ap._onion_enabled = False
-
-        # フレーム1
         c.tool = Tool.PEN
         c.pen_color = QColor(0, 0, 0, 255)
         c.pen_size = 5
-        draw_stroke(c, 100, 200, 130, 200)  # 左位置
-        ap._on_add_frame()
+        draw_stroke(c, 100, 200, 130, 200)
+        assert ap.onion_overlay() is None
 
-        # 2枚目からオニオンスキンON
-        ap._onion_enabled = True
-        ap._onion_count = 1
+        ap._onion_check.setChecked(True)
+        ap._onion_before_spin.setValue(1)
+        ap._on_new_cel()
+        draw_stroke(c, 120, 200, 150, 200)
+        ov = ap.onion_overlay()
+        assert ov is not None
+        # 前のセルの線が青で見える
+        cp = c._widget_to_canvas(QPoint(105, 200))
+        o = px(ov, cp.x(), cp.y())
+        assert o.alpha() > 0 and o.blue() > o.red()
 
-        # フレーム2
-        c.tool = Tool.ERASER
-        c.eraser_size = 200
-        draw_stroke(c, 10, 100, 290, 250)
-        c.tool = Tool.PEN
-        c.pen_color = QColor(0, 0, 0, 255)
-        c.pen_size = 5
-        draw_stroke(c, 120, 200, 150, 200)  # 少し右
-        ap._on_add_frame()
-
-        # オニオンスキン確認
-        ap._on_frame_clicked(1)
-        onion = ap.get_onion_images()
-        assert len(onion) == 1, "オニオンスキン1枚のはずが違う"
-        opacity = onion[0][1]
-        assert 0 < opacity < 1, "オニオンスキンの不透明度が異常"
-
-        # フレーム3〜6: オニオンスキン枚数を増やしながら描く
-        ap._onion_count = 2
+        ap._onion_before_spin.setValue(2)
         for i in range(4):
-            c.tool = Tool.ERASER
-            c.eraser_size = 200
-            draw_stroke(c, 10, 100, 290, 250)
-            c.tool = Tool.PEN
-            c.pen_color = QColor(0, 0, 0, 255)
-            c.pen_size = 5
+            ap._on_new_cel()
             x = 140 + i * 20
             draw_stroke(c, x, 200, x + 30, 200)
-            ap._on_add_frame()
+        ap._len_spin.setValue(6)
+        ap.go_to(5)
+        assert len(anim.onion_items(ls, 5, 2, ap._onion_after)) == 2
 
-        assert len(ap.frames) == 6
+        # キャンバスに描くと、オニオンスキンは絵の上に重なる
+        img = c.grab()
+        assert not img.isNull()
 
-        # 最後のフレームでオニオンスキン枚数確認
-        ap._on_frame_clicked(5)
-        onion = ap.get_onion_images()
-        assert len(onion) == 2, f"オニオンスキン2枚のはずが{len(onion)}枚"
-        # 近いフレームほど不透明度が高い
-        assert onion[0][1] > onion[1][1], \
-            "近いフレームの方が不透明度が低い（逆になっている）"
-
-        # オニオンスキンOFFにして確認
-        ap._onion_enabled = False
-        assert ap.get_onion_images() == []
-
-        # 再度ONにして再生
-        ap._onion_enabled = True
         ap._start_play()
+        assert ap.onion_overlay() is None   # 再生中は出さない
         for _ in range(6):
             ap._play_next()
         ap._stop_play()
 
-        # GIF出力
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-            gif_path = f.name
-        try:
-            ap._export_gif_to(gif_path)
-            from PIL import Image
-            with Image.open(gif_path) as gif:
-                count = 0
-                try:
-                    while True:
-                        count += 1
-                        gif.seek(gif.tell() + 1)
-                except EOFError:
-                    pass
-                assert count == 6
-        finally:
-            os.unlink(gif_path)
-
+        assert export_gif(ap) == 6
         win._toggle_anim_mode(False)
 
 
 class TestClipStudioStyle_ModeSwitch:
     """
-    お絵かきモード ↔ アニメーションモードの切り替えフロー。
-    絵を描いてからアニメモードに入り、またお絵かきに戻る。
+    お絵かき ↔ アニメーションモードの切り替え。タイムラインは作品に残る。
     """
 
-    def test_paint_then_animate_then_paint(self, win):
-        """
-        1. お絵かきモードでイラストを描く
-        2. アニメーションモードに切り替えてフレーム追加
-        3. お絵かきモードに戻って描き足す
-        4. 再度アニメモードでフレーム追加 → GIF出力
-        """
+    def test_paint_then_animate_then_paint(self, win, tmp_path):
+        import anim
         c = win.canvas
         ls = c.layer_stack
         ap = win.anim_panel
 
-        # --- お絵かきモード: イラストを描く ---
         assert not ap.isVisible()
         c.tool = Tool.PEN
         c.pen_color = QColor(255, 0, 0, 255)
         c.pen_size = 20
         draw_stroke(c, 100, 100, 200, 100)
 
-        win.layer_panel._add()
+        win._toggle_anim_mode(True)
+        ap._on_new_folder()
         c.pen_color = QColor(0, 0, 255, 255)
         draw_stroke(c, 100, 150, 200, 150)
-        assert len(ls.layers) == 2
+        ap._on_new_cel()
+        draw_stroke(c, 100, 160, 200, 160)
+        ap._len_spin.setValue(2)
 
-        # --- アニメモードに切り替え ---
-        win._toggle_anim_mode(True)
-        assert ap.isVisible()
-
-        # 現在のキャンバスをフレーム1として追加
-        ap._on_add_frame()
-        assert len(ap.frames) == 1
-
-        # --- お絵かきモードに戻る ---
         win._toggle_anim_mode(False)
         assert not ap.isVisible()
 
-        # 描き足す（レイヤーは維持されている）
-        assert len(ls.layers) == 2
-        c.tool = Tool.PEN
+        # 背景に描き足すと全コマに出る
+        ls.active_path = [len(ls.layers) - 1]
         c.pen_color = QColor(0, 255, 0, 255)
-        c.pen_size = 15
         draw_stroke(c, 100, 200, 200, 200)
+        assert frame_px(win, 0, 150, 200).green() > 200
+        assert frame_px(win, 1, 150, 200).green() > 200
 
-        # --- 再度アニメモード ---
         win._toggle_anim_mode(True)
-        # フレームは保持されている
-        assert len(ap.frames) == 1
+        assert ls.anim_length == 2
+        assert anim.cel_at(anim_folder(win), 1).name == "2"
 
-        # 変更後のキャンバスをフレーム2として追加
-        ap._on_add_frame()
-        assert len(ap.frames) == 2
-
-        # GIF出力
-        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-            gif_path = f.name
-        try:
-            ap._export_gif_to(gif_path)
-            assert os.path.exists(gif_path)
-            assert os.path.getsize(gif_path) > 100
-        finally:
-            os.unlink(gif_path)
-
+        # 保存して開き直しても同じ
+        path = str(tmp_path / "anim.pola")
+        win._write_pola(path)
+        win._load_pola(path)
+        folder = anim_folder(win)
+        assert [anim.cel_at(folder, f).name for f in range(2)] == ["1", "2"]
+        assert export_gif(ap) == 2
         win._toggle_anim_mode(False)
 
-
-# ── 線画抽出: 色彩補正と適応的しきい値 ──────────────────────────────────────
 
 class TestLineExtraction:
     """写真からの線画抽出。照明ムラのある画像で、固定しきい値では
@@ -3559,7 +3260,7 @@ class TestThemePersistence:
     def test_saved_theme_is_restored(self):
         from PyQt6.QtCore import QSettings
         from main import MainWindow
-        s = QSettings("PaintPola", "PaintPola")
+        s = open_settings()
         before = s.value("theme")
         try:
             s.setValue("theme", "win95")
@@ -3578,7 +3279,7 @@ class TestThemePersistence:
         """壊れた値が入っていても起動できること。"""
         from PyQt6.QtCore import QSettings
         from main import MainWindow
-        s = QSettings("PaintPola", "PaintPola")
+        s = open_settings()
         before = s.value("theme")
         try:
             s.setValue("theme", "存在しないテーマ")
@@ -3600,7 +3301,7 @@ class TestThemePersistence:
         """
         from PyQt6.QtCore import QSettings
         from main import MainWindow
-        s = QSettings("PaintPola", "PaintPola")
+        s = open_settings()
         before = s.value("theme")
         try:
             s.setValue("theme", ["win95"])
@@ -3614,15 +3315,32 @@ class TestThemePersistence:
                 s.setValue("theme", before)
             s.sync()
 
+    def test_tests_do_not_touch_real_settings(self):
+        """テストでテーマを切り替えても、本物の設定（レジストリ）は変わらないこと。
+
+        以前はテストが最後に選んだテーマが本物の設定に残り、
+        次にアプリを起動するとそのテーマ（ダーク）で始まっていた。
+        """
+        from PyQt6.QtCore import QSettings
+        from main import MainWindow
+        real = QSettings(QSettings.Format.NativeFormat, QSettings.Scope.UserScope,
+                         "PaintPola", "PaintPola")
+        before = real.value("theme")
+        w = MainWindow()
+        for key in w._theme_actions:
+            w._apply_theme(key)
+        real.sync()
+        assert real.value("theme") == before
+
     def test_apply_theme_writes_setting(self):
         from PyQt6.QtCore import QSettings
         from main import MainWindow
-        s = QSettings("PaintPola", "PaintPola")
+        s = open_settings()
         before = s.value("theme")
         try:
             w = MainWindow()
             w._theme_actions["pastel"].trigger()
-            assert QSettings("PaintPola", "PaintPola").value("theme") == "pastel"
+            assert open_settings().value("theme") == "pastel"
         finally:
             if before is None:
                 s.remove("theme")
@@ -3639,7 +3357,7 @@ class TestPalettePersistence:
         """本物の設定を壊さないよう、パレットのキーだけ退避する。"""
         from PyQt6.QtCore import QSettings
         import color_panel as cp
-        s = QSettings("PaintPola", "PaintPola")
+        s = open_settings()
         before = s.value(cp._USER_PALETTE_KEY)
         s.remove(cp._USER_PALETTE_KEY)
         s.sync()

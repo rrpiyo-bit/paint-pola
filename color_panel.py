@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtGui import (QColor, QPainter, QLinearGradient, QBrush, QImage,
                           QConicalGradient)
 from PyQt6.QtCore import Qt, QRect, QRectF, pyqtSignal, QSize, QSettings
+from app_settings import open_settings
 
 
 class CollapsibleSection(QWidget):
@@ -756,7 +757,7 @@ class ColorPanel(QWidget):
 
         # 自分で作ったパレットは設定に保存する。組み込みパレットは
         # 読み取り専用で、登録先にはならない。
-        self._settings = QSettings("PaintPola", "PaintPola")
+        self._settings = open_settings()
         self._user_palettes = _safe_user_palettes(
             self._settings.value(_USER_PALETTE_KEY, ""))
         self._current_palette = "基本色"

@@ -602,7 +602,8 @@ class Canvas(QWidget):
 
     # テキスト入力ダイアログをキャンバス内で閉じるため、main から注入する
     ask_text_fn: object = None  # type: ignore  # Callable[[Canvas], None] | None
-    _get_onion_images: object = None  # type: ignore  # Callable[[], list[tuple[QImage, float]]] | None
+    _get_onion_overlay: object = None  # type: ignore  # Callable[[], QImage | None] | None
+    _get_playback_image: object = None  # type: ignore  # Callable[[], QImage | None] | None
 
     def __init__(self, layer_stack: LayerStack, parent=None):
         super().__init__(parent)
@@ -1184,6 +1185,9 @@ class Canvas(QWidget):
             # 線は点の並びなので画像よりずっと軽い。1点あたり 24 バイト見当。
             return sum(len(s.points) * 24 for s in entry[2])
 
+        if entry[0] == "anim":
+            return 0
+
         def _snap_bytes(snap) -> int:
             if snap.get("type") == "group":
                 return sum(_snap_bytes(c) for c in snap.get("children", []))
@@ -1253,6 +1257,8 @@ class Canvas(QWidget):
                 "opacity": lyr.opacity, "clipping": lyr.clipping,
                 "reference": lyr.reference, "locked": lyr.locked,
                 "collapsed": lyr.collapsed,
+                "timeline": (list(lyr.timeline)
+                             if getattr(lyr, "timeline", None) is not None else None),
                 "children": [self._snapshot_layer(c) for c in lyr.children],
                 "_w": lyr._w, "_h": lyr._h,
             }
@@ -1292,6 +1298,8 @@ class Canvas(QWidget):
             g.locked = snap.get("locked", False)
             g.collapsed = snap["collapsed"]
             g.pass_through = snap.get("pass_through", False)
+            tl = snap.get("timeline")
+            g.timeline = list(tl) if tl is not None else None
             g.children = [self._restore_layer(c) for c in snap["children"]]
             if "uid" in snap:
                 g.uid = snap["uid"]
@@ -1329,8 +1337,18 @@ class Canvas(QWidget):
             # キャンバスサイズも一緒に控える。サイズ変更を元に戻したとき、
             # 画像だけ旧サイズに戻ってキャンバスと食い違うのを防ぐ。
             "canvas_size": (ls.width, ls.height),
+            "anim": (ls.anim_length, ls.anim_frame),
         }
         self._history.append(("structure", snap))
+        self._redo_stack.clear()
+        self._trim_history()
+        self.edited.emit()
+
+    def save_anim_history(self) -> None:
+        """タイムライン（セルの指定・コマ数）だけを変える直前の状態を控える。
+        レイヤーの絵は変わらないので、構造の控えより軽い。"""
+        import anim
+        self._history.append(("anim", anim.timelines_state(self.layer_stack)))
         self._redo_stack.clear()
         self._trim_history()
         self.edited.emit()
@@ -1364,6 +1382,7 @@ class Canvas(QWidget):
         if path:
             path[0] = min(path[0], max(0, len(ls.layers) - 1))
         ls.active_path = path
+        ls.anim_length, ls.anim_frame = snap.get("anim", (ls.anim_length, ls.anim_frame))
 
     def _all_layer_ids(self) -> set[int]:
         ids: set[int] = set()
@@ -1379,7 +1398,7 @@ class Canvas(QWidget):
         live = self._all_layer_ids()
 
         def _alive(e) -> bool:
-            if e[0] == "structure":
+            if e[0] in ("structure", "anim"):
                 return True
             # pixel と vector はどちらもレイヤーに結びついているので、
             # そのレイヤーが残っているものだけ残す。
@@ -1486,6 +1505,7 @@ class Canvas(QWidget):
                     "layers": [self._snapshot_layer(l) for l in self.layer_stack.layers],
                     "active_path": list(self.layer_stack.active_path),
                     "canvas_size": (self.layer_stack.width, self.layer_stack.height),
+                    "anim": (self.layer_stack.anim_length, self.layer_stack.anim_frame),
                 }))
                 self._apply_structure_snapshot(snap)
                 # 作り直したレイヤーには選択中のベクター線は無い
@@ -1493,6 +1513,12 @@ class Canvas(QWidget):
                     self._vector_selected = None
                     self._vector_drag = None
                     self.vector_selection_changed.emit()
+                if self._on_structure_restored:
+                    self._on_structure_restored()
+            elif entry[0] == "anim":
+                import anim
+                dst.append(("anim", anim.timelines_state(self.layer_stack)))
+                anim.restore_timelines(self.layer_stack, entry[1])
                 if self._on_structure_restored:
                     self._on_structure_restored()
             break
@@ -1513,15 +1539,18 @@ class Canvas(QWidget):
         # 透明チェッカーボード
         self._draw_checkerboard(p)
 
-        # オニオンスキン（前のフレームを半透明表示）
-        if self._get_onion_images:
-            for onion_img, onion_opacity in self._get_onion_images():
-                p.setOpacity(onion_opacity)
-                p.drawImage(0, 0, onion_img)
-            p.setOpacity(1.0)
-
-        if not self._paint_stroke_layers(p):
+        playback = self._get_playback_image() if self._get_playback_image else None
+        if playback is not None:
+            # アニメーション再生中は作っておいたコマの絵を出すだけ
+            p.drawImage(0, 0, playback)
+        elif not self._paint_stroke_layers(p):
             p.drawImage(0, 0, self._composite_with_floating())
+        # オニオンスキン（前後のコマのセルを色付きで重ねる）。
+        # 背景の下に置くと不透明な用紙で隠れてしまうので、絵の上に重ねる。
+        if playback is None and self._get_onion_overlay:
+            onion = self._get_onion_overlay()
+            if onion is not None:
+                p.drawImage(0, 0, onion)
         if self._overlay_preview is not None:
             p.drawImage(0, 0, self._overlay_preview)
 

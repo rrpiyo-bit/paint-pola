@@ -9,8 +9,28 @@ import sys
 if not os.environ.get("PAINTPOLA_TEST_GUI"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import tempfile
+
 import pytest
+from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication, QMessageBox
+
+# テストがテーマ等を切り替えると、そのまま本物の設定（レジストリ）に
+# 書き込まれ、次にアプリを起動したとき最後にテストが選んだテーマで
+# 始まっていた。設定の保存先をテスト専用の一時フォルダに向ける。
+_SETTINGS_DIR = tempfile.mkdtemp(prefix="paintpola_settings_")
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, _SETTINGS_DIR)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings():
+    """前のテストが保存した設定（手ブレ補正・入り抜き等）を持ち越さない。"""
+    s = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
+                  "PaintPola", "PaintPola")
+    s.clear()
+    s.sync()
+    yield
 
 
 @pytest.fixture(scope="session")

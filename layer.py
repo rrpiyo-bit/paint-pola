@@ -59,25 +59,18 @@ def _item_buffer(item, w: int, h: int, off_x: int, off_y: int, skip=None) -> QIm
 
 
 def _lerp_into(target: QImage, before: QImage, t: float) -> None:
-    """target = before + (target - before) * t。通過グループの不透明度用。"""
-    w, h = target.width(), target.height()
-    a = _as_premul_array(before, w, h)
-    b = _as_premul_array(target, w, h)
-    out = (a.astype(np.float32) * (1.0 - t) + b.astype(np.float32) * t)
-    out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
-    img = QImage(out.tobytes(), w, h, w * 4,
-                 QImage.Format.Format_ARGB32_Premultiplied).copy()
+    """target = before + (target - before) * t。通過グループの不透明度用。
+
+    Source モードに不透明度を付けて描くと、Qt は「描く絵 × 不透明度 +
+    今の絵 × (1 - 不透明度)」で置き換える。before を 1 - t で描けば
+    そのまま線形補間になる。numpy で全画素を計算し直すと、ストローク中の
+    再描画のたびに数百ms かかっていた。
+    """
     p = QPainter(target)
     p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-    p.drawImage(0, 0, img)
+    p.setOpacity(1.0 - t)
+    p.drawImage(0, 0, before)
     p.end()
-
-
-def _as_premul_array(img: QImage, w: int, h: int) -> np.ndarray:
-    src = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-    ptr = src.constBits()
-    ptr.setsize(h * w * 4)
-    return np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
 
 
 def _draw_item(target: QImage, item, off_x: int, off_y: int, skip=None) -> None:
@@ -425,6 +418,8 @@ class GroupLayer:
         # グループのロックは中のレイヤー全部に効く。
         self.locked = False
         self.collapsed = False  # True のとき子レイヤーをパネルで非表示
+        # アニメーションフォルダのときだけ、コマごとのセル指定（anim.py）
+        self.timeline: list[int | None] | None = None
         self.children: list[Layer | GroupLayer] = []
         self._w = w
         self._h = h
@@ -474,6 +469,9 @@ class LayerStack:
         self.active_path: list[int] = [0]
         self.width = w
         self.height = h
+        # アニメーションの再生時間（コマ数）と今のコマ（anim.py）
+        self.anim_length = 8
+        self.anim_frame = 0
 
     # ── 後方互換プロパティ ──
     @property

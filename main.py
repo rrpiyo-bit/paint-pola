@@ -22,6 +22,7 @@ from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
 from layer import LayerStack, Layer, GroupLayer, CANVAS_W, CANVAS_H, render_items
 from vector import VectorLayer
 from animation_panel import AnimationPanel
+import anim
 from canvas import Canvas
 from toolbar import Toolbar
 from layer_panel import LayerPanel
@@ -31,6 +32,7 @@ from tools import Tool
 from tool_options_panel import ToolOptionsPanel
 from toolbar import make_tool_cursors
 from themes import get_theme_keys, get_theme_label, get_theme_qss
+from app_settings import open_settings
 
 
 def _apply_color_correction(bgr: np.ndarray, contrast: int, brightness: int,
@@ -1300,7 +1302,7 @@ _TAPER_TOOL_KEYS = {Tool.PEN: "pen", Tool.ERASER: "eraser"}
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self._settings = QSettings("PaintPola", "PaintPola")
+        self._settings = open_settings()
         self._current_path: str | None = None  # 現在開いている .pola ファイルのパス
         self._dirty = False  # 未保存の変更があるか（タイトルの * 印・終了時確認に使う）
         self.setWindowTitle("PaintPola")
@@ -1319,12 +1321,21 @@ class MainWindow(QMainWindow):
 
         self._tool_cursors = make_tool_cursors()
 
-        self.anim_panel = AnimationPanel()
+        self.anim_panel = AnimationPanel(self.layer_stack)
         self.anim_panel.setVisible(False)
-        self.anim_panel.set_composite_fn(lambda: self.layer_stack.composite())
-        self.anim_panel.onion_skin_changed.connect(self.canvas.update)
-        self.anim_panel.frames_changed.connect(self._mark_dirty)
-        self.canvas._get_onion_images = self.anim_panel.get_onion_images
+        ap = self.anim_panel
+        ap.onion_skin_changed.connect(self.canvas.update)
+        ap.playback_tick.connect(self.canvas.update)
+        ap.frames_changed.connect(self._mark_dirty)
+        ap.anim_will_change.connect(self.canvas.save_anim_history)
+        ap.structure_will_change.connect(self.canvas.save_structure_history)
+        ap.frame_changed.connect(self._on_anim_frame_changed)
+        # レイヤーパネルでセルを消したり動かしたりしたらタイムラインも合わせる
+        self.layer_panel.layers_changed.connect(ap.sync)
+        # 描いたらタイムラインのサムネイルを描き直す
+        self.canvas.edited.connect(lambda: ap._view.update() if ap.isVisible() else None)
+        self.canvas._get_onion_overlay = ap.onion_overlay
+        self.canvas._get_playback_image = ap.playback_image
         self._anim_mode = False
         # 開いている線画抽出ダイアログと、そのあいだ止めているメニュー項目
         self._line_dialog = None
@@ -1387,6 +1398,8 @@ class MainWindow(QMainWindow):
         self.layer_stack.width = w
         self.layer_stack.height = h
         self.layer_stack.active_path = [0]
+        self.layer_stack.anim_length = anim.DEFAULT_LENGTH
+        self.layer_stack.anim_frame = 0
         bg = Layer("背景", w, h)
         p = QPainter(bg.image)
         p.fillRect(0, 0, w, h, Qt.GlobalColor.white)
@@ -1877,7 +1890,19 @@ class MainWindow(QMainWindow):
         self._anim_mode_action.toggled.connect(self._toggle_anim_mode)
         anim_menu.addAction(self._anim_mode_action)
         anim_menu.addSeparator()
-        self._add_action(anim_menu, "アニメーションGIFを書き出し...", self.anim_panel._on_export_gif)
+        ap = self.anim_panel
+        self._add_action(anim_menu, "新しいアニメーションフォルダ",
+                         lambda: self._anim_do(ap._on_new_folder))
+        self._add_action(anim_menu, "新しいセル", lambda: self._anim_do(ap._on_new_cel))
+        self._add_action(anim_menu, "セルを複製して次のコマへ",
+                         lambda: self._anim_do(ap._on_dup_cel))
+        anim_menu.addSeparator()
+        self._add_action(anim_menu, "前のコマ", lambda: self._anim_do(ap.prev_frame), ",")
+        self._add_action(anim_menu, "次のコマ", lambda: self._anim_do(ap.next_frame), ".")
+        self._add_action(anim_menu, "再生 / 停止", lambda: self._anim_do(ap._on_play_toggle))
+        anim_menu.addSeparator()
+        self._add_action(anim_menu, "アニメーションGIFを書き出し...", ap._on_export_gif)
+        self._add_action(anim_menu, "連番PNGを書き出し...", ap._on_export_png_sequence)
 
     def _update_edit_menu(self):
         has_sel = self.canvas._selection_rect is not None
@@ -1965,6 +1990,8 @@ class MainWindow(QMainWindow):
         self.layer_stack.width = iw
         self.layer_stack.height = ih
         self.layer_stack.active_path = [0]
+        self.layer_stack.anim_length = anim.DEFAULT_LENGTH
+        self.layer_stack.anim_frame = 0
         bg = Layer("背景", iw, ih)
         p = QPainter(bg.image)
         p.drawImage(0, 0, img)
@@ -2074,6 +2101,13 @@ class MainWindow(QMainWindow):
                         info["reference"] = lyr.reference
                         info["locked"] = lyr.locked
                         info["children"] = [_write_layer(c) for c in lyr.children]
+                        if getattr(lyr, "timeline", None) is not None:
+                            # uid は開き直すと変わるので、子の並び順の番号で書く
+                            # （-1 は空きコマ、null は指定なし）
+                            idx = {c.uid: i for i, c in enumerate(lyr.children)}
+                            info["timeline"] = [
+                                None if v is None else idx.get(v, -1)
+                                for v in lyr.timeline]
                     else:
                         info["clipping"] = lyr.clipping
                         info["reference"] = lyr.reference
@@ -2152,30 +2186,22 @@ class MainWindow(QMainWindow):
     _MAX_ANIM_FRAMES = 1000
 
     def _write_anim_frames(self, zf, meta: dict) -> None:
-        """アニメーションのコマも作品の一部として保存する。"""
-        frames = self.anim_panel.frames
-        if not frames:
-            return
-        names = []
-        for i, img in enumerate(frames):
-            buf = QByteArray()
-            bio = QBuffer(buf)
-            bio.open(QIODevice.OpenModeFlag.WriteOnly)
-            img.save(bio, "PNG")
-            bio.close()
-            name = f"frame_{i}.png"
-            zf.writestr(name, bytes(buf))
-            names.append(name)
-        meta["anim"] = {"frames": names, "fps": self.anim_panel.fps}
+        """アニメーションの設定を保存する。セルはレイヤーとして保存済み。"""
+        ls = self.layer_stack
+        meta["anim"] = {"fps": self.anim_panel.fps, "length": ls.anim_length,
+                        "frame": ls.anim_frame}
 
     def _read_anim_frames(self, zf, meta: dict) -> tuple[list[QImage], int | None]:
+        """fps と、旧形式（合成済みのコマ画像）のコマを読む。"""
         import pathlib
-        anim = meta.get("anim")
-        if not isinstance(anim, dict):
+        info = meta.get("anim")
+        if not isinstance(info, dict):
             return [], None
-        names = anim.get("frames")
+        fps = info.get("fps")
+        fps = self._clamp(fps, 1, 60, 8) if fps is not None else None
+        names = info.get("frames")
         if not isinstance(names, list):
-            return [], None
+            return [], fps
         frames: list[QImage] = []
         for n in names[:self._MAX_ANIM_FRAMES]:
             if not isinstance(n, str):
@@ -2187,8 +2213,7 @@ class MainWindow(QMainWindow):
             if img.isNull():
                 raise ValueError(f"コマ画像の読み込みに失敗: {safe}")
             frames.append(img.convertToFormat(QImage.Format.Format_ARGB32))
-        fps = anim.get("fps")
-        return frames, (self._clamp(fps, 1, 60, 8) if fps is not None else None)
+        return frames, fps
 
     @staticmethod
     def _clamp(val, lo, hi, default):
@@ -2370,6 +2395,13 @@ class MainWindow(QMainWindow):
                         children = info.get("children", [])
                         if isinstance(children, list):
                             grp.children = [_read_layer(c) for c in children]
+                        tl = info.get("timeline")
+                        if isinstance(tl, list):
+                            n = len(grp.children)
+                            grp.timeline = [
+                                None if not isinstance(v, int) or isinstance(v, bool)
+                                else (grp.children[v].uid if 0 <= v < n else anim.BLANK)
+                                for v in tl[:anim.MAX_LENGTH]]
                         return grp
                     else:
                         is_vec = bool(info.get("is_vector", False))
@@ -2473,9 +2505,18 @@ class MainWindow(QMainWindow):
         rot = meta.get("view_rotation", 0)
         self.canvas._rotation = rot % 360 if isinstance(rot, int) and rot % 90 == 0 else 0
         self.canvas._flip_h = bool(meta.get("view_flip_h", False))
-        self._document_replaced(path)
+        anim_meta = meta["anim"] if isinstance(meta.get("anim"), dict) else {}
+        tl_lens = [len(f.timeline) for f in anim.anim_folders(ls.layers)]
+        ls.anim_length = self._clamp(
+            anim_meta.get("length", max(tl_lens, default=anim.DEFAULT_LENGTH)),
+            1, anim.MAX_LENGTH, anim.DEFAULT_LENGTH)
+        ls.anim_frame = self._clamp(anim_meta.get("frame", 0), 0, ls.anim_length - 1, 0)
         if anim_frames:
-            self.anim_panel.set_frames(anim_frames, anim_fps)
+            # 旧形式のコマはアニメーションフォルダのセルにして引き継ぐ
+            anim.migrate_frames(ls, anim_frames)
+        if anim_fps is not None:
+            self.anim_panel.set_fps(anim_fps)
+        self._document_replaced(path)
 
     # ── PNG 書き出し ─────────────────────────────────────────────────────────
 
@@ -2502,6 +2543,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "エラー", "書き出しに失敗しました。")
 
     def _on_structure_restored(self):
+        self.anim_panel.sync()
         self.layer_panel.refresh()
         self.navigator.refresh()
         # キャンバスサイズ変更を元に戻したときに表示がずれないように
@@ -2527,7 +2569,22 @@ class MainWindow(QMainWindow):
         self.anim_panel.setVisible(enabled)
         if not enabled:
             self.anim_panel._stop_play()
+        else:
+            self.anim_panel.sync()
         self.canvas.update()
+
+    def _anim_do(self, fn) -> None:
+        """アニメーションメニューの操作。モードが切れていたら入れてから行う。"""
+        if not self._anim_mode:
+            self._anim_mode_action.setChecked(True)
+        fn()
+
+    def _on_anim_frame_changed(self) -> None:
+        """コマを移るとセルの表示と選択中のレイヤーが変わる。"""
+        self.layer_panel.refresh()
+        self._refresh_tool_options_if_kind_changed()
+        self.canvas.update()
+        self.navigator.refresh()
 
     def _on_status_message(self, msg: str):
         self._status_coord.setText(msg)
@@ -2678,24 +2735,6 @@ class MainWindow(QMainWindow):
                     _resize_layer_image(layer, new_w, new_h, mode == "scale")
 
         _resize_items(self.layer_stack.layers)
-
-        # アニメのコマもレイヤーと同じように新サイズへ合わせる。
-        # 旧サイズのコマが混ざると、GIF書き出しでコマが黙って落ちたり
-        # オニオンスキンがずれた位置に出たりする。
-        for i, frame in enumerate(self.anim_panel.frames):
-            buf = QImage(new_w, new_h, QImage.Format.Format_ARGB32_Premultiplied)
-            buf.fill(Qt.GlobalColor.transparent)
-            fp = QPainter(buf)
-            if mode == "scale":
-                fp.drawImage(0, 0, frame.scaled(
-                    new_w, new_h,
-                    Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation))
-            else:
-                fp.drawImage(offset_x, offset_y, frame)
-            fp.end()
-            self.anim_panel.frames[i] = buf.convertToFormat(QImage.Format.Format_ARGB32)
-        self.anim_panel._rebuild_thumbs()
 
         self.layer_stack.width = new_w
         self.layer_stack.height = new_h
