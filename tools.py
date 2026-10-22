@@ -12,6 +12,7 @@ class Tool(Enum):
     TEXT = auto()
     SELECT_RECT = auto()
     LASSO = auto()
+    SELECT_PEN = auto()
     LASSO_FILL = auto()
     BLUR = auto()
     MOVE = auto()

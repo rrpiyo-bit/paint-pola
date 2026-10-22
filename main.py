@@ -1493,6 +1493,10 @@ class MainWindow(QMainWindow):
             lambda v: self._set_tool_setting("fill_tolerance", int(v)))
         self.tool_options.text_font_changed.connect(
             lambda v: self._set_tool_setting("text_font_family", str(v)))
+        self.tool_options.select_pen_size_changed.connect(
+            lambda v: setattr(self.canvas, 'select_pen_size', v))
+        self.tool_options.select_pen_erase_changed.connect(
+            lambda v: setattr(self.canvas, 'select_pen_erase', v))
         self.tool_options.text_size_changed.connect(
             lambda v: self._set_tool_setting("text_size", int(v)))
         # [ ] や Ctrl+ドラッグでサイズ変更 → オプションパネルも同期
@@ -1632,6 +1636,8 @@ class MainWindow(QMainWindow):
             fill_tolerance=self.canvas.fill_tolerance,
             text_font=self.canvas.text_font_family,
             text_size=self.canvas.text_size,
+            select_pen_size=self.canvas.select_pen_size,
+            select_pen_erase=self.canvas.select_pen_erase,
         )
 
     def _refresh_tool_options_if_kind_changed(self):

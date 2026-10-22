@@ -111,6 +111,8 @@ class ToolOptionsPanel(QWidget):
     mesh_div_changed = pyqtSignal(int)              # メッシュ分割数
     blur_size_changed = pyqtSignal(int)
     blur_strength_changed = pyqtSignal(int)         # 0〜100 (%)
+    select_pen_size_changed = pyqtSignal(int)
+    select_pen_erase_changed = pyqtSignal(bool)     # True: なぞった所を選択から外す
     # ベクターレイヤー用（ペン選択時のみ出る）
     vector_pen_mode_changed = pyqtSignal(str)       # "draw" | "select"
     vector_width_changed = pyqtSignal(int)          # 選択中の線の太さ
@@ -196,7 +198,9 @@ class ToolOptionsPanel(QWidget):
                  eraser_antialias: bool = False,
                  fill_tolerance: int = 0,
                  text_font: str = "Arial",
-                 text_size: int = 40):
+                 text_size: int = 40,
+                 select_pen_size: int = 30,
+                 select_pen_erase: bool = False):
         self._current_tool = tool
         self._clear()
 
@@ -209,6 +213,7 @@ class ToolOptionsPanel(QWidget):
             Tool.ELLIPSE: "楕円",
             Tool.SELECT_RECT: "矩形選択",
             Tool.LASSO: "投げなわ",
+            Tool.SELECT_PEN: "選択ペン",
             Tool.LASSO_FILL: "囲み内塗りつぶし",
             Tool.BLUR: "ぼかし",
             Tool.MOVE: "移動",
@@ -320,6 +325,17 @@ class ToolOptionsPanel(QWidget):
             self._add_separator()
             self._add_transform_mode_combo(transform_mode, mesh_div)
             self._add_pivot_selector()
+
+        elif tool == Tool.SELECT_PEN:
+            self._add_spinbox("ペンの太さ", select_pen_size, 1, 500,
+                              lambda v: self.select_pen_size_changed.emit(v),
+                              key="select_pen_size", suffix=" px")
+            self._add_toggle("なぞった所を選択から外す", select_pen_erase,
+                             lambda v: self.select_pen_erase_changed.emit(v),
+                             "オンにすると選択範囲を削る（選択消し）")
+            self._add_invert_selection_button()
+            self._add_label("なぞった所が選択範囲になります。\n"
+                            "選択があるときになぞると追加されます。")
 
         elif tool == Tool.TRANSFORM:
             self._add_transform_mode_combo(transform_mode, mesh_div)

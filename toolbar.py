@@ -18,6 +18,7 @@ TOOL_SHORTCUTS: dict[Tool, str] = {
     Tool.BLUR:       "B",
     Tool.SELECT_RECT:"S",
     Tool.LASSO:      "Q",
+    Tool.SELECT_PEN: "A",
     Tool.LASSO_FILL: "W",
     Tool.MOVE:       "V",
     Tool.TRANSFORM:  "F",
@@ -42,6 +43,7 @@ _TOOL_ICONS: dict[Tool, str] = {
     Tool.SELECT_RECT: "⬚",
     # 以前は白丸で、図形ツールの「楕円」と紛らわしかった。
     Tool.LASSO: "➿",
+    Tool.SELECT_PEN: "🖍",
     Tool.LASSO_FILL: "\U0001f7e2",
     Tool.MOVE: "✥",
     Tool.TRANSFORM: "⤢",
@@ -59,7 +61,7 @@ _TOOL_ORDER: list[Tool | None] = [
     Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.TEXT,
     None,
     # 選択
-    Tool.SELECT_RECT, Tool.LASSO, Tool.LASSO_FILL,
+    Tool.SELECT_RECT, Tool.LASSO, Tool.SELECT_PEN, Tool.LASSO_FILL,
     None,
     # 補助・変形
     Tool.EYEDROPPER, Tool.MOVE, Tool.TRANSFORM,
@@ -82,6 +84,7 @@ _TOOL_LABELS: dict[Tool, str] = {
     Tool.BLUR: "ぼかし",
     Tool.SELECT_RECT: "矩形選択",
     Tool.LASSO: "投げなわ",
+    Tool.SELECT_PEN: "選択ペン",
     Tool.LASSO_FILL: "囲み内塗りつぶし",
     Tool.MOVE: "移動",
     Tool.TRANSFORM: "自由変形",
@@ -215,6 +218,8 @@ def make_tool_cursors() -> dict[Tool, QCursor]:
     cursors[Tool.TEXT] = _make_cursor_pixmap(_text, hot=(12, 12))
     cursors[Tool.SELECT_RECT] = _make_cursor_pixmap(_select, hot=(12, 12))
     cursors[Tool.LASSO] = _make_cursor_pixmap(_lasso, hot=(12, 12))
+    # 太さは円で出すので、カーソル自体は中心が分かる十字にする
+    cursors[Tool.SELECT_PEN] = QCursor(Qt.CursorShape.CrossCursor)
     cursors[Tool.LASSO_FILL] = _make_cursor_pixmap(_lasso_fill, hot=(12, 12))
     cursors[Tool.BLUR] = _make_cursor_pixmap(_blur, hot=(12, 12))
     cursors[Tool.MOVE] = QCursor(Qt.CursorShape.SizeAllCursor)

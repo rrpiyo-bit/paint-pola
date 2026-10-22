@@ -2538,6 +2538,199 @@ class TestGridSettings:
         assert np.array_equal(before, layer_bytes())
 
 
+class TestSelectionPen:
+    """選択ペン: なぞった所が選択範囲になり、選択があるときは追加される。"""
+
+    @staticmethod
+    def _selected(c, wx, wy) -> bool:
+        cp = c._widget_to_canvas(QPoint(wx, wy))
+        if c._selection_rect is None or not c._selection_rect.contains(cp):
+            return False
+        if c._lasso_mask is None:
+            return True
+        return QColor.fromRgba(c._lasso_mask.pixel(cp.x(), cp.y())).alpha() > 0
+
+    def test_stroke_makes_selection(self, win):
+        c = win.canvas
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 30
+        draw_stroke(c, 100, 100, 160, 100)
+        assert c.has_selection()
+        assert self._selected(c, 130, 100)
+        assert not self._selected(c, 130, 200)
+        assert c._selection_outline_path is not None, "点線が出ない"
+        assert c._selpen_overlay is None, "なぞり終わったのに塗り表示が残っている"
+
+    def test_second_stroke_adds_to_selection(self, win):
+        c = win.canvas
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 30
+        draw_stroke(c, 100, 100, 160, 100)
+        draw_stroke(c, 100, 200, 160, 200)
+        assert self._selected(c, 130, 100), "前の選択が消えた"
+        assert self._selected(c, 130, 200)
+        assert not self._selected(c, 130, 150)
+
+    def test_adds_to_rect_and_lasso_selection(self, win):
+        c = win.canvas
+        c.tool = Tool.SELECT_RECT
+        draw_stroke(c, 200, 200, 260, 260)
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 20
+        draw_stroke(c, 100, 100, 140, 100)
+        assert self._selected(c, 230, 230), "矩形選択が消えた"
+        assert self._selected(c, 120, 100)
+        c.deselect()
+        c.tool = Tool.LASSO
+        press(c, 200, 200)
+        for x, y in ((260, 200), (260, 260), (200, 260)):
+            move(c, x, y)
+        release(c, 200, 260)
+        c.tool = Tool.SELECT_PEN
+        draw_stroke(c, 100, 100, 140, 100)
+        assert self._selected(c, 230, 230), "投げなわ選択が消えた"
+        assert self._selected(c, 120, 100)
+
+    def test_erase_mode_removes_from_selection(self, win):
+        c = win.canvas
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 30
+        draw_stroke(c, 100, 100, 160, 100)
+        draw_stroke(c, 100, 200, 160, 200)
+        c.select_pen_erase = True
+        draw_stroke(c, 80, 200, 180, 200)
+        assert self._selected(c, 130, 100)
+        assert not self._selected(c, 130, 200)
+        draw_stroke(c, 80, 100, 180, 100)
+        assert not c.has_selection(), "全部削ったら選択は解除される"
+
+    def test_pen_draws_only_inside(self, win):
+        """選択ペンで作った範囲の外にはペンが描けないこと。"""
+        c = win.canvas
+        layer = c.layer_stack.active
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 30
+        draw_stroke(c, 100, 100, 160, 100)
+        c.tool = Tool.PEN
+        c.pen_color = QColor(255, 0, 0)
+        c.pen_size = 20
+        draw_stroke(c, 130, 60, 130, 160)
+        inside = c._widget_to_canvas(QPoint(130, 100))
+        outside = c._widget_to_canvas(QPoint(130, 150))
+        ox, oy = layer.offset_x, layer.offset_y
+        assert QColor.fromRgba(layer.image.pixel(inside.x() - ox, inside.y() - oy)).red() == 255
+        out = QColor.fromRgba(layer.image.pixel(outside.x() - ox, outside.y() - oy))
+        assert not (out.red() == 255 and out.green() == 0), "選択の外に描けてしまう"
+
+    def test_works_on_locked_layer(self, win):
+        """選択範囲を作るだけなので、ロック中のレイヤーでも使えること。"""
+        c = win.canvas
+        c.layer_stack.active.locked = True
+        c.tool = Tool.SELECT_PEN
+        draw_stroke(c, 100, 100, 160, 100)
+        assert c.has_selection()
+
+    def test_undo_redo_selection_pen(self, win):
+        """なぞりを1回ずつ取り消し・やり直しできること。"""
+        c = win.canvas
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 30
+        draw_stroke(c, 100, 100, 160, 100)
+        draw_stroke(c, 100, 200, 160, 200)
+        c.undo()
+        assert self._selected(c, 130, 100)
+        assert not self._selected(c, 130, 200), "追加分が戻らない"
+        assert c._selection_outline_path is not None
+        c.undo()
+        assert not c.has_selection()
+        c.redo()
+        assert self._selected(c, 130, 100) and not self._selected(c, 130, 200)
+        c.redo()
+        assert self._selected(c, 130, 200)
+
+    def test_undo_erase_mode(self, win):
+        c = win.canvas
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 30
+        draw_stroke(c, 100, 100, 160, 100)
+        c.select_pen_erase = True
+        draw_stroke(c, 80, 100, 180, 100)
+        assert not c.has_selection()
+        c.undo()
+        assert self._selected(c, 130, 100), "削った選択が戻らない"
+
+    def test_undo_mixes_with_drawing(self, win):
+        """描画と選択の取り消しが、操作した順に戻ること。"""
+        c = win.canvas
+        layer = c.layer_stack.active
+        c.tool = Tool.SELECT_PEN
+        c.select_pen_size = 30
+        draw_stroke(c, 100, 100, 160, 100)
+        c.tool = Tool.PEN
+        c.pen_color = QColor(255, 0, 0)
+        c.pen_size = 10
+        draw_stroke(c, 110, 100, 150, 100)
+        cp = c._widget_to_canvas(QPoint(130, 100))
+
+        def is_red():
+            col = QColor.fromRgba(layer.image.pixel(
+                cp.x() - layer.offset_x, cp.y() - layer.offset_y))
+            return col.red() == 255 and col.green() == 0 and col.alpha() == 255
+
+        assert is_red()
+        c.undo()                       # まずペンが戻る
+        assert not is_red()
+        assert c.has_selection(), "ペンの取り消しで選択まで消えた"
+        c.undo()                       # 次に選択が戻る
+        assert not c.has_selection()
+
+    def test_undo_other_selection_operations(self, win):
+        """矩形・投げなわ・全選択・解除・反転も取り消せること。"""
+        c = win.canvas
+        c.tool = Tool.SELECT_RECT
+        draw_stroke(c, 100, 100, 160, 160)
+        rect = QRect(c._selection_rect)
+        c.select_all()
+        c.undo()
+        assert c._selection_rect == rect, "全選択が戻らない"
+        c.deselect()
+        assert not c.has_selection()
+        c.undo()
+        assert c._selection_rect == rect, "解除が戻らない"
+        c.invert_selection()
+        assert self._selected(c, 50, 50)
+        c.undo()
+        assert c._selection_rect == rect and c._lasso_mask is None, "反転が戻らない"
+        c.tool = Tool.LASSO
+        press(c, 200, 200)
+        for x, y in ((260, 200), (260, 260), (200, 260)):
+            move(c, x, y)
+        release(c, 200, 260)
+        assert self._selected(c, 230, 230)
+        c.undo()
+        assert c._selection_rect == rect, "投げなわ選択が戻らない"
+        c.undo()
+        assert not c.has_selection(), "矩形選択が戻らない"
+
+    def test_click_without_change_adds_no_history(self, win):
+        c = win.canvas
+        c.tool = Tool.SELECT_RECT
+        n = len(c._history)
+        press(c, 100, 100)
+        release(c, 100, 100)          # 選択なしでクリックしただけ
+        assert len(c._history) == n
+
+    def test_shortcut_and_options(self, win):
+        c = win.canvas
+        from PyQt6.QtTest import QTest
+        QTest.keyClick(c, Qt.Key.Key_A)
+        assert c.tool == Tool.SELECT_PEN
+        opts = win.tool_options
+        opts.select_pen_size_changed.emit(55)
+        opts.select_pen_erase_changed.emit(True)
+        assert c.select_pen_size == 55 and c.select_pen_erase
+
+
 class TestThemeIsolation:
     """テーマ適用がウィンドウ単位で完結すること。
     以前は QApplication.setStyleSheet を使っており、閉じた（破棄前の）
@@ -3097,7 +3290,7 @@ class TestToolbarLayout:
             else:
                 cur.append(t)
         groups.append(cur)
-        assert [Tool.SELECT_RECT, Tool.LASSO, Tool.LASSO_FILL] in groups
+        assert [Tool.SELECT_RECT, Tool.LASSO, Tool.SELECT_PEN, Tool.LASSO_FILL] in groups
         draw = next(g for g in groups if Tool.PEN in g)
         assert Tool.ERASER in draw and Tool.FILL in draw
         shapes = next(g for g in groups if Tool.RECT in g)

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import functools
 import math
 import time
 import numpy as np
@@ -28,6 +29,7 @@ _TOOL_KEY_MAP: dict[Qt.Key, Tool] = {
     Qt.Key.Key_B: Tool.BLUR,
     Qt.Key.Key_S: Tool.SELECT_RECT,
     Qt.Key.Key_Q: Tool.LASSO,
+    Qt.Key.Key_A: Tool.SELECT_PEN,
     Qt.Key.Key_W: Tool.LASSO_FILL,
     Qt.Key.Key_V: Tool.MOVE,
     Qt.Key.Key_F: Tool.TRANSFORM,
@@ -530,6 +532,26 @@ def _fill_closed_regions_in_area(image: QImage, area_mask: np.ndarray,
 
 # ── ポリゴンマスク ─────────────────────────────────────────────────────────────
 
+def _records_selection(fn):
+    """選択範囲を変える操作を、取り消せるよう履歴に積む。
+
+    中で別の記録付き操作（反転が全面選択だったときの解除など）を
+    呼んでも、積むのは一番外側の1回だけにする。
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        if self._sel_recording:
+            return fn(self, *args, **kwargs)
+        before = self._selection_state()
+        self._sel_recording = True
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._sel_recording = False
+            self._push_selection_history(before)
+    return wrapper
+
+
 def _outline_path_from_mask(mask: np.ndarray) -> QPainterPath:
     """選択マスク（0/1 の 2値）の輪郭を QPainterPath にする。
 
@@ -665,6 +687,14 @@ class Canvas(QWidget):
         # Ctrl+ドラッグでブラシサイズを変えている途中の状態
         self._size_drag: dict | None = None
         self.select_mode: str = "select"  # "select" | "transform"
+        # 選択ペン: なぞったところを選択範囲に足す（削るモードでは引く）
+        self.select_pen_size: int = 30
+        self.select_pen_erase: bool = False
+        self._selpen_mask: QImage | None = None      # なぞっている途中の選択マスク
+        self._selpen_overlay: QImage | None = None   # その色付き表示
+        self._selpen_last: QPoint | None = None
+        self._sel_before: tuple | None = None  # 選択ツールで押した時点の選択範囲
+        self._sel_recording = False  # 選択範囲の履歴を積む操作の途中か
 
         # ぼかしツール
         self.blur_size: int = 30
@@ -1188,6 +1218,10 @@ class Canvas(QWidget):
         if entry[0] == "anim":
             return 0
 
+        if entry[0] == "selection":
+            crop = entry[2]
+            return crop.sizeInBytes() if crop is not None else 0
+
         def _snap_bytes(snap) -> int:
             if snap.get("type") == "group":
                 return sum(_snap_bytes(c) for c in snap.get("children", []))
@@ -1353,6 +1387,51 @@ class Canvas(QWidget):
         self._trim_history()
         self.edited.emit()
 
+    # ── 選択範囲の履歴 ──────────────────────────────────────────────────────
+    # 選択範囲の作成・追加・解除も取り消せるようにする（クリスタと同じ）。
+    # 状態は (外接矩形, マスク, 輪郭, 投げなわの点) で、マスクと輪郭は
+    # 変更のたびに新しいオブジェクトに置き換わるので、同一性で変化を見られる。
+
+    def _selection_state(self) -> tuple:
+        rect = self._selection_rect
+        return (QRect(rect) if rect is not None else None, self._lasso_mask,
+                self._selection_outline_path, list(self._lasso_path_points))
+
+    def _selection_entry(self, state: tuple) -> tuple:
+        """履歴に積む形にする。マスクは外接矩形の分だけ切り出して軽くする。"""
+        rect, mask, outline, points = state
+        crop = mask.copy(rect) if mask is not None and rect is not None else None
+        return ("selection", rect, crop, outline, points)
+
+    def _push_selection_history(self, before: tuple) -> None:
+        """before から選択範囲が変わっていたら、取り消し用に積む。"""
+        now = self._selection_state()
+        if (before[0] == now[0] and before[1] is now[1]
+                and before[2] is now[2] and before[3] == now[3]):
+            return
+        self._compact_history_top()
+        self._history.append(self._selection_entry(before))
+        self._redo_stack.clear()
+        self._trim_history()
+
+    def _apply_selection_entry(self, entry: tuple) -> None:
+        _, rect, crop, outline, points = entry
+        mask = None
+        if crop is not None and rect is not None:
+            mask = QImage(self.layer_stack.width, self.layer_stack.height,
+                          QImage.Format.Format_ARGB32)
+            mask.fill(Qt.GlobalColor.transparent)
+            p = QPainter(mask)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.drawImage(rect.topLeft(), crop)
+            p.end()
+        self._selection_rect = QRect(rect) if rect is not None else None
+        self._lasso_mask = mask
+        self._selection_outline_path = outline
+        self._lasso_path_points = list(points)
+        self._lasso_points = []
+        self._sync_ant_timer()
+
     _PROP_COALESCE_SEC = 1.0
 
     def save_property_history(self, key) -> None:
@@ -1398,7 +1477,7 @@ class Canvas(QWidget):
         live = self._all_layer_ids()
 
         def _alive(e) -> bool:
-            if e[0] in ("structure", "anim"):
+            if e[0] in ("structure", "anim", "selection"):
                 return True
             # pixel と vector はどちらもレイヤーに結びついているので、
             # そのレイヤーが残っているものだけ残す。
@@ -1521,6 +1600,9 @@ class Canvas(QWidget):
                 anim.restore_timelines(self.layer_stack, entry[1])
                 if self._on_structure_restored:
                     self._on_structure_restored()
+            elif entry[0] == "selection":
+                dst.append(self._selection_entry(self._selection_state()))
+                self._apply_selection_entry(entry)
             break
         self.update()
         self.edited.emit()
@@ -1565,7 +1647,10 @@ class Canvas(QWidget):
         if self._preview_start is not None and self._preview_end is not None:
             self._draw_shape_preview(p)
 
-        if self._lasso_points:
+        if self._selpen_overlay is not None:
+            # 選択ペンでなぞっている途中は、選ばれる所を色で塗って見せる
+            p.drawImage(0, 0, self._selpen_overlay)
+        elif self._lasso_points:
             lasso_path = QPainterPath()
             lasso_path.moveTo(QPointF(self._lasso_points[0]))
             for pt in self._lasso_points[1:]:
@@ -1626,7 +1711,7 @@ class Canvas(QWidget):
 
         # ブラシカーソル円
         if (self._cursor_widget_pos is not None and not self._view_only
-                and self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR)):
+                and self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR, Tool.SELECT_PEN)):
             self._draw_cursor_circle(p)
 
         p.end()
@@ -2106,6 +2191,8 @@ class Canvas(QWidget):
             return
         if self.tool == Tool.BLUR:
             size = self.blur_size
+        elif self.tool == Tool.SELECT_PEN:
+            size = self.select_pen_size
         elif self.tool == Tool.PEN:
             size = self.pen_size
         else:
@@ -2578,6 +2665,10 @@ class Canvas(QWidget):
             event.accept()
             return
 
+        # 選択ツールで作った・解除した選択範囲を、離したときに履歴へ積む
+        self._sel_before = (self._selection_state() if self.tool in (
+            Tool.SELECT_RECT, Tool.LASSO, Tool.SELECT_PEN) else None)
+
         wp = event.position()
         cp = self._widget_to_canvas(wp.toPoint())
 
@@ -2658,6 +2749,11 @@ class Canvas(QWidget):
                 self._move_base_pos = cp
                 self._last_pos = cp
                 self._drawing = True
+            return
+
+        if self.tool == Tool.SELECT_PEN:
+            # 選択範囲を作るだけなので、レイヤーの種類・ロック・表示は問わない
+            self._selpen_begin(cp)
             return
 
         if not layer or layer.is_group:
@@ -2974,9 +3070,13 @@ class Canvas(QWidget):
             event.accept()
             return
 
-        if self.tool in (Tool.PEN, Tool.ERASER):
+        if self.tool in (Tool.PEN, Tool.ERASER, Tool.SELECT_PEN):
             self._cursor_widget_pos = wp
             self.update()
+
+        if self._selpen_mask is not None:
+            self._selpen_stroke_to(cp)
+            return
 
         # 選択範囲内クリック後、実際にドラッグが始まったら lift を実行
         if self._lift_pending and self._drawing:
@@ -3078,6 +3178,20 @@ class Canvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        before, self._sel_before = self._sel_before, None
+        if before is None:
+            self._handle_release(event)
+            return
+        self._sel_recording = True  # 中で解除が呼ばれても二重に積まない
+        try:
+            self._handle_release(event)
+        finally:
+            self._sel_recording = False
+        # 持ち上げて変形中のときは選択が絵と一緒に動いているだけなので積まない
+        if event.button() == Qt.MouseButton.LeftButton and not self._transform_image:
+            self._push_selection_history(before)
+
+    def _handle_release(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         if self._view_only:
@@ -3088,6 +3202,9 @@ class Canvas(QWidget):
         if self._size_drag is not None:
             self._size_drag = None
             event.accept()
+            return
+        if self._selpen_mask is not None:
+            self._selpen_finish()
             return
         if self._drawing and not self._panning:
             self._finish_stabilized_stroke()
@@ -3784,7 +3901,8 @@ class Canvas(QWidget):
                 self._save_history()
                 layer.strokes = keep
                 layer.mark_dirty()
-            self.deselect()
+            # 画像を消したときと同じく、消したあとの解除は取り消しの手順に数えない
+            self._clear_selection()
             return
         self._save_history()
         ox = getattr(layer, 'offset_x', 0)
@@ -3802,6 +3920,7 @@ class Canvas(QWidget):
         self._selection_outline_path = None
         self.update()
 
+    @_records_selection
     def select_all(self):
         self._selection_rect = QRect(0, 0, self.layer_stack.width, self.layer_stack.height)
         self._lasso_mask = None
@@ -3813,6 +3932,7 @@ class Canvas(QWidget):
         """確定した選択範囲があるか。ドラッグ途中の投げなわは含めない。"""
         return self._selection_rect is not None
 
+    @_records_selection
     def invert_selection(self):
         """選択範囲を反転する。矩形選択・投げなわ選択どちらにも対応。"""
         if not self._selection_rect:
@@ -3885,7 +4005,12 @@ class Canvas(QWidget):
                 out.append(i)
         return out
 
+    @_records_selection
     def deselect(self):
+        self._clear_selection()
+
+    def _clear_selection(self):
+        """選択を解除する（履歴には積まない。積むのは deselect）。"""
         if self._transform_image:
             # CLIP STUDIO と同じく、変形中の解除は確定してから解除する。
             # 捨てると動かした絵が黙って元に戻ってしまう。
@@ -3898,6 +4023,92 @@ class Canvas(QWidget):
         self._sync_ant_timer()
         self.update()
 
+    # 選択ペンでなぞっている所の色（クリスタの選択ペンと同じく塗りで見せる）
+    _SELPEN_COLOR = QColor(60, 140, 255, 110)
+
+    def _selection_mask_image(self) -> QImage:
+        """今の選択範囲をキャンバス大のマスク（白=選択）にして返す。"""
+        w, h = self.layer_stack.width, self.layer_stack.height
+        if self._selection_rect is not None and self._lasso_mask is not None:
+            return self._lasso_mask.copy()
+        mask = QImage(w, h, QImage.Format.Format_ARGB32)
+        mask.fill(Qt.GlobalColor.transparent)
+        if self._selection_rect is not None:
+            p = QPainter(mask)
+            p.fillRect(self._selection_rect, Qt.GlobalColor.white)
+            p.end()
+        return mask
+
+    def _selpen_begin(self, cp: QPoint) -> None:
+        """選択ペンのなぞり始め。今の選択範囲に足していく。"""
+        if self._transform_image:
+            self._commit_transform()
+        self._selpen_mask = self._selection_mask_image()
+        overlay = QImage(self._selpen_mask.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        overlay.fill(self._SELPEN_COLOR)
+        p = QPainter(overlay)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        p.drawImage(0, 0, self._selpen_mask)
+        p.end()
+        self._selpen_overlay = overlay
+        self._selpen_last = cp
+        self._selpen_stroke_to(cp)
+
+    def _selpen_stroke_to(self, cp: QPoint) -> None:
+        """前の位置から cp まで、ペンの太さで選択マスクに描き足す（削る）。"""
+        if self._selpen_mask is None:
+            return
+        start = self._selpen_last or cp
+        size = max(1, int(self.select_pen_size))
+        # 足すときは Source で置き換える（重ねてなぞっても表示の色が濃くならない）
+        mode = (QPainter.CompositionMode.CompositionMode_Clear if self.select_pen_erase
+                else QPainter.CompositionMode.CompositionMode_Source)
+        for img, color in ((self._selpen_mask, QColor(255, 255, 255)),
+                           (self._selpen_overlay, self._SELPEN_COLOR)):
+            p = QPainter(img)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setCompositionMode(mode)
+            p.setPen(QPen(color, size, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            if start == cp:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(color)
+                p.drawEllipse(QPointF(cp), size / 2, size / 2)
+            else:
+                p.drawLine(start, cp)
+            p.end()
+        self._selpen_last = cp
+        self.update()
+
+    def _selpen_finish(self) -> None:
+        """なぞり終わり。マスクから選択範囲を確定する（空なら解除）。"""
+        mask = self._selpen_mask
+        self._selpen_mask = None
+        self._selpen_overlay = None
+        self._selpen_last = None
+        if mask is None:
+            return
+        w, h = mask.width(), mask.height()
+        ptr = mask.constBits()
+        ptr.setsize(h * mask.bytesPerLine())
+        alpha = np.frombuffer(ptr, dtype=np.uint8).reshape(
+            h, mask.bytesPerLine() // 4, 4)[:, :w, 3]
+        on = alpha > 0
+        if not on.any():
+            self.deselect()
+            return
+        ys, xs = np.nonzero(on)
+        self._lasso_mask = mask
+        self._selection_rect = QRect(int(xs.min()), int(ys.min()),
+                                     int(xs.max() - xs.min() + 1),
+                                     int(ys.max() - ys.min() + 1))
+        self._selection_outline_path = _outline_path_from_mask(on)
+        self._lasso_path_points = []
+        self._lasso_points = []
+        self._sync_ant_timer()
+        self.update()
+
+    @_records_selection
     def select_layer_alpha(self, layer=None, threshold: int = 10) -> bool:
         """レイヤーの不透明部分（alpha > threshold）の形で選択範囲を作る。
         （レイヤーパネルでサムネイルをCtrlクリックした時などに呼ばれる想定）
