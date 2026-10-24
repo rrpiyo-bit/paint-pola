@@ -127,6 +127,68 @@ def new_cel(stack, folder, frame: int, source=None) -> Layer:
     return cel
 
 
+def frame_for_new(stack, folder) -> int:
+    """新しいセルを置くコマ。今のコマに指定があれば次のコマ。"""
+    f = stack.anim_frame
+    if f < len(folder.timeline) and folder.timeline[f] is not None:
+        f += 1
+    return f
+
+
+def adopt_cel(stack, folder, cel) -> None:
+    """フォルダの外から入れたレイヤーをセルとして今のコマ（埋まっていれば
+    次のコマ）に出す。
+
+    どのコマにも指定されていないセルは非表示にされるため、指定しないと
+    入れたとたんにレイヤーが消えたように見える。
+    """
+    frame = frame_for_new(stack, folder)
+    if frame >= MAX_LENGTH:
+        return
+    if frame >= stack.anim_length:
+        set_length(stack, frame + 1)
+    folder.timeline[frame] = cel.uid
+    apply_frame(stack, frame)
+
+
+def can_add_as_cel(folder, item) -> bool:
+    """item をアニメーションフォルダ folder（None なら新しく作る）のセルにできるか。"""
+    if item is None or is_anim_folder(item):
+        return False
+    if folder is None:
+        return True
+    if item is folder or any(c is item for c in folder.children):
+        return False
+    # folder を中に持つフォルダはセルにできない（自分の中に入ることになる）
+    return not (item.is_group and _contains(item, folder))
+
+
+def _contains(group, target) -> bool:
+    return any(c is target or (c.is_group and _contains(c, target))
+               for c in group.children)
+
+
+def add_as_cel(stack, folder, item) -> GroupLayer | None:
+    """レイヤー item をそのまま（透明な所は透明のまま）folder のセルに移し、
+    今のコマ（埋まっていれば次のコマ）に出す。folder が None なら item の
+    上にアニメーションフォルダを作って入れる。入れたフォルダを返す。"""
+    if not can_add_as_cel(folder, item):
+        return None
+    if folder is None:
+        folder = GroupLayer("アニメーションフォルダ", stack.width, stack.height)
+        folder.pass_through = True
+        folder.timeline = [None] * stack.anim_length
+        stack.active_path = stack.find_path(item)
+        stack.insert_above_active(folder)
+    path = stack.find_path(item)
+    container, _ = stack.parent_of(path)
+    container.pop(path[-1])
+    folder.children.insert(0, item)
+    adopt_cel(stack, folder, item)
+    stack.active_path = stack.find_path(item)
+    return folder
+
+
 def set_spec(folder, frame: int, value) -> None:
     if 0 <= frame < len(folder.timeline):
         folder.timeline[frame] = value

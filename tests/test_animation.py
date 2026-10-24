@@ -685,6 +685,98 @@ class TestInApp:
         win.canvas.undo()   # フォルダを作る前へ
         assert anim.anim_folders(st.layers) == []
 
+    def test_add_layer_to_folder_becomes_cel(self, win):
+        """レイヤーパネルの「グループに追加」で入れたレイヤーが消えずに
+        今のコマ（埋まっていれば次のコマ）のセルとして出ること。"""
+        st = win.layer_stack
+        lp = win.layer_panel
+        outside = st.add("外の絵")
+        fill(outside, QColor(255, 0, 0))
+        win.anim_panel._on_new_folder()       # 外の絵の上にフォルダ（セル1がコマ1）
+        folder = anim.anim_folders(st.layers)[0]
+        st.active_path = st.find_path(outside)
+        before = list(folder.timeline)
+        lp._add_to_group()
+        assert any(c is outside for c in folder.children)
+        assert outside.visible, "入れたレイヤーが非表示になった"
+        assert anim.cel_at(folder, 1) is outside and st.anim_frame == 1
+        assert anim.cel_at(folder, 0).name == "1", "元のセルの指定が変わった"
+        assert st.active is outside
+        win.canvas.undo()
+        folder = anim.anim_folders(st.layers)[0]
+        assert folder.timeline == before
+        assert not any(c.name == "外の絵" for c in folder.children)
+
+    def test_layer_to_cel_button(self, win):
+        """「レイヤーをセルに」で選択中のレイヤーがそのままセルになる。
+        塗っていない所は透明のまま、取り消しで元の場所に戻る。"""
+        st = win.layer_stack
+        ap = win.anim_panel
+        outside = st.add("外の絵")
+        p = QPainter(outside.image)
+        p.fillRect(0, 0, 10, 10, QColor(255, 0, 0))
+        p.end()
+        ap._on_new_folder()
+        folder = anim.anim_folders(st.layers)[0]
+        cel1 = folder.children[0]
+        n_top = len(st.layers)
+        st.active_path = st.find_path(outside)
+        ap._on_layer_to_cel()
+        assert folder.children[0] is outside and outside.visible
+        assert anim.cel_at(folder, 0) is cel1 and anim.cel_at(folder, 1) is outside
+        assert st.anim_frame == 1 and st.active is outside
+        assert len(st.layers) == n_top - 1
+        assert px(outside.image, 2, 2).red() == 255
+        assert px(outside.image, 20, 20).alpha() == 0, "塗っていない所が透明でなくなった"
+        frame = anim.render_frame(st, 1)
+        assert px(frame, 2, 2).red() == 255
+        win.canvas.undo()
+        folder = anim.anim_folders(st.layers)[0]
+        assert len(folder.children) == 1 and len(st.layers) == n_top
+        assert any(l.name == "外の絵" for l in st.layers)
+
+    def test_layer_to_cel_makes_folder_when_none(self, win):
+        st = win.layer_stack
+        layer = st.add("絵")
+        st.active_path = st.find_path(layer)
+        win.anim_panel._on_layer_to_cel()
+        folder = anim.folder_of(st, layer)
+        assert folder is not None and folder.children == [layer]
+        assert anim.cel_at(folder, st.anim_frame) is layer
+
+    def test_layer_to_cel_rejects_invalid(self, win):
+        st = win.layer_stack
+        ap = win.anim_panel
+        ap._on_new_folder()
+        folder = anim.anim_folders(st.layers)[0]
+        n_hist = len(win.canvas._history)
+        ap._on_layer_to_cel()                     # すでにセルのレイヤー
+        st.active_path = st.find_path(folder)
+        ap._on_layer_to_cel()                     # アニメーションフォルダ自体
+        assert len(folder.children) == 1
+        assert len(win.canvas._history) == n_hist
+        outer = GroupLayer("外側", W, H)
+        outer.children.append(Layer("x", W, H))
+        assert not anim.can_add_as_cel(folder, folder)
+        wrap = GroupLayer("包む", W, H)
+        wrap.children.append(folder)
+        assert not anim.can_add_as_cel(folder, wrap), "自分を含むフォルダをセルにできてしまう"
+        assert anim.can_add_as_cel(folder, outer)
+
+    def test_adopt_cel_uses_empty_current_frame(self):
+        st = make_stack()
+        folder = anim.make_anim_folder(st)
+        anim.apply_frame(st, 3)
+        cel = Layer("x", W, H)
+        folder.children.insert(0, cel)
+        anim.adopt_cel(st, folder, cel)
+        assert folder.timeline[3] == cel.uid and cel.visible
+        anim.apply_frame(st, st.anim_length - 1)
+        last = Layer("y", W, H)
+        folder.children.insert(0, last)
+        anim.adopt_cel(st, folder, last)   # 最後のコマ以降はコマ数を延ばす
+        assert anim.cel_at(folder, st.anim_frame) is last
+
     def test_save_and_load(self, win, tmp_path):
         st = win.layer_stack
         ap = win.anim_panel

@@ -430,6 +430,10 @@ class AnimationPanel(QWidget):
         self._dup_btn = self._btn(top, "⧉複製",
                                   "今のセルを写した新しいセルを次のコマに置く（中割り用）",
                                   self._on_dup_cel)
+        self._adopt_btn = self._btn(top, "📥レイヤーをセルに",
+                                    "選択中のレイヤーをそのまま（透明な所は透明のまま）"
+                                    "セルにして、今のコマ（埋まっていれば次のコマ）に置く",
+                                    self._on_layer_to_cel)
         top.addWidget(self._sep_v())
         self._first_btn = self._btn(top, "⏮", "最初のコマへ", lambda: self.go_to(0), 28)
         self._prev_btn = self._btn(top, "◀", "前のコマへ（,）", self.prev_frame, 28)
@@ -695,12 +699,6 @@ class AnimationPanel(QWidget):
         anim.make_anim_folder(self.stack)
         self._changed()
 
-    def _target_frame_for_new(self, folder) -> int:
-        f = self.stack.anim_frame
-        if folder.timeline[f] is not None:
-            f += 1
-        return f
-
     def _new_cel_at(self, folder, frame: int, source=None) -> None:
         self.structure_will_change.emit()
         anim.new_cel(self.stack, folder, frame, source)
@@ -711,7 +709,7 @@ class AnimationPanel(QWidget):
         if folder is None:
             self._on_new_folder()
             return
-        self._new_cel_at(folder, self._target_frame_for_new(folder))
+        self._new_cel_at(folder, anim.frame_for_new(self.stack, folder))
 
     def _on_dup_cel(self):
         folder = self.current_folder()
@@ -721,6 +719,19 @@ class AnimationPanel(QWidget):
         if src is None:
             return
         self._new_cel_at(folder, self.stack.anim_frame + 1, src)
+
+    def _on_layer_to_cel(self):
+        item = self.stack.active
+        folder = self.current_folder()
+        if not anim.can_add_as_cel(folder, item):
+            QMessageBox.information(
+                self, "レイヤーをセルに",
+                "セルにしたいレイヤーをレイヤーパネルで選んでから押してください。\n"
+                "（すでにセルのレイヤー・アニメーションフォルダは選べません）")
+            return
+        self.structure_will_change.emit()
+        anim.add_as_cel(self.stack, folder, item)
+        self._changed()
 
     def _renumber(self, folder) -> None:
         self.structure_will_change.emit()

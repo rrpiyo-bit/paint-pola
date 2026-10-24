@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QMimeData, QPoint
 from layer import LayerStack, Layer, GroupLayer, BLEND_MODES, BLEND_KEYS, BLEND_LABELS
 from vector import VectorLayer
 from actions import ActionPanel
+import anim
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
 _THUMB_SIZE    = 40          # サムネイル px
@@ -1181,8 +1182,15 @@ class LayerPanel(QWidget):
         above.children.append(layer)
         new_child_idx = len(above.children) - 1
         ls.set_active_path(path[:-1] + [idx - 1, new_child_idx])
+        self._adopt_into_anim(layer, container)
         self.refresh()
         self.layers_changed.emit()
+
+    def _adopt_into_anim(self, layer, src_container) -> None:
+        """アニメーションフォルダへ外から入れたレイヤーを今のコマのセルにする。"""
+        folder = anim.folder_of(self.layer_stack, layer)
+        if folder is not None and src_container is not folder.children:
+            anim.adopt_cel(self.layer_stack, folder, layer)
 
     def _remove_from_group(self):
         """グループ内のアクティブレイヤーを一つ上の階層に取り出す。"""
@@ -1267,6 +1275,7 @@ class LayerPanel(QWidget):
                 target_layer.children.insert(0, layer)
                 new_path = target_path + [0]
                 ls.set_active_path(new_path)
+                self._adopt_into_anim(layer, src_container)
                 self.refresh()
                 self.layers_changed.emit()
             return
@@ -1295,6 +1304,7 @@ class LayerPanel(QWidget):
             layer = src_container.pop(src_idx)
             dst_container.insert(dst_idx, layer)
             ls.set_active_path(dst_path[:-1] + [dst_idx])
+            self._adopt_into_anim(layer, src_container)
 
         self.refresh()
         self.layers_changed.emit()

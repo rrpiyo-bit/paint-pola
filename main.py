@@ -1902,6 +1902,8 @@ class MainWindow(QMainWindow):
         self._add_action(anim_menu, "新しいセル", lambda: self._anim_do(ap._on_new_cel))
         self._add_action(anim_menu, "セルを複製して次のコマへ",
                          lambda: self._anim_do(ap._on_dup_cel))
+        self._add_action(anim_menu, "選択中のレイヤーをセルにする",
+                         lambda: self._anim_do(ap._on_layer_to_cel))
         anim_menu.addSeparator()
         self._add_action(anim_menu, "前のコマ", lambda: self._anim_do(ap.prev_frame), ",")
         self._add_action(anim_menu, "次のコマ", lambda: self._anim_do(ap.next_frame), ".")
