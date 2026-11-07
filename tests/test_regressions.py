@@ -1502,3 +1502,187 @@ class TestAntialias:
         win._restore_tool_settings()
         assert win.canvas.pen_antialias is False
         assert win.canvas.eraser_antialias is True
+
+
+class TestBlurCursorCircle:
+    """ぼかしツールでも、ぼかせる範囲をペンと同じ円で見せる。"""
+
+    def test_blur_tracks_cursor_for_circle(self, win):
+        c = win.canvas
+        win._on_tool_change(Tool.BLUR)
+        wp = c._c2w().map(QPointF(300, 300))
+        c.mouseMoveEvent(QMouseEvent(QEvent.Type.MouseMove, wp, Qt.MouseButton.NoButton,
+                                     Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+        assert c._cursor_widget_pos is not None
+
+    def test_blur_circle_matches_blur_size(self, win, monkeypatch):
+        c = win.canvas
+        win._on_tool_change(Tool.BLUR)
+        c.blur_size = 80
+        c._cursor_widget_pos = QPointF(100, 100)
+        radii = []
+        from PyQt6.QtGui import QPainter
+        orig = QPainter.drawEllipse
+        def spy(self, *a):
+            if len(a) == 3:
+                radii.append(a[1])
+            return orig(self, *a)
+        monkeypatch.setattr(QPainter, "drawEllipse", spy)
+        c.grab()
+        assert pytest.approx(80 * c.zoom / 2) in radii
+
+
+class TestFreeRotation:
+    """表示の回転を1度単位で変えられる（以前は90度刻みだけ）。"""
+
+    def test_slider_sets_any_angle(self, win):
+        nav = win.navigator
+        nav._rot_slider.setValue(30)
+        assert win.canvas._rotation == 30
+        assert nav._rot_spin.value() == 30
+        nav._rot_spin.setValue(-45)
+        assert win.canvas._rotation == 315
+        assert nav._rot_slider.value() == -45
+
+    def test_buttons_and_menu_sync_slider(self, win):
+        win.canvas.set_rotation(0)
+        win.canvas.rotate_cw()
+        assert win.navigator._rot_slider.value() == 90
+        win.canvas.reset_rotation()
+        assert win.navigator._rot_slider.value() == 0
+
+    def test_widget_size_fits_rotated_canvas(self, win):
+        import math
+        c = win.canvas
+        c.set_zoom(0.2)
+        c.set_rotation(45)
+        W, H = c.layer_stack.width * c.zoom, c.layer_stack.height * c.zoom
+        k = math.cos(math.radians(45))
+        assert c.width() >= int((W + H) * k)
+        # 4隅がすべてウィジェットの中に入る
+        for x, y in ((0, 0), (c.layer_stack.width, 0), (0, c.layer_stack.height),
+                     (c.layer_stack.width, c.layer_stack.height)):
+            p = c._c2w().map(QPointF(x, y))
+            assert -1 <= p.x() <= c.width() + 1 and -1 <= p.y() <= c.height() + 1
+
+    def test_drawing_maps_through_rotation(self, win):
+        """回した状態でも、押した所に描ける。"""
+        c = win.canvas
+        c.set_zoom(0.3)
+        c.set_rotation(30)
+        win._on_tool_change(Tool.PEN)
+        c.pen_size = 10
+        click(c, 500, 700)
+        layer = c.layer_stack.active
+        px = layer.image.pixelColor(500 - layer.offset_x, 700 - layer.offset_y)
+        assert px.alpha() > 0
+
+    def test_rotation_saved_and_loaded(self, win, tmp_path):
+        win.canvas.set_rotation(33)
+        path = str(tmp_path / "r.pola")
+        win._write_pola(path)
+        win.canvas.set_rotation(0)
+        win._load_pola(path)
+        assert win.canvas._rotation == 33
+        assert win.navigator._rot_slider.value() == 33
+
+
+class TestUniFlash:
+    """ウニフラッシュ：楕円のように左上からドラッグして描く。"""
+
+    def _alpha(self, layer, x, y):
+        return layer.image.pixelColor(x - layer.offset_x, y - layer.offset_y).alpha()
+
+    def test_drag_from_top_left_draws_spikes_inside_rect(self, win):
+        c = win.canvas
+        c.layer_stack.add("u")
+        win._on_tool_change(Tool.UNI_FLASH)
+        c.uni_flash.update(thickness=8, spacing=3, length=40, jitter=0, fill=False)
+        drag(c, [(100, 100), (300, 300), (500, 500)])
+        layer = c.layer_stack.active
+        # 中心 (300,300) は空き、外側の楕円の少し内側にトゲがある
+        assert self._alpha(layer, 300, 300) == 0
+        ring = sum(self._alpha(layer, int(300 + 180 * __import__("math").cos(a / 10)),
+                               int(300 + 180 * __import__("math").sin(a / 10))) > 0
+                   for a in range(63))
+        assert ring > 10
+        # 矩形の外には描かない
+        assert self._alpha(layer, 90, 300) == 0
+        assert self._alpha(layer, 510, 300) == 0
+
+    def test_fill_inside(self, win):
+        c = win.canvas
+        c.layer_stack.add("u")
+        win._on_tool_change(Tool.UNI_FLASH)
+        c.uni_flash.update(fill=True, fill_color="#ff0000", jitter=0)
+        drag(c, [(100, 100), (500, 500)])
+        px = c.layer_stack.active.image.pixelColor(
+            300 - c.layer_stack.active.offset_x, 300 - c.layer_stack.active.offset_y)
+        assert (px.red(), px.green(), px.blue(), px.alpha()) == (255, 0, 0, 255)
+
+    def test_preview_matches_commit(self, win):
+        """離したときに、ドラッグ中に見えていた形と同じものが描かれる（乱数の種を共有）。"""
+        from PyQt6.QtCore import QRectF
+        from uniflash import uni_flash_paths
+        c = win.canvas
+        c.layer_stack.add("u")
+        win._on_tool_change(Tool.UNI_FLASH)
+        drag(c, [(100, 100), (400, 400)])
+        a, _ = uni_flash_paths(QRectF(100, 100, 300, 300), c.uni_flash, c._uni_seed)
+        b, _ = uni_flash_paths(QRectF(100, 100, 300, 300), c.uni_flash, c._uni_seed)
+        assert a == b
+
+    def test_bundle_mode_and_taper(self):
+        from PyQt6.QtCore import QRectF, QPointF as P
+        from uniflash import default_uni, uni_flash_paths, _spike_polygon
+        o = default_uni()
+        o.update(mode="bundle", bundle_count=5, spacing=20)
+        spikes, _ = uni_flash_paths(QRectF(0, 0, 400, 400), o, 1)
+        # 360/20 = 18 束 × 5 本
+        assert len(spikes.toSubpathPolygons()) == 90
+        # 入り抜きで両端が尖る：両端の点は左右で同じ位置（幅 0）、真ん中は太い
+        poly = _spike_polygon(P(0, 0), P(100, 0), 10, 0.3, 0.5)
+        n = len(poly)
+        assert (poly[0] - poly[n - 1]).manhattanLength() < 1e-6
+        assert (poly[n // 2 - 1] - poly[n // 2]).manhattanLength() < 1e-6
+        widths = [abs(poly[i].y() - poly[n - 1 - i].y()) for i in range(n // 2)]
+        assert max(widths) == pytest.approx(10)
+
+    def test_click_without_drag_draws_nothing(self, win):
+        c = win.canvas
+        c.layer_stack.add("u")
+        win._on_tool_change(Tool.UNI_FLASH)
+        before = c.layer_stack.active.image.copy()
+        click(c, 200, 200)
+        assert c.layer_stack.active.image == before
+
+    def test_undo(self, win):
+        c = win.canvas
+        c.layer_stack.add("u")
+        win._on_tool_change(Tool.UNI_FLASH)
+        layer = c.layer_stack.active
+        before = layer.image.copy()
+        drag(c, [(100, 100), (400, 400)])
+        assert layer.image != before
+        c.undo()
+        assert c.layer_stack.active.image == before
+
+    def test_options_persist(self, win):
+        win._on_tool_change(Tool.UNI_FLASH)
+        win.tool_options.uni_flash_changed.emit("spacing", 9)
+        win.tool_options.uni_flash_changed.emit("mode", "bundle")
+        win.tool_options.uni_flash_changed.emit("thickness", 9999)  # 範囲外は丸める
+        assert win.canvas.uni_flash["spacing"] == 9
+        assert win.canvas.uni_flash["thickness"] == 100
+        w2 = MainWindow()
+        try:
+            assert w2.canvas.uni_flash["spacing"] == 9
+            assert w2.canvas.uni_flash["mode"] == "bundle"
+        finally:
+            w2.close()
+
+    def test_shortcut_u(self):
+        from canvas import _TOOL_KEY_MAP
+        from toolbar import TOOL_SHORTCUTS
+        assert _TOOL_KEY_MAP[Qt.Key.Key_U] == Tool.UNI_FLASH
+        assert TOOL_SHORTCUTS[Tool.UNI_FLASH] == "U"

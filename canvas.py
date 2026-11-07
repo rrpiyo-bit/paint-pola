@@ -15,6 +15,7 @@ from PyQt6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal,
 from layer import LayerStack, Layer, BLEND_KEY_TO_MODE
 from tools import Tool
 from brush import BrushType, get_brush, StabilizedBrush, BlurBrush, BRUSH_LABELS
+from uniflash import default_uni, draw_uni_flash
 
 # ツールキーボードショートカット（toolbar.py の TOOL_SHORTCUTS と一致させること）
 _TOOL_KEY_MAP: dict[Qt.Key, Tool] = {
@@ -33,6 +34,7 @@ _TOOL_KEY_MAP: dict[Qt.Key, Tool] = {
     Qt.Key.Key_W: Tool.LASSO_FILL,
     Qt.Key.Key_V: Tool.MOVE,
     Qt.Key.Key_F: Tool.TRANSFORM,
+    Qt.Key.Key_U: Tool.UNI_FLASH,
 }
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
@@ -607,6 +609,20 @@ def _canvas_to_widget_transform(canvas_w: int, canvas_h: int,
     return t
 
 
+def _rotated_size(w: float, h: float, rotation: int) -> tuple[int, int]:
+    """w×h の絵を rotation 度回したときに収まる外接矩形の大きさ。"""
+    rotation %= 360
+    if rotation % 90 == 0:
+        if rotation % 180:
+            w, h = h, w
+        return int(w), int(h)
+    rad = math.radians(rotation)
+    c, s = abs(math.cos(rad)), abs(math.sin(rad))
+    # 四隅が欠けないよう切り上げる
+    return (int(math.ceil(w * c + h * s - 1e-6)),
+            int(math.ceil(w * s + h * c - 1e-6)))
+
+
 # ── Canvas ─────────────────────────────────────────────────────────────────────
 
 class Canvas(QWidget):
@@ -620,7 +636,8 @@ class Canvas(QWidget):
     tool_shortcut_pressed = pyqtSignal(object)  # Tool — キーボードショートカットでツール切替
     edited = pyqtSignal()  # 絵・レイヤー構造が実際に変更されたとき（未保存マーク用）
     grid_visibility_changed = pyqtSignal(bool)  # 方眼の表示・非表示が変わったとき（メニューのチェックを合わせるため）
-    vector_selection_changed = pyqtSignal()  # 選んでいるベクター線が変わったとき（ツールオプションを出し直す）
+    vector_selection_changed = pyqtSignal()
+    rotation_changed = pyqtSignal(int)  # 表示の回転角(0〜359)が変わったとき（ナビゲーターのスライダーを合わせる）  # 選んでいるベクター線が変わったとき（ツールオプションを出し直す）
 
     # テキスト入力ダイアログをキャンバス内で閉じるため、main から注入する
     ask_text_fn: object = None  # type: ignore  # Callable[[Canvas], None] | None
@@ -700,6 +717,10 @@ class Canvas(QWidget):
         self.blur_size: int = 30
         self.blur_strength: float = 0.5  # 0.0〜1.0
         self._blur_brush: BlurBrush = BlurBrush(0.5)
+
+        # ウニフラッシュ（設定は uniflash.UNI_DEFAULTS を参照）
+        self.uni_flash: dict = default_uni()
+        self._uni_seed: int = 0  # ドラッグ中のプレビューと確定で同じ形にするための乱数の種
 
         # view state
         self._rotation = 0
@@ -853,10 +874,8 @@ class Canvas(QWidget):
     # ── size / view ──────────────────────────────────────────────────────────
 
     def _update_size(self):
-        w = int(self.layer_stack.width * self.zoom)
-        h = int(self.layer_stack.height * self.zoom)
-        if self._rotation % 180 != 0:
-            w, h = h, w
+        w, h = _rotated_size(self.layer_stack.width * self.zoom,
+                             self.layer_stack.height * self.zoom, self._rotation)
         self.resize(w, h)
         self.update()
 
@@ -951,8 +970,19 @@ class Canvas(QWidget):
         self.zoom_changed.emit(self.zoom)
 
     def set_rotation(self, degrees: int):
-        self._rotation = degrees % 360
+        """表示を degrees 度回す（1度単位・何度でもよい）。
+
+        今見えている範囲の中心が動かないようにスクロールも合わせる。
+        合わせないと、スライダーを動かすたびに絵が画面の外へ逃げる。
+        """
+        new = int(round(degrees)) % 360
+        if new == self._rotation:
+            return
+        anchor = self._viewport_anchor()
+        self._rotation = new
         self._update_size()
+        self._restore_anchor(anchor)
+        self.rotation_changed.emit(self._rotation)
 
     def rotate_cw(self):
         self.set_rotation(self._rotation + 90)
@@ -1783,6 +1813,10 @@ class Canvas(QWidget):
             p.setPen(QPen(SELECTION_COLOR, 1, Qt.PenStyle.DashLine))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(r)
+            return
+        if self.tool == Tool.UNI_FLASH:
+            draw_uni_flash(p, QRectF(r), self.uni_flash, self.pen_color,
+                           self._uni_seed, self.pen_antialias)
             return
         pen = QPen(self.pen_color, self.pen_size)
         if self.shape_fill == "fill":
@@ -2778,7 +2812,7 @@ class Canvas(QWidget):
         # ここで止めて理由を伝える。
         if layer.is_vector and self.tool in (
                 Tool.FILL, Tool.BLUR, Tool.LINE, Tool.RECT, Tool.ELLIPSE,
-                Tool.TEXT, Tool.LASSO_FILL):
+                Tool.TEXT, Tool.LASSO_FILL, Tool.UNI_FLASH):
             self.status_message.emit(
                 "ベクターレイヤーにはこの道具はまだ使えません。ペンを使うか、"
                 "レイヤーをラスタライズしてください。")
@@ -2907,10 +2941,13 @@ class Canvas(QWidget):
             if not self._alt_eyedropper:
                 self._drawing = False
 
-        elif self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE):
+        elif self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.UNI_FLASH):
             self._save_history()
             self._preview_start = cp
             self._preview_end = cp
+            if self.tool == Tool.UNI_FLASH:
+                import random
+                self._uni_seed = random.randrange(1 << 30)
 
         elif self.tool == Tool.SELECT_RECT:
             if self._transform_image:
@@ -3070,7 +3107,7 @@ class Canvas(QWidget):
             event.accept()
             return
 
-        if self.tool in (Tool.PEN, Tool.ERASER, Tool.SELECT_PEN):
+        if self.tool in (Tool.PEN, Tool.ERASER, Tool.BLUR, Tool.SELECT_PEN):
             self._cursor_widget_pos = wp
             self.update()
 
@@ -3166,8 +3203,8 @@ class Canvas(QWidget):
             self._apply_clip_to_selection()
             self.update()
 
-        elif self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.SELECT_RECT):
-            if (self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start is not None
+        elif self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.UNI_FLASH, Tool.SELECT_RECT):
+            if (self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.UNI_FLASH) and self._preview_start is not None
                     and QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier):
                 cp = _constrain_shape_shift(self.tool, self._preview_start, cp)
             self._preview_end = cp
@@ -3253,7 +3290,7 @@ class Canvas(QWidget):
             self._commit_vector_stroke(layer)
             return
 
-        if self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE) and self._preview_start is not None:
+        if self.tool in (Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.UNI_FLASH) and self._preview_start is not None:
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                 cp = _constrain_shape_shift(self.tool, self._preview_start, cp)
             # ドラッグせずクリックしただけ（始点=終点）の場合は退化図形なので何も描かない。
@@ -3267,7 +3304,8 @@ class Canvas(QWidget):
             else:
                 # 図形の外接矩形（線幅ぶんの余白込み）がレイヤー画像に収まるよう
                 # 広げてから描く。はみ出す図形が切れるのを防ぐ。
-                pad = max(1, int(self.pen_size))
+                pad = max(1, int(self.uni_flash["thickness"] if self.tool == Tool.UNI_FLASH
+                                 else self.pen_size))
                 shape_rect = QRect(self._preview_start, cp).normalized()
                 shape_rect = shape_rect.adjusted(-pad, -pad, pad, pad)
                 self._ensure_layer_bounds(layer, shape_rect)
@@ -3760,6 +3798,12 @@ class Canvas(QWidget):
                 self._last_pos.y() + getattr(layer, 'offset_y', 0)))
 
     def _commit_shape(self, img: QImage, a: QPoint, b: QPoint):
+        if self.tool == Tool.UNI_FLASH:
+            painter = QPainter(img)
+            draw_uni_flash(painter, QRectF(QRect(a, b).normalized()), self.uni_flash,
+                           self.pen_color, self._uni_seed, self.pen_antialias)
+            painter.end()
+            return
         painter = QPainter(img)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         pen = self._make_pen(self.pen_color, self.pen_size)

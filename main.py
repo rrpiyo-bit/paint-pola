@@ -1389,6 +1389,7 @@ class MainWindow(QMainWindow):
                 except (TypeError, ValueError):
                     pass
         self._restore_tool_settings()
+        self._restore_uni_flash_settings()
         self._refresh_tool_options()
         # ウィンドウ表示・レイアウト確定後でないと表示領域が0のままフィットできない
         QTimer.singleShot(0, lambda: self.navigator._fit_view())
@@ -1499,6 +1500,7 @@ class MainWindow(QMainWindow):
             lambda v: setattr(self.canvas, 'select_pen_erase', v))
         self.tool_options.text_size_changed.connect(
             lambda v: self._set_tool_setting("text_size", int(v)))
+        self.tool_options.uni_flash_changed.connect(self._on_uni_flash_change)
         # [ ] や Ctrl+ドラッグでサイズ変更 → オプションパネルも同期
         self.canvas.brush_size_changed.connect(self.tool_options.sync_pen_size)
         self.canvas.eraser_size_changed.connect(
@@ -1587,6 +1589,25 @@ class MainWindow(QMainWindow):
                 continue
             setattr(self.canvas, attr, value)
 
+    def _on_uni_flash_change(self, field: str, value) -> None:
+        """ウニフラッシュの設定を変えて、次回起動時も同じ値で始められるよう残す。"""
+        from uniflash import sanitize_uni
+        v = sanitize_uni(field, value)
+        if v is None:
+            return
+        self.canvas.uni_flash[field] = v
+        self._settings.setValue(f"uni_flash/{field}", v)
+
+    def _restore_uni_flash_settings(self) -> None:
+        from uniflash import UNI_DEFAULTS, sanitize_uni
+        for field in UNI_DEFAULTS:
+            raw = self._settings.value(f"uni_flash/{field}", None)
+            if raw is None:
+                continue
+            v = sanitize_uni(field, raw)
+            if v is not None:
+                self.canvas.uni_flash[field] = v
+
     def _on_stabilization_change(self, value: int):
         self.canvas.set_stabilization(value)
         self._settings.setValue("stabilization", self.canvas.stabilization)
@@ -1638,6 +1659,7 @@ class MainWindow(QMainWindow):
             text_size=self.canvas.text_size,
             select_pen_size=self.canvas.select_pen_size,
             select_pen_erase=self.canvas.select_pen_erase,
+            uni_flash=self.canvas.uni_flash,
         )
 
     def _refresh_tool_options_if_kind_changed(self):
@@ -2511,7 +2533,9 @@ class MainWindow(QMainWindow):
             aci = aci if isinstance(aci, int) else -1
             ls.active_path = [ai, aci] if aci >= 0 else [ai]
         rot = meta.get("view_rotation", 0)
-        self.canvas._rotation = rot % 360 if isinstance(rot, int) and rot % 90 == 0 else 0
+        # 回転はスライダーで1度単位に変えられるので、90度刻み以外も受け付ける
+        self.canvas._rotation = rot % 360 if isinstance(rot, int) and not isinstance(rot, bool) else 0
+        self.canvas.rotation_changed.emit(self.canvas._rotation)
         self.canvas._flip_h = bool(meta.get("view_flip_h", False))
         anim_meta = meta["anim"] if isinstance(meta.get("anim"), dict) else {}
         tl_lens = [len(f.timeline) for f in anim.anim_folders(ls.layers)]

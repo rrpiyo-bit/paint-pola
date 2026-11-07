@@ -22,6 +22,7 @@ TOOL_SHORTCUTS: dict[Tool, str] = {
     Tool.LASSO_FILL: "W",
     Tool.MOVE:       "V",
     Tool.TRANSFORM:  "F",
+    Tool.UNI_FLASH:  "U",
 }
 
 _HISTORY_MAX = 10  # ツールバーに表示するカラーヒストリーの最大数
@@ -47,6 +48,7 @@ _TOOL_ICONS: dict[Tool, str] = {
     Tool.LASSO_FILL: "\U0001f7e2",
     Tool.MOVE: "✥",
     Tool.TRANSFORM: "⤢",
+    Tool.UNI_FLASH: "✴",
 }
 
 # ツールバーの表示順。Tool の宣言順そのままだと「スポイト」が消しゴムと
@@ -58,7 +60,7 @@ _TOOL_ORDER: list[Tool | None] = [
     Tool.PEN, Tool.ERASER, Tool.FILL, Tool.BLUR,
     None,
     # 図形・文字
-    Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.TEXT,
+    Tool.LINE, Tool.RECT, Tool.ELLIPSE, Tool.UNI_FLASH, Tool.TEXT,
     None,
     # 選択
     Tool.SELECT_RECT, Tool.LASSO, Tool.SELECT_PEN, Tool.LASSO_FILL,
@@ -88,6 +90,7 @@ _TOOL_LABELS: dict[Tool, str] = {
     Tool.LASSO_FILL: "囲み内塗りつぶし",
     Tool.MOVE: "移動",
     Tool.TRANSFORM: "自由変形",
+    Tool.UNI_FLASH: "ウニフラッシュ",
 }
 
 
@@ -193,14 +196,6 @@ def make_tool_cursors() -> dict[Tool, QCursor]:
         p.setBrush(QBrush(QColor(100, 160, 255, 120)))
         p.drawPath(path)
 
-    def _blur(p: QPainter, s: int):
-        p.setPen(QPen(QColor(100, 140, 220), 2))
-        p.setBrush(QBrush(QColor(100, 140, 220, 60)))
-        p.drawEllipse(3, 3, s - 6, s - 6)
-        p.setPen(QPen(QColor(60, 100, 180), 1))
-        p.drawLine(s // 2, 6, s // 2, s - 6)
-        p.drawLine(6, s // 2, s - 6, s // 2)
-
     def _transform(p: QPainter, s: int):
         p.setPen(QPen(QColor(0, 0, 0), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -221,7 +216,19 @@ def make_tool_cursors() -> dict[Tool, QCursor]:
     # 太さは円で出すので、カーソル自体は中心が分かる十字にする
     cursors[Tool.SELECT_PEN] = QCursor(Qt.CursorShape.CrossCursor)
     cursors[Tool.LASSO_FILL] = _make_cursor_pixmap(_lasso_fill, hot=(12, 12))
-    cursors[Tool.BLUR] = _make_cursor_pixmap(_blur, hot=(12, 12))
+    # ぼかす範囲は円で出すので、カーソル自体は中心が分かる十字にする
+    # （以前はアイコンのカーソルで、どこまでぼけるのか分からなかった）
+    cursors[Tool.BLUR] = QCursor(Qt.CursorShape.CrossCursor)
+
+    def _uni(p: QPainter, s: int):
+        import math
+        p.setPen(QPen(QColor(0, 0, 0), 1.5))
+        c = s / 2
+        for i in range(12):
+            a = i * math.pi / 6
+            p.drawLine(QPoint(int(c + 5 * math.cos(a)), int(c + 5 * math.sin(a))),
+                       QPoint(int(c + 11 * math.cos(a)), int(c + 11 * math.sin(a))))
+    cursors[Tool.UNI_FLASH] = _make_cursor_pixmap(_uni, hot=(12, 12))
     cursors[Tool.MOVE] = QCursor(Qt.CursorShape.SizeAllCursor)
     cursors[Tool.TRANSFORM] = _make_cursor_pixmap(_transform, hot=(12, 12))
     return cursors

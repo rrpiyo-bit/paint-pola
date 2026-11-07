@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QScrollArea
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+                             QScrollArea, QSlider, QSpinBox)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QTransform, QPixmap,
                          QBrush)
 from PyQt6.QtCore import Qt, QRect, QRectF, QPointF, QSize, QTimer, pyqtSignal
@@ -202,6 +203,28 @@ class NavigatorPanel(QWidget):
             rot_row.addWidget(b)
         layout.addLayout(rot_row)
 
+        # 好きな角度に回すスライダー（-180〜180度）。ボタン・メニューで
+        # 回したときも canvas.rotation_changed で表示を合わせる。
+        angle_row = QHBoxLayout()
+        angle_row.addWidget(QLabel("角度"))
+        self._rot_slider = QSlider(Qt.Orientation.Horizontal)
+        self._rot_slider.setRange(-180, 180)
+        self._rot_slider.setToolTip("キャンバスの表示を好きな角度に回します\n"
+                                    "（絵そのものは回りません）")
+        self._rot_spin = QSpinBox()
+        self._rot_spin.setRange(-180, 180)
+        self._rot_spin.setSuffix("°")
+        self._rot_spin.setWrapping(True)
+        self._rot_spin.setFixedWidth(64)
+        angle_row.addWidget(self._rot_slider, 1)
+        angle_row.addWidget(self._rot_spin)
+        layout.addLayout(angle_row)
+        self._rot_slider.valueChanged.connect(self._on_angle_input)
+        self._rot_spin.valueChanged.connect(self._on_angle_input)
+        if hasattr(canvas, "rotation_changed"):
+            canvas.rotation_changed.connect(self._sync_angle)
+        self._sync_angle(getattr(canvas, "_rotation", 0))
+
         layout.addStretch()
 
         self._scroll.horizontalScrollBar().valueChanged.connect(self._sync_frame)
@@ -233,11 +256,12 @@ class NavigatorPanel(QWidget):
         rot = self._canvas._rotation
         flip = self._canvas._flip_h
         if rot != 0 or flip:
-            # Canvas._c2w() と同じ変換順: flip → rotate
+            # Canvas._c2w() と同じ変換順（点には反転 → 回転の順で効く）。
+            # QTransform は後から呼んだ操作が先に点に効くので、呼ぶ順は回転 → 反転。
             t = QTransform()
+            t.rotate(rot)
             if flip:
                 t.scale(-1, 1)
-            t.rotate(rot)
             composite = composite.transformed(t, Qt.TransformationMode.SmoothTransformation)
 
         scaled = composite.scaled(
@@ -248,6 +272,27 @@ class NavigatorPanel(QWidget):
         self._sync_frame()
 
     # ── internal ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _signed_angle(rot: int) -> int:
+        """0〜359 を -180〜180 に直す（スライダーの中央が 0 度）。"""
+        rot %= 360
+        return rot - 360 if rot > 180 else rot
+
+    def _on_angle_input(self, value: int):
+        self._canvas.set_rotation(value)
+        # set_rotation が rotation_changed を出さなかった（同じ角度）ときも
+        # スライダーと数値欄を揃えておく
+        self._sync_angle(self._canvas._rotation)
+        self.refresh()
+
+    def _sync_angle(self, rot: int):
+        v = self._signed_angle(rot)
+        for w in (self._rot_slider, self._rot_spin):
+            if w.value() != v:
+                w.blockSignals(True)
+                w.setValue(v)
+                w.blockSignals(False)
 
     def _canvas_origin_in_content(self) -> tuple[int, int]:
         """余白ラッパー内でのキャンバスの左上位置（余白ラッパー座標系）。
@@ -313,9 +358,8 @@ class NavigatorPanel(QWidget):
         if sv is None:
             return
         ls = self._canvas.layer_stack
-        cw, ch = ls.width, ls.height
-        if self._canvas._rotation % 180 != 0:
-            cw, ch = ch, cw
+        from canvas import _rotated_size
+        cw, ch = _rotated_size(ls.width, ls.height, self._canvas._rotation)
         if cw == 0 or ch == 0:
             return
         # 少しだけ余裕を持たせて全体が確実に見えるようにする

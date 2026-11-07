@@ -120,6 +120,7 @@ class ToolOptionsPanel(QWidget):
     vector_delete_requested = pyqtSignal()          # 選択中の線を消す
     vector_smooth_toggled = pyqtSignal(bool)        # なめらか / 直線つなぎ
     vector_erase_mode_changed = pyqtSignal(str)     # "cut" | "whole"
+    uni_flash_changed = pyqtSignal(str, object)     # ウニフラッシュの設定 (項目名, 値)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -200,7 +201,8 @@ class ToolOptionsPanel(QWidget):
                  text_font: str = "Arial",
                  text_size: int = 40,
                  select_pen_size: int = 30,
-                 select_pen_erase: bool = False):
+                 select_pen_erase: bool = False,
+                 uni_flash: dict | None = None):
         self._current_tool = tool
         self._clear()
 
@@ -220,6 +222,7 @@ class ToolOptionsPanel(QWidget):
             Tool.TRANSFORM: "自由変形",
             Tool.EYEDROPPER: "スポイト",
             Tool.TEXT: "テキスト",
+            Tool.UNI_FLASH: "ウニフラッシュ",
         }
         self._title.setText(label_map.get(tool, "ツールオプション"))
 
@@ -326,6 +329,9 @@ class ToolOptionsPanel(QWidget):
             self._add_transform_mode_combo(transform_mode, mesh_div)
             self._add_pivot_selector()
 
+        elif tool == Tool.UNI_FLASH:
+            self._build_uni_flash(uni_flash)
+
         elif tool == Tool.SELECT_PEN:
             self._add_spinbox("ペンの太さ", select_pen_size, 1, 500,
                               lambda v: self.select_pen_size_changed.emit(v),
@@ -407,6 +413,7 @@ class ToolOptionsPanel(QWidget):
         w._opt_key = key  # type: ignore
         w.connect_changed(callback)
         self._add_row(label, w, tooltip)
+        return w
 
     def _add_stabilization(self, value: int):
         """ペン・消しゴム共通の手ブレ補正。指やマウスで描くときの
@@ -708,6 +715,85 @@ class ToolOptionsPanel(QWidget):
             "Shift+線の上をクリック＝点を追加\n"
             "ハンドル（○）をドラッグ＝曲がり具合\n"
             "　Alt を押しながらで片側だけ動く（角）")
+
+    def _build_uni_flash(self, opts: dict | None):
+        """ウニフラッシュの設定。どれも次に描くウニフラから効く。"""
+        from uniflash import UNI_DEFAULTS
+        o = dict(UNI_DEFAULTS)
+        o.update(opts or {})
+        emit = self.uni_flash_changed.emit
+        self._add_label("ドラッグした四角（左上→右下）の中に描きます。\n"
+                        "Shift で正円。色はペンの色を使います。")
+        self._add_spinbox("トゲの太さ", o["thickness"], 1, 100,
+                          lambda v: emit("thickness", v), key="uni_thickness",
+                          suffix=" px", tooltip="トゲ1本の、一番太い所の太さ。")
+        cb = QComboBox()
+        cb.addItem("1本ずつ", "single")
+        cb.addItem("束", "bundle")
+        cb.setCurrentIndex(1 if o["mode"] == "bundle" else 0)
+        self._add_row("トゲの数え方", cb,
+                      "束にすると、数本のトゲをひとまとめにして並べます。")
+        bundle_row = self._add_spinbox(
+            "1束の本数", o["bundle_count"], 2, 12,
+            lambda v: emit("bundle_count", v), key="uni_bundle_count",
+            suffix=" 本")
+        bundle_row.setEnabled(o["mode"] == "bundle")
+
+        def _on_mode(i):
+            mode = cb.itemData(i)
+            bundle_row.setEnabled(mode == "bundle")
+            emit("mode", mode)
+        cb.currentIndexChanged.connect(_on_mode)
+
+        self._add_spinbox("間隔", o["spacing"], 1, 60,
+                          lambda v: emit("spacing", v), key="uni_spacing",
+                          suffix=" °",
+                          tooltip="隣のトゲ（束）との間の角度。\n"
+                                  "小さいほどトゲが多くなります。")
+        self._add_spinbox("長さ", o["length"], 5, 100,
+                          lambda v: emit("length", v), key="uni_length",
+                          suffix=" %",
+                          tooltip="外側から内側へ伸びるトゲの長さ（半径に対する割合）。\n"
+                                  "100 % で中心まで届きます。")
+        self._add_spinbox("長さのばらつき", o["jitter"], 0, 100,
+                          lambda v: emit("jitter", v), key="uni_jitter",
+                          suffix=" %", tooltip="0 % で全部同じ長さになります。")
+        self._add_spinbox("入り（内側）", o["taper_in"], 0, 100,
+                          lambda v: emit("taper_in", v), key="uni_taper_in",
+                          suffix=" %",
+                          tooltip="トゲの内側の端を細くする長さ（トゲの長さに対する割合）。")
+        self._add_spinbox("抜き（外側）", o["taper_out"], 0, 100,
+                          lambda v: emit("taper_out", v), key="uni_taper_out",
+                          suffix=" %",
+                          tooltip="トゲの外側の端を細くする長さ（トゲの長さに対する割合）。")
+        self._add_separator()
+        self._add_toggle("中を塗る", bool(o["fill"]),
+                         lambda v: emit("fill", bool(v)),
+                         tooltip="トゲの内側の楕円を、下の色で塗りつぶします。\n"
+                                 "後ろの絵を隠したいとき用。")
+        self._add_color_button("中の色", o["fill_color"],
+                               lambda c: emit("fill_color", c))
+
+    def _add_color_button(self, label: str, color: str, callback):
+        """押すと色を選べるボタン。ボタンの地の色が今の色。"""
+        from PyQt6.QtWidgets import QColorDialog
+        from PyQt6.QtGui import QColor
+        btn = QPushButton()
+        btn.setFixedHeight(24)
+
+        def _paint(c: str):
+            btn.setStyleSheet(f"background:{c}; border:1px solid #888; border-radius:3px;")
+            btn._color = c  # type: ignore
+
+        def _pick():
+            c = QColorDialog.getColor(QColor(btn._color), self, label)  # type: ignore
+            if c.isValid():
+                _paint(c.name())
+                callback(c.name())
+        _paint(color)
+        btn.clicked.connect(_pick)
+        self._add_row(label, btn)
+        return btn
 
     def _add_separator(self):
         """設定のまとまりを視覚的に区切る横線。"""

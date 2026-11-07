@@ -17,3 +17,4 @@ class Tool(Enum):
     BLUR = auto()
     MOVE = auto()
     TRANSFORM = auto()
+    UNI_FLASH = auto()
