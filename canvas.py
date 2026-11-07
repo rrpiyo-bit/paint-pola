@@ -1393,9 +1393,10 @@ class Canvas(QWidget):
             lyr.uid = snap["uid"]
         return lyr
 
-    def save_structure_history(self):
+    def structure_snapshot(self) -> dict:
+        """全レイヤーの今の状態の控え（構造の取り消し・アクションのプレビュー用）。"""
         ls = self.layer_stack
-        snap = {
+        return {
             "layers": [self._snapshot_layer(l) for l in ls.layers],
             "active_path": list(ls.active_path),
             # キャンバスサイズも一緒に控える。サイズ変更を元に戻したとき、
@@ -1403,10 +1404,31 @@ class Canvas(QWidget):
             "canvas_size": (ls.width, ls.height),
             "anim": (ls.anim_length, ls.anim_frame),
         }
+
+    def save_structure_history(self):
+        self.push_structure_snapshot(self.structure_snapshot())
+
+    def push_structure_snapshot(self, snap: dict) -> None:
+        """前に取っておいた控えを、取り消し1回ぶんとして積む。
+
+        アクションのプレビューは、開いた時点の控えを取ってから結果を
+        映しているので、OK のときはその控えをそのまま履歴にすればよい。
+        """
         self._history.append(("structure", snap))
         self._redo_stack.clear()
         self._trim_history()
         self.edited.emit()
+
+    def restore_structure_snapshot(self, snap: dict) -> None:
+        """履歴を積まずに、控えの状態へ戻す（プレビューの取り消し用）。"""
+        self._apply_structure_snapshot(snap)
+        if self._vector_selected is not None:
+            self._vector_selected = None
+            self._vector_drag = None
+            self.vector_selection_changed.emit()
+        if self._on_structure_restored:
+            self._on_structure_restored()
+        self.update()
 
     def save_anim_history(self) -> None:
         """タイムライン（セルの指定・コマ数）だけを変える直前の状態を控える。

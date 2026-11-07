@@ -1686,3 +1686,156 @@ class TestUniFlash:
         from toolbar import TOOL_SHORTCUTS
         assert _TOOL_KEY_MAP[Qt.Key.Key_U] == Tool.UNI_FLASH
         assert TOOL_SHORTCUTS[Tool.UNI_FLASH] == "U"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# アクションのリアルタイムプレビュー・印象派の角度
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _paint_subject(win):
+    from PyQt6.QtGui import QPainter, QColor
+    ls = win.layer_stack
+    layer = ls.add("絵")
+    p = QPainter(layer.image)
+    p.fillRect(200, 200, 300, 300, QColor(200, 60, 60))
+    p.setPen(QColor(0, 0, 0))
+    for i in range(0, 300, 20):
+        p.drawLine(200 + i, 200, 500, 200 + i)
+    # 切り絵コラージュ用に、線で閉じた透明な領域も作る
+    p.drawRect(600, 600, 200, 200)
+    p.end()
+    win.layer_panel.refresh()
+    return layer
+
+
+def _layer_names(ls):
+    out = []
+    def walk(items):
+        for it in items:
+            out.append(it.name)
+            if it.is_group:
+                walk(it.children)
+    walk(ls.layers)
+    return out
+
+
+class TestImpressionistOptions:
+    def test_limits_doubled(self):
+        from actions import ImpressionistDialog
+        d = ImpressionistDialog()
+        assert d._length.maximum() == 80
+        assert d._width.maximum() == 24
+        assert d._density.maximum() == 1200
+        assert d._jitter.maximum() == 120
+        p = d.params()
+        assert p["angle"] == 0 and 0 < p["wobble"] <= 90
+
+    def _orientation(self, angle):
+        """筆跡の向き（画像の構造テンソルから求めた主方向, 度）。"""
+        import numpy as np, cv2
+        from layer import LayerStack
+        from actions import execute_impressionist, _qimage_to_array
+        from PyQt6.QtGui import QPainter, QColor
+        ls = LayerStack(300, 300)
+        layer = ls.add("x")
+        p = QPainter(layer.image)
+        p.fillRect(0, 0, 300, 300, QColor(128, 128, 128))
+        p.end()
+        import random
+        random.seed(1); np.random.seed(1)
+        r = execute_impressionist(ls, layer, {"length": 30, "width": 2, "density": 2.0,
+                                              "jitter": 120, "follow": False,
+                                              "angle": angle, "wobble": 0})
+        g = _qimage_to_array(r.image)[:, :, :3].mean(axis=2).astype(np.float32)
+        gx = cv2.Sobel(g, cv2.CV_32F, 1, 0); gy = cv2.Sobel(g, cv2.CV_32F, 0, 1)
+        jxx, jyy, jxy = (gx * gx).sum(), (gy * gy).sum(), (gx * gy).sum()
+        # 勾配の主方向に直交するのが筆の向き
+        grad = 0.5 * np.degrees(np.arctan2(2 * jxy, jxx - jyy))
+        return (grad + 90 + 90) % 180 - 90
+
+    @pytest.mark.parametrize("angle", [0, 45, -45, 90])
+    def test_fixed_angle_sets_stroke_direction(self, angle):
+        got = self._orientation(angle)
+        diff = abs((got - angle + 90) % 180 - 90)
+        assert diff < 10, (angle, got)
+
+
+class TestActionLivePreview:
+    """アクションのダイアログで数値を変えると、キャンバスに結果が映る。"""
+
+    def _open(self, win, monkeypatch, on_open, accept):
+        """ダイアログが開いたら on_open(dlg) を呼んでから閉じる。"""
+        from PyQt6.QtWidgets import QDialog
+        def fake_exec(dlg):
+            dlg.show()
+            QApplication.processEvents()  # 開いた直後の1回目のプレビュー
+            on_open(dlg)
+            dlg.hide()
+            return QDialog.DialogCode.Accepted if accept else QDialog.DialogCode.Rejected
+        monkeypatch.setattr(QDialog, "exec", fake_exec)
+
+    def test_preview_then_cancel_restores(self, win, monkeypatch):
+        _paint_subject(win)
+        ls = win.layer_stack
+        before = _layer_names(ls)
+        hist = len(win.canvas._history)
+        seen = {}
+        def on_open(dlg):
+            seen["names"] = _layer_names(ls)
+            dlg._length.setValue(30)
+            dlg._preview_live.update()
+            seen["names2"] = _layer_names(ls)
+        self._open(win, monkeypatch, on_open, accept=False)
+        win.layer_panel._action_panel._on_impressionist()
+        assert any("印象派風" in n for n in seen["names"])
+        # 数値を変えても結果は1つだけ（前のプレビューは消してから作り直す）
+        assert sum("印象派風" in n for n in seen["names2"]) == 1
+        assert _layer_names(ls) == before
+        assert len(win.canvas._history) == hist
+
+    def test_preview_then_ok_keeps_result_and_undo(self, win, monkeypatch):
+        _paint_subject(win)
+        ls = win.layer_stack
+        before = _layer_names(ls)
+        shown = {}
+        def on_open(dlg):
+            dlg._angle.setValue(40)
+            dlg._preview_live.update()
+            shown["img"] = next(l for l in ls.layers if "印象派風" in l.name).image.copy()
+        self._open(win, monkeypatch, on_open, accept=True)
+        win.layer_panel._action_panel._on_impressionist()
+        res = [l for l in ls.layers if "印象派風" in l.name]
+        assert len(res) == 1
+        # プレビューで見ていた絵がそのまま確定する
+        assert res[0].image == shown["img"]
+        win.canvas.undo()
+        assert _layer_names(ls) == before
+
+    def test_ok_with_changed_params_recomputes_same_seed(self, win, monkeypatch):
+        """プレビューを切っていても、OK で結果が作られる。"""
+        _paint_subject(win)
+        ls = win.layer_stack
+        def on_open(dlg):
+            dlg._preview_live.check.setChecked(False)
+        self._open(win, monkeypatch, on_open, accept=True)
+        win.layer_panel._action_panel._on_impressionist()
+        assert sum("印象派風" in l.name for l in ls.layers) == 1
+
+    def test_every_action_previews_and_cancels_cleanly(self, win, monkeypatch):
+        """ガチャ・パス複製以外のどのアクションも、プレビューしてキャンセルすると元通り。"""
+        _paint_subject(win)
+        ls = win.layer_stack
+        panel = win.layer_panel._action_panel
+        before = _layer_names(ls)
+        changed = {}
+        def on_open(dlg):
+            live = getattr(dlg, "_preview_live", None)
+            assert live is not None, type(dlg).__name__
+            changed[type(dlg).__name__] = _layer_names(ls) != before or live._applied
+        self._open(win, monkeypatch, on_open, accept=False)
+        names = [n for n in dir(panel) if n.startswith("_on_")
+                 and n not in ("_on_gacha", "_on_path_repeat", "_on_paper_layers")]
+        for n in names:
+            getattr(panel, n)()
+            assert _layer_names(ls) == before, n
+        assert changed and all(changed.values()), changed

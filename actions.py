@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QDialog,
                               QScrollArea)
 from PyQt6.QtGui import (QImage, QPainter, QColor, QTransform, QLinearGradient,
                           QRadialGradient, QBrush, QPen, QPainterPath)
-from PyQt6.QtCore import Qt, pyqtSignal, QPointF
+from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QTimer
 
 from layer import Layer, GroupLayer, LayerStack
 
@@ -3847,35 +3847,52 @@ class ImpressionistDialog(QDialog):
 
         form = QFormLayout()
         self._length = QSpinBox()
-        self._length.setRange(3, 40)
+        self._length.setRange(3, 80)
         self._length.setValue(12)
         self._length.setSuffix(" px")
         self._length.setToolTip("1本の筆跡の長さ")
         form.addRow("筆跡の長さ", self._length)
 
         self._width = QSpinBox()
-        self._width.setRange(1, 12)
+        self._width.setRange(1, 24)
         self._width.setValue(3)
         self._width.setSuffix(" px")
         form.addRow("筆跡の太さ", self._width)
 
         self._density = QSpinBox()
-        self._density.setRange(50, 600)
+        self._density.setRange(50, 1200)
         self._density.setValue(220)
         self._density.setSuffix(" %")
         self._density.setToolTip("画面を何回ぶん塗り重ねるか。多いほど密になるが遅くなる")
         form.addRow("筆の密度", self._density)
 
         self._jitter = QSpinBox()
-        self._jitter.setRange(0, 60)
+        self._jitter.setRange(0, 120)
         self._jitter.setValue(20)
         self._jitter.setToolTip("1本ごとの色のばらつき。大きいと絵の具らしくなる")
         form.addRow("色のゆらぎ", self._jitter)
 
         self._follow = QCheckBox("明暗の流れに沿って筆を向ける")
         self._follow.setChecked(True)
-        self._follow.setToolTip("オフにするとすべて同じ角度の筆跡になる")
+        self._follow.setToolTip("オフにするとすべて「流れの角度」の向きの筆跡になる")
         form.addRow("", self._follow)
+
+        self._angle = QSpinBox()
+        self._angle.setRange(-90, 90)
+        self._angle.setValue(0)
+        self._angle.setSuffix(" °")
+        self._angle.setWrapping(True)
+        self._angle.setToolTip("筆跡の向き。明暗に沿わせるときは、その流れ全体をこの角度だけ回す。\n"
+                               "沿わせないときは、すべての筆跡がこの角度になる（0°で横向き）")
+        form.addRow("流れの角度", self._angle)
+
+        self._wobble = QSpinBox()
+        self._wobble.setRange(0, 90)
+        self._wobble.setValue(14)
+        self._wobble.setSuffix(" °")
+        self._wobble.setToolTip("1本ごとの向きのばらつき。0°で流れにぴったり揃い、\n"
+                                "大きいほど筆跡があちこちを向く")
+        form.addRow("流れのブレ", self._wobble)
 
         layout.addLayout(form)
 
@@ -3898,6 +3915,8 @@ class ImpressionistDialog(QDialog):
             "density": self._density.value() / 100.0,
             "jitter": self._jitter.value(),
             "follow": self._follow.isChecked(),
+            "angle": self._angle.value(),
+            "wobble": self._wobble.value(),
         }
 
 
@@ -3915,6 +3934,10 @@ def execute_impressionist(layer_stack: LayerStack, source_layer: Layer,
     density = max(0.1, float(params.get("density", 2.2)))
     jitter = max(0, int(params.get("jitter", 20)))
     follow = params.get("follow", True)
+    # 流れの角度（度）。follow のときは流れ全体の回転、そうでなければ筆の向きそのもの
+    angle_off = math.radians(float(params.get("angle", 0)))
+    # 1本ごとの向きのブレ（度）。以前は ±0.25 rad（約14°）固定だった
+    wobble = math.radians(max(0.0, min(90.0, float(params.get("wobble", 14.3)))))
 
     arr = _qimage_to_array(src_img).astype(np.float32)
     rgb, alpha = arr[:, :, :3], arr[:, :, 3]
@@ -3941,18 +3964,18 @@ def execute_impressionist(layer_stack: LayerStack, source_layer: Layer,
     # 1本の筆が覆う面積からストローク数を決める
     per_stroke = max(1.0, float(length * width))
     n_strokes = int(len(xs) / per_stroke * density)
-    n_strokes = max(20, min(n_strokes, 120000))
+    n_strokes = max(20, min(n_strokes, 240000))
 
     order = np.random.randint(0, len(xs), size=n_strokes)
-    base_angle = random.uniform(0, math.pi)
     for i in order:
         cx, cy = int(xs[i]), int(ys[i])
         if follow:
             # 勾配ベクトルに直交＝等明度線に沿う向き
-            ang = math.atan2(-gx[cy, cx], gy[cy, cx] + 1e-6)
+            ang = math.atan2(-gx[cy, cx], gy[cy, cx] + 1e-6) + angle_off
         else:
-            ang = base_angle
-        ang += random.uniform(-0.25, 0.25)
+            ang = angle_off
+        if wobble:
+            ang += random.uniform(-wobble, wobble)
         half = length * random.uniform(0.6, 1.2) * 0.5
         dx, dy = math.cos(ang) * half, math.sin(ang) * half
         b, g, r = rgb[cy, cx]
@@ -4623,7 +4646,7 @@ def _gacha_random_params(key: str, colors: list[QColor]) -> dict:
     if key == "impressionist":
         return {"length": ri(6, 20), "width": ri(2, 5),
                 "density": ru(1.5, 3.0), "jitter": ri(5, 35),
-                "follow": rb(0.75)}
+                "follow": rb(0.75), "angle": ri(-90, 90), "wobble": ri(5, 30)}
     if key == "stained_glass":
         # 同上。背景まで暗いガラスで覆うと重ねがけの意味が無くなる。
         return {"cell": ri(18, 60), "lead": ri(2, 6), "lead_color": dark,
@@ -4917,6 +4940,144 @@ def execute_paper_layers(layer_stack: LayerStack, folder: GroupLayer,
 # アクションパネル
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _seed_random(seed: int | None) -> None:
+    """アクションの乱数をそろえる。プレビューと OK で同じ seed を使えば、
+    確認していた見た目のまま確定できる。None で元の（予測できない）状態へ戻す。"""
+    random.seed(seed)
+    np.random.seed(None if seed is None else seed % (2 ** 32))
+
+
+class _LivePreview:
+    """アクションのダイアログを開いている間、今の数値の結果をキャンバスに映す。
+
+    数値を変えるたびに、開いた時点の状態へ戻してから実行し直す。
+    履歴は積まないので、キャンセルすれば何も起きなかったことになる。
+    OK のときは、最後に映していた結果をそのまま残し、開いた時点の控えを
+    取り消し1回ぶんとして積む（同じ数値ならもう一度計算しない）。
+    """
+
+    DELAY_MS = 350  # 数値を続けて動かしている間は待ち、止まってから描き直す
+
+    def __init__(self, panel: "ActionPanel", dlg: QDialog, run_fn):
+        self.panel = panel
+        self.dlg = dlg
+        self.run_fn = run_fn  # run_fn(params) -> 結果（偽なら何もできなかった）
+        self.canvas = panel.canvas
+        self.seed = random.randrange(1 << 31)
+        self._base: dict | None = None      # 開いた時点の状態
+        self._applied = False               # 今キャンバスに結果を映しているか
+        self._applied_params = None
+        self._timer = QTimer(dlg)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.DELAY_MS)
+        self._timer.timeout.connect(self.update)
+        self.check = QCheckBox("キャンバスでプレビュー")
+        self.check.setChecked(self.canvas is not None)
+        self.check.setEnabled(self.canvas is not None)
+        self.check.setToolTip("数値を変えると、結果がすぐキャンバスに映ります。\n"
+                              "重いアクションで操作がもたつくときはオフにします。")
+        self.check.toggled.connect(self._on_toggled)
+        lay = dlg.layout()
+        if lay is not None:
+            # OK / キャンセルの直前に置く
+            lay.insertWidget(max(0, lay.count() - 1), self.check)
+        self._connect_inputs()
+        dlg._preview_live = self  # テストや後からの参照用
+
+    def _connect_inputs(self):
+        from PyQt6.QtWidgets import (QDoubleSpinBox, QSlider, QLineEdit,
+                                     QRadioButton, QAbstractButton)
+        d = self.dlg
+        for w in d.findChildren(QSpinBox) + d.findChildren(QDoubleSpinBox) + d.findChildren(QSlider):
+            w.valueChanged.connect(self.schedule)
+        for w in d.findChildren(QComboBox):
+            w.currentIndexChanged.connect(self.schedule)
+        for w in d.findChildren(QLineEdit):
+            if not isinstance(w.parent(), (QSpinBox, QDoubleSpinBox, QComboBox)):
+                w.textChanged.connect(self.schedule)
+        boxes = d.findChildren(QDialogButtonBox)
+        for w in d.findChildren(QAbstractButton):
+            if w is self.check or any(w in b.buttons() for b in boxes):
+                continue
+            if isinstance(w, (QCheckBox, QRadioButton)) or w.isCheckable():
+                w.toggled.connect(self.schedule)
+            else:
+                # 色ボタンなど。色を選ぶ処理のあとに呼ばれる（先につないだ順に動く）
+                w.clicked.connect(self.schedule)
+
+    @property
+    def enabled(self) -> bool:
+        return self.canvas is not None and self.check.isChecked()
+
+    def schedule(self, *_):
+        if self.enabled:
+            self._timer.start()
+
+    def start(self):
+        """ダイアログを開いた直後、既定の数値でまず1回映す。"""
+        if self.enabled:
+            QTimer.singleShot(0, self.update)
+
+    def _on_toggled(self, on: bool):
+        if on:
+            self.update()
+        else:
+            self._timer.stop()
+            self.revert()
+
+    def revert(self):
+        if self._applied and self._base is not None:
+            self.canvas.restore_structure_snapshot(self._base)
+        self._applied = False
+        self._applied_params = None
+
+    def update(self):
+        if not self.enabled or not self.dlg.isVisible():
+            return
+        from PyQt6.QtWidgets import QApplication
+        try:
+            params = self.dlg.params()
+        except Exception:
+            return
+        if self._base is None:
+            self._base = self.canvas.structure_snapshot()
+        self.revert()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            _seed_random(self.seed)
+            result = self.run_fn(params)
+        except Exception:
+            traceback.print_exc()
+            result = None
+        finally:
+            _seed_random(None)
+            QApplication.restoreOverrideCursor()
+        if result:
+            self._applied = True
+            self._applied_params = params
+            # action_executed は出さない。出すと未保存マークが付き、
+            # 履歴の掃除（消えたレイヤーの履歴を捨てる）まで走ってしまう。
+            self.canvas.update()
+        elif self._base is not None:
+            # 途中まで書き換えていても残さない
+            self.canvas.restore_structure_snapshot(self._base)
+
+    def finish(self, accepted: bool) -> bool:
+        """閉じたときに呼ぶ。OK で最後のプレビューをそのまま確定できたら True。"""
+        self._timer.stop()
+        if accepted and self._applied and self._applied_params is not None:
+            try:
+                same = self.dlg.params() == self._applied_params
+            except Exception:
+                same = False
+            if same:
+                self.canvas.push_structure_snapshot(self._base)
+                self._applied = False
+                return True
+        self.revert()
+        return False
+
+
 class ActionPanel(QWidget):
     action_executed = pyqtSignal()
     structure_will_change = pyqtSignal()
@@ -4998,15 +5159,35 @@ class ActionPanel(QWidget):
             return None
         return active
 
-    def _run(self, title: str, dialog_cls, execute_fn):
+    def _run(self, title: str, dialog_cls, execute_fn, preview: bool = True):
         active = self._require_layer(title)
         if not active:
             return
         dlg = dialog_cls(self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        # プレビューで状態を戻すとレイヤーは作り直されるので、
+        # 対象は毎回「今選んでいるレイヤー」から取り直す。
+        def run(params):
+            return execute_fn(self.layer_stack, self.layer_stack.active, params)
+        self._exec_with_preview(dlg, run, preview)
+
+    def _exec_with_preview(self, dlg: QDialog, run, preview: bool = True):
+        """ダイアログを開き、数値を変えるたびに結果をキャンバスに映す。
+        OK で確定（取り消し1回で元に戻せる）、キャンセルで何もしない。"""
+        live = _LivePreview(self, dlg, run) if preview else None
+        if live is not None:
+            live.start()
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        if live is not None and live.finish(accepted):
+            self.action_executed.emit()
             return
+        if not accepted:
+            return  # プレビューは finish() で戻してある
         self.structure_will_change.emit()
-        result = execute_fn(self.layer_stack, active, dlg.params())
+        _seed_random(live.seed if live is not None else None)
+        try:
+            result = run(dlg.params())
+        finally:
+            _seed_random(None)
         if result:
             self.action_executed.emit()
 
@@ -5020,14 +5201,9 @@ class ActionPanel(QWidget):
         self._run("影付け", DropShadowDialog, execute_drop_shadow)
 
     def _on_bg_pattern(self):
-        active = self.layer_stack.active
         dlg = BgPatternDialog(self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        self.structure_will_change.emit()
-        result = execute_bg_pattern(self.layer_stack, active, dlg.params())
-        if result:
-            self.action_executed.emit()
+        self._exec_with_preview(
+            dlg, lambda p: execute_bg_pattern(self.layer_stack, self.layer_stack.active, p))
 
     def _on_line_color(self):
         self._run("線画色変え", LineColorDialog, execute_line_color)
@@ -5065,16 +5241,23 @@ class ActionPanel(QWidget):
                                     "（非表示・クリッピング・空のレイヤーは対象外です）")
             return
         dlg = PaperLayersDialog(self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        self.structure_will_change.emit()
-        made = execute_paper_layers(self.layer_stack, folder, dlg.params())
-        # 影を差し込むと番号がずれるので、選んでいたレイヤーを選び直す
-        path = self.layer_stack.find_path(active)
-        if path:
-            self.layer_stack.set_active_path(path)
-        if made:
-            self.action_executed.emit()
+        path0 = list(self.layer_stack.active_path)
+
+        def run(params):
+            # プレビューで戻すとレイヤーが作り直されるので、毎回選び直す
+            ls = self.layer_stack
+            ls.active_path = list(path0)
+            cur = ls.active
+            target = paper_target_folder(ls, cur)
+            if target is None:
+                return None
+            made = execute_paper_layers(ls, target, params)
+            # 影を差し込むと番号がずれるので、選んでいたレイヤーを選び直す
+            path = ls.find_path(cur)
+            if path:
+                ls.set_active_path(path)
+            return made
+        self._exec_with_preview(dlg, run)
 
     def _on_wobble(self):
         self._run("線の揺らぎ", WobbleDialog, execute_wobble)
@@ -5122,7 +5305,8 @@ class ActionPanel(QWidget):
         self._run("銅版画 / エッチング風", EtchingDialog, execute_etching)
 
     def _on_gacha(self):
-        self._run("アクションガチャ", GachaDialog, execute_gacha)
+        # ガチャは中身がランダムなので、見ながら数値を決めるプレビューは付けない
+        self._run("アクションガチャ", GachaDialog, execute_gacha, preview=False)
 
     def _on_path_repeat(self):
         active = self._require_layer("パスに沿った連続複製")
