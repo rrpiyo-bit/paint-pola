@@ -1839,3 +1839,151 @@ class TestActionLivePreview:
             getattr(panel, n)()
             assert _layer_names(ls) == before, n
         assert changed and all(changed.values()), changed
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# スプレーの設定（粒の数・大きさ・ばらつき・中心寄せ・形・吹き続け）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _alpha_arr(img):
+    import numpy as np
+    from PyQt6.QtGui import QImage
+    im = img.convertToFormat(QImage.Format.Format_ARGB32)
+    ptr = im.bits(); ptr.setsize(im.height() * im.width() * 4)
+    return np.frombuffer(ptr, dtype=np.uint8).reshape(im.height(), im.width(), 4)[:, :, 3].copy()
+
+
+def _spray_img(**opts):
+    import random
+    from PyQt6.QtGui import QImage, QColor
+    from PyQt6.QtCore import QPoint
+    from brush import SprayBrush, SPRAY_DEFAULTS
+    random.seed(3)
+    b = SprayBrush()
+    b.settings = dict(SPRAY_DEFAULTS); b.settings.update(opts)
+    img = QImage(200, 200, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(0)
+    b.stamp(img, QPoint(100, 100), QColor(0, 0, 0), 120)
+    return _alpha_arr(img)
+
+
+class TestSprayOptions:
+    def test_density_adds_particles(self):
+        assert (_spray_img(density=200) > 0).sum() > 3 * (_spray_img(density=20) > 0).sum()
+
+    def test_particle_size(self):
+        small = (_spray_img(density=20, particle_size=2, size_jitter=0) > 0).sum()
+        big = (_spray_img(density=20, particle_size=12, size_jitter=0) > 0).sum()
+        assert big > 5 * small
+
+    def test_bias_concentrates_center(self):
+        import numpy as np
+        yy, xx = np.mgrid[0:200, 0:200]
+        inner = (xx - 100) ** 2 + (yy - 100) ** 2 < 20 ** 2
+        def ratio(a):
+            a = a.astype(float)
+            return a[inner].sum() / max(1.0, a.sum())
+        assert ratio(_spray_img(density=300, bias=100)) > 2 * ratio(_spray_img(density=300, bias=0))
+
+    def test_particles_stay_in_circle(self):
+        import numpy as np
+        a = _spray_img(density=300, bias=0, particle_size=1, size_jitter=0)
+        yy, xx = np.nonzero(a)
+        assert ((xx - 100) ** 2 + (yy - 100) ** 2).max() <= 62 ** 2
+
+    @pytest.mark.parametrize("shape", ["circle", "square", "star", "streak"])
+    def test_shapes_draw(self, shape):
+        assert (_spray_img(shape=shape, particle_size=8) > 0).sum() > 0
+
+    def test_opacity(self):
+        assert _spray_img(opacity=100, density=5).max() > _spray_img(opacity=10, density=5).max()
+
+    def test_sanitize(self):
+        from brush import sanitize_spray
+        assert sanitize_spray("density", 9999) == 300
+        assert sanitize_spray("shape", "hexagon") is None
+        assert sanitize_spray("continuous", "false") is False
+
+
+class TestSprayOnCanvas:
+    def _setup(self, win, **opts):
+        c = win.canvas
+        c.layer_stack.add("s")
+        win._on_tool_change(Tool.PEN)
+        win.tool_options.brush_changed.emit("spray")
+        QApplication.processEvents()
+        c.spray_settings.update(opts)
+        return c
+
+    def _press(self, c, x, y):
+        wp = c._c2w().map(QPointF(x, y))
+        c.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, wp, Qt.MouseButton.LeftButton,
+                                      Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+
+    def _release(self, c, x, y):
+        wp = c._c2w().map(QPointF(x, y))
+        c.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, wp, Qt.MouseButton.LeftButton,
+                                        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+
+    def _ink(self, c):
+        return int(_alpha_arr(c.layer_stack.active.image).astype(int).sum())
+
+    def test_holding_still_keeps_spraying(self, win):
+        c = self._setup(win, continuous=True, density=20)
+        self._press(c, 400, 400)
+        first = self._ink(c)
+        for _ in range(5):
+            c._spray_tick()
+        assert self._ink(c) > first
+        self._release(c, 400, 400)
+        assert not c._spray_timer.isActive()
+
+    def test_continuous_off(self, win):
+        c = self._setup(win, continuous=False, density=20)
+        self._press(c, 400, 400)
+        assert not c._spray_timer.isActive()
+        first = self._ink(c)
+        c._spray_tick()
+        assert self._ink(c) == first
+        self._release(c, 400, 400)
+
+    def test_held_spray_survives_taper_redraw(self, win):
+        """入り抜きで離したときに描き直しても、止めて吹いた粒は残る。"""
+        c = self._setup(win, continuous=True, density=30)
+        c.set_taper("pen", "out", 20)
+        self._press(c, 400, 400)
+        for _ in range(10):
+            c._spray_tick()
+        before = self._ink(c)
+        self._release(c, 400, 400)
+        assert self._ink(c) > before * 0.6
+
+    def test_options_shown_only_for_spray_and_persist(self, win):
+        from PyQt6.QtWidgets import QLabel
+        win._on_tool_change(Tool.PEN)
+        win.tool_options.brush_changed.emit("round")
+        QApplication.processEvents()
+        labels = lambda: [l.text() for l in win.tool_options.findChildren(QLabel) if l.isVisibleTo(win.tool_options)]
+        assert "粒の数" not in labels()
+        win.tool_options.brush_changed.emit("spray")
+        QApplication.processEvents()
+        assert "粒の数" in labels() and "中心への寄せ" in labels()
+        win.tool_options.spray_changed.emit("bias", 70)
+        win.tool_options.spray_changed.emit("shape", "star")
+        w2 = MainWindow()
+        try:
+            assert w2.canvas.spray_settings["bias"] == 70
+            assert w2.canvas.spray_settings["shape"] == "star"
+        finally:
+            w2.close()
+
+    def test_settings_not_shared_between_windows(self, win):
+        """ブラシは使い回しなので、別ウィンドウの設定で描かれないこと。"""
+        w2 = MainWindow()
+        try:
+            win.canvas.spray_settings["density"] = 7
+            w2.canvas.spray_settings["density"] = 99
+            win.canvas.brush_type = "spray"
+            assert win.canvas._pen_brush().settings["density"] == 7
+        finally:
+            w2.close()

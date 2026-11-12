@@ -1390,6 +1390,7 @@ class MainWindow(QMainWindow):
                     pass
         self._restore_tool_settings()
         self._restore_uni_flash_settings()
+        self._restore_spray_settings()
         self._refresh_tool_options()
         # ウィンドウ表示・レイアウト確定後でないと表示領域が0のままフィットできない
         QTimer.singleShot(0, lambda: self.navigator._fit_view())
@@ -1448,7 +1449,8 @@ class MainWindow(QMainWindow):
         self.toolbar.options_toggled.connect(self._toggle_tool_options)
         self.tool_options.pen_size_changed.connect(self._on_pen_size_change)
         self.tool_options.eraser_size_changed.connect(self._on_eraser_size_change)
-        self.tool_options.brush_changed.connect(self.canvas.set_brush)
+        self.tool_options.brush_changed.connect(self._on_brush_change)
+        self.tool_options.spray_changed.connect(self._on_spray_change)
         self.tool_options.stabilization_changed.connect(self._on_stabilization_change)
         self.tool_options.taper_changed.connect(self._on_taper_change)
         self.tool_options.symmetry_toggled.connect(
@@ -1598,6 +1600,31 @@ class MainWindow(QMainWindow):
         self.canvas.uni_flash[field] = v
         self._settings.setValue(f"uni_flash/{field}", v)
 
+    def _on_brush_change(self, key: str) -> None:
+        self.canvas.set_brush(key)
+        # スプレーのときだけ粒の設定を出すので、オプション欄を作り直す。
+        # コンボボックスの信号の中で消さないよう、少し後で。
+        QTimer.singleShot(0, self._refresh_tool_options)
+
+    def _on_spray_change(self, field: str, value) -> None:
+        """スプレーの設定を変えて、次回起動時も同じ値で始められるよう残す。"""
+        from brush import sanitize_spray
+        v = sanitize_spray(field, value)
+        if v is None:
+            return
+        self.canvas.spray_settings[field] = v
+        self._settings.setValue(f"spray/{field}", v)
+
+    def _restore_spray_settings(self) -> None:
+        from brush import SPRAY_DEFAULTS, sanitize_spray
+        for field in SPRAY_DEFAULTS:
+            raw = self._settings.value(f"spray/{field}", None)
+            if raw is None:
+                continue
+            v = sanitize_spray(field, raw)
+            if v is not None:
+                self.canvas.spray_settings[field] = v
+
     def _restore_uni_flash_settings(self) -> None:
         from uniflash import UNI_DEFAULTS, sanitize_uni
         for field in UNI_DEFAULTS:
@@ -1660,6 +1687,7 @@ class MainWindow(QMainWindow):
             select_pen_size=self.canvas.select_pen_size,
             select_pen_erase=self.canvas.select_pen_erase,
             uni_flash=self.canvas.uni_flash,
+            spray=self.canvas.spray_settings,
         )
 
     def _refresh_tool_options_if_kind_changed(self):

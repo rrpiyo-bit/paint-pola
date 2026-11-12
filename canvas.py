@@ -14,7 +14,8 @@ from PyQt6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal,
 
 from layer import LayerStack, Layer, BLEND_KEY_TO_MODE
 from tools import Tool
-from brush import BrushType, get_brush, StabilizedBrush, BlurBrush, BRUSH_LABELS
+from brush import (BrushType, get_brush, StabilizedBrush, BlurBrush, BRUSH_LABELS,
+                   SprayBrush, SPRAY_DEFAULTS)
 from uniflash import default_uni, draw_uni_flash
 
 # ツールキーボードショートカット（toolbar.py の TOOL_SHORTCUTS と一致させること）
@@ -609,6 +610,9 @@ def _canvas_to_widget_transform(canvas_w: int, canvas_h: int,
     return t
 
 
+SPRAY_INTERVAL_MS = 40  # 止めて吹き続けるときの間隔
+
+
 def _rotated_size(w: float, h: float, rotation: int) -> tuple[int, int]:
     """w×h の絵を rotation 度回したときに収まる外接矩形の大きさ。"""
     rotation %= 360
@@ -717,6 +721,14 @@ class Canvas(QWidget):
         self.blur_size: int = 30
         self.blur_strength: float = 0.5  # 0.0〜1.0
         self._blur_brush: BlurBrush = BlurBrush(0.5)
+
+        # スプレー（設定は brush.SPRAY_DEFAULTS を参照）。止めていても
+        # 吹き続けるときは、タイマーで今の位置に粒を足していく。
+        self.spray_settings: dict = dict(SPRAY_DEFAULTS)
+        self._spray_timer = QTimer(self)
+        self._spray_timer.setInterval(SPRAY_INTERVAL_MS)
+        self._spray_timer.timeout.connect(self._spray_tick)
+        self._spray_moved = False  # 前のタイマーから動いたか（動いている間は足さない）
 
         # ウニフラッシュ（設定は uniflash.UNI_DEFAULTS を参照）
         self.uni_flash: dict = default_uni()
@@ -1177,7 +1189,7 @@ class Canvas(QWidget):
         """a→b を描いたときに変わりうる範囲。左右対称のときは全体（None）。"""
         if self.symmetry_enabled:
             return None
-        m = int(self._tool_size()) + 4
+        m = int(self._tool_size()) + 4 + self._spray_extent()
         return QRect(a, b).normalized().adjusted(-m, -m, m, m)
 
     def _clip_to_selection_area(self, layer, base: QImage) -> None:
@@ -2896,6 +2908,9 @@ class Canvas(QWidget):
                                   self._taper_start_size(layer, smooth_pt))
                 dirty = self._segment_dirty(smooth_pt, smooth_pt)
             self._after_stroke_draw(layer, dirty)
+            if self._is_spraying() and self.spray_settings.get("continuous", True):
+                self._spray_moved = False
+                self._spray_timer.start()
             self.update()
 
         elif self.tool == Tool.ERASER and self._is_alpha_locked(layer):
@@ -3212,6 +3227,7 @@ class Canvas(QWidget):
         lp = QPoint(cp.x() - lox, cp.y() - loy)
 
         if self.tool in (Tool.PEN, Tool.ERASER) and self._last_pos is not None:
+            self._spray_moved = True
             smooth_pt = self._stabilizer.push(lp).toPoint()
             dirty = self._segment_dirty(self._last_pos, smooth_pt)
             self._stroke_segment(layer, self._last_pos, smooth_pt)
@@ -3265,6 +3281,7 @@ class Canvas(QWidget):
         if self._selpen_mask is not None:
             self._selpen_finish()
             return
+        self._spray_timer.stop()
         if self._drawing and not self._panning:
             self._finish_stabilized_stroke()
             self._taper_finish()
@@ -3508,10 +3525,50 @@ class Canvas(QWidget):
             return QPointF(2 * cx - pt.x() - 2 * ox, pt.y())
         return QPoint(2 * cx - pt.x() - 2 * ox, pt.y())
 
+    def _pen_brush(self):
+        """今のペンのブラシ。スプレーならこのキャンバスの設定を持たせる
+        （ブラシは使い回しなので、別のウィンドウの設定が混ざらないように）。"""
+        brush = get_brush(self.brush_type)
+        if isinstance(brush, SprayBrush):
+            brush.settings = self.spray_settings
+        return brush
+
+    def _is_spraying(self) -> bool:
+        return (self.tool == Tool.PEN and self.brush_type == BrushType.SPRAY)
+
+    def _spray_extent(self) -> int:
+        """スプレーの粒がブラシの円からはみ出しうる幅（細長い線の粒が一番長い）。"""
+        if not self._is_spraying():
+            return 0
+        return int(self.spray_settings["particle_size"] * 1.3) + 1
+
+    def _spray_tick(self):
+        """止めたまま押し続けている間、今の位置に粒を足す（クリスタの「連続吹き付け」）。"""
+        layer = self.layer_stack.active
+        if (not self._drawing or not self._is_spraying() or self._last_pos is None
+                or layer is None or layer.is_group or layer.is_vector
+                or not self.spray_settings.get("continuous", True)):
+            self._spray_timer.stop()
+            return
+        if self._spray_moved:
+            # 動かしている間は線として粒が出ているので、ここでは足さない
+            self._spray_moved = False
+            return
+        pos = self._last_pos
+        self._brush_stamp(self._stroke_target(layer), pos)
+        ts = self._taper_stroke
+        if ts is not None and ts["layer"] is layer:
+            # 入り抜きで離したときに描き直すので、止めて吹いた所も覚えておく
+            ox = getattr(layer, 'offset_x', 0)
+            oy = getattr(layer, 'offset_y', 0)
+            ts.setdefault("stamps", []).append(QPointF(pos.x() + ox, pos.y() + oy))
+        self._after_stroke_draw(layer, self._segment_dirty(pos, pos))
+        self.update()
+
     def _brush_stamp(self, img: QImage, pt: QPoint, size: float | None = None):
         """ブラシで1点描画（対称定規対応）。size 省略時はペンの太さ。"""
         size = self.pen_size if size is None else size
-        brush = get_brush(self.brush_type)
+        brush = self._pen_brush()
         aa = self.pen_antialias
         brush.stamp(img, pt, self.pen_color, size, aa)
         if self.symmetry_enabled:
@@ -3520,7 +3577,7 @@ class Canvas(QWidget):
     def _brush_stroke(self, img: QImage, a: QPoint, b: QPoint, size: float | None = None):
         """ブラシでストローク描画（対称定規対応）。size 省略時はペンの太さ。"""
         size = self.pen_size if size is None else size
-        brush = get_brush(self.brush_type)
+        brush = self._pen_brush()
         aa = self.pen_antialias
         brush.stroke_to(img, a, b, self.pen_color, size, aa)
         if self.symmetry_enabled:
@@ -3707,6 +3764,9 @@ class Canvas(QWidget):
                 self._brush_stamp(img, pts[0], size)
         for a, b, w in _taper_pieces(pts, size, t["in"], t["out"], t["tip"], total):
             self._taper_draw_piece(img, a, b, w)
+        for q in ts.get("stamps", ()):
+            # スプレーを止めて吹き続けた所
+            self._brush_stamp(img, QPointF(q.x() - ox, q.y() - oy), size)
         if pen_buf is None:
             layer.image = img
         else:
@@ -4673,7 +4733,7 @@ class Canvas(QWidget):
             return int(self.eraser_size)
         if self.tool == Tool.BLUR:
             return int(self.blur_size)
-        return int(self.pen_size)
+        return int(self.pen_size) + self._spray_extent()
 
     def _commit_transform(self):
         layer = self._transform_layer or self.layer_stack.active

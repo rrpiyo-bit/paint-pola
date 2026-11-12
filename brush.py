@@ -97,31 +97,135 @@ class SoftBrush(BrushBase):
 
 # ── スプレー ──────────────────────────────────────────────────────────────────
 
+# スプレーの設定名 → (既定値, 最小, 最大)。形は SPRAY_SHAPES、吹き続けは bool。
+SPRAY_RANGES: dict[str, tuple[int, int, int]] = {
+    "density":       (40, 1, 300),  # 1回の吹き付けで出す粒の数
+    "particle_size": (3, 1, 60),    # 粒の大きさ（直径 px）
+    "size_jitter":   (60, 0, 100),  # 粒の大きさのばらつき (%)
+    "bias":          (0, 0, 100),   # 中心への寄せ具合 (%)。0 で円の中に均一
+    "opacity":       (25, 1, 100),  # 粒1つの濃さ（ペン色に対する %）
+}
+SPRAY_SHAPES = ("circle", "square", "star", "streak")
+SPRAY_SHAPE_LABELS = {"circle": "丸", "square": "四角", "star": "星", "streak": "細長い線"}
+SPRAY_DEFAULTS: dict = {k: v[0] for k, v in SPRAY_RANGES.items()}
+SPRAY_DEFAULTS.update({"shape": "circle", "continuous": True})
+
+
+def sanitize_spray(field: str, value):
+    """保存値や UI から来た値を、使える型と範囲に直す。使えなければ None。"""
+    if field in SPRAY_RANGES:
+        _, lo, hi = SPRAY_RANGES[field]
+        try:
+            return max(lo, min(hi, int(value)))
+        except (TypeError, ValueError):
+            return None
+    if field == "shape":
+        return value if value in SPRAY_SHAPES else None
+    if field == "continuous":
+        return value if isinstance(value, bool) else str(value).lower() == "true"
+    return None
+
+
+def _star_path(r: float):
+    from PyQt6.QtGui import QPainterPath
+    path = QPainterPath()
+    for i in range(10):
+        rr = r if i % 2 == 0 else r * 0.45
+        ang = -math.pi / 2 + i * math.pi / 5
+        pt = QPointF(rr * math.cos(ang), rr * math.sin(ang))
+        if i == 0:
+            path.moveTo(pt)
+        else:
+            path.lineTo(pt)
+    path.closeSubpath()
+    return path
+
+
 class SprayBrush(BrushBase):
-    """ランダム散布。サイズが大きいほど広がる。"""
+    """ランダム散布（クリスタのエアブラシ「スプレー」「飛沫」に相当）。
+
+    ブラシサイズの円の中に粒を散らす。粒の数・大きさ・大きさのばらつき・
+    中心への寄せ具合・粒の形・濃さは settings で変えられる。
+    """
 
     def __init__(self, density: int = 40):
-        self._density = density  # 1ストロークあたりの粒数
+        self.settings: dict = dict(SPRAY_DEFAULTS)
+        self.settings["density"] = density
 
-    def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
-                  color: QColor, size: int, antialias: bool = True) -> None:
-        pts = _lerp_points(a, b, max(1.0, size * 0.3))
+    def _particle(self, p: QPainter, x: float, y: float, r: float, shape: str):
+        if shape == "circle":
+            p.drawEllipse(QPointF(x, y), r, r)
+            return
+        p.save()
+        p.translate(x, y)
+        p.rotate(random.uniform(0, 360))
+        if shape == "square":
+            p.drawRect(QRectF(-r, -r, 2 * r, 2 * r))
+        elif shape == "star":
+            p.drawPath(_star_path(r * 1.4))
+        else:  # streak: 細長い線（飛沫の筋）
+            p.drawRect(QRectF(-r * 2.5, -r * 0.35, r * 5, r * 0.7))
+        p.restore()
+
+    def _offset(self, radius: float) -> tuple[float, float]:
+        """円の中の1点（中心からのずれ）。寄せるほど中心寄りの正規分布から選ぶ。"""
+        if random.random() < self.settings["bias"] / 100.0:
+            sigma = radius * 0.4
+            for _ in range(4):
+                dx, dy = random.gauss(0, sigma), random.gauss(0, sigma)
+                if dx * dx + dy * dy <= radius * radius:
+                    return dx, dy
+        # 円の中に均一（面積あたり同じ数）
+        angle = random.uniform(0, 2 * math.pi)
+        dist = radius * math.sqrt(random.random())
+        return dist * math.cos(angle), dist * math.sin(angle)
+
+    def spray_at(self, p: QPainter, pt: QPointF, size: float,
+                 to: QPointF | None = None, count: int | None = None) -> None:
+        """pt を中心に粒を吹き付ける。to を渡すと pt→to の線上に散らす。
+
+        線のときは粒ごとに中心を線上のどこかから選ぶ。決まった間隔の点を
+        中心にすると、中心に寄せたときに点ごとの濃い塊が数珠のように並ぶ。
+        """
+        st = self.settings
+        radius = size / 2.0
+        base_r = st["particle_size"] / 2.0
+        jit = st["size_jitter"] / 100.0
+        shape = st["shape"]
+        n = st["density"] if count is None else count
+        for _ in range(n):
+            if to is None:
+                cx, cy = pt.x(), pt.y()
+            else:
+                t = random.random()
+                cx = pt.x() + (to.x() - pt.x()) * t
+                cy = pt.y() + (to.y() - pt.y()) * t
+            dx, dy = self._offset(radius)
+            r = max(0.3, base_r * (1.0 - jit * random.random()))
+            self._particle(p, cx + dx, cy + dy, r, shape)
+
+    def _begin(self, img: QImage, color: QColor, antialias: bool) -> QPainter:
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, antialias)
         dot_color = QColor(color)
-        dot_color.setAlpha(max(30, color.alpha() // 4))
+        dot_color.setAlpha(max(1, int(color.alpha() * self.settings["opacity"] / 100.0)))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(dot_color))
-        radius = size / 2.0
-        for pt in pts:
-            for _ in range(self._density):
-                angle = random.uniform(0, 2 * math.pi)
-                # 円内一様分布
-                dist = radius * math.sqrt(random.random())
-                dx = dist * math.cos(angle)
-                dy = dist * math.sin(angle)
-                dot_r = random.uniform(0.5, max(1.5, size * 0.04))
-                p.drawEllipse(QPointF(pt.x() + dx, pt.y() + dy), dot_r, dot_r)
+        return p
+
+    def stamp(self, img: QImage, pt: QPoint, color: QColor, size: int,
+              antialias: bool = True) -> None:
+        p = self._begin(img, color, antialias)
+        self.spray_at(p, QPointF(pt), size)
+        p.end()
+
+    def stroke_to(self, img: QImage, a: QPoint, b: QPoint,
+                  color: QColor, size: int, antialias: bool = True) -> None:
+        # 粒の総数は以前と同じく「ブラシ幅の 3 割ごとに density 個」
+        n_steps = len(_lerp_points(a, b, max(1.0, size * 0.3)))
+        p = self._begin(img, color, antialias)
+        self.spray_at(p, QPointF(a), size, QPointF(b),
+                      self.settings["density"] * n_steps)
         p.end()
 
 

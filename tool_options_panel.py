@@ -121,6 +121,7 @@ class ToolOptionsPanel(QWidget):
     vector_smooth_toggled = pyqtSignal(bool)        # なめらか / 直線つなぎ
     vector_erase_mode_changed = pyqtSignal(str)     # "cut" | "whole"
     uni_flash_changed = pyqtSignal(str, object)     # ウニフラッシュの設定 (項目名, 値)
+    spray_changed = pyqtSignal(str, object)         # スプレーの設定 (項目名, 値)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -202,7 +203,8 @@ class ToolOptionsPanel(QWidget):
                  text_size: int = 40,
                  select_pen_size: int = 30,
                  select_pen_erase: bool = False,
-                 uni_flash: dict | None = None):
+                 uni_flash: dict | None = None,
+                 spray: dict | None = None):
         self._current_tool = tool
         self._clear()
 
@@ -253,6 +255,8 @@ class ToolOptionsPanel(QWidget):
             self._add_stabilization(stabilization)
             self._add_taper(taper)
             self._add_brush_combo(brush_key)
+            if brush_key == "spray":
+                self._build_spray(spray)
             self._add_toggle("対称定規", symmetry,
                              lambda v: self.symmetry_toggled.emit(v))
 
@@ -715,6 +719,43 @@ class ToolOptionsPanel(QWidget):
             "Shift+線の上をクリック＝点を追加\n"
             "ハンドル（○）をドラッグ＝曲がり具合\n"
             "　Alt を押しながらで片側だけ動く（角）")
+
+    def _build_spray(self, opts: dict | None):
+        """スプレーの粒の設定（クリスタのエアブラシ「スプレー」「飛沫」に相当）。"""
+        from brush import SPRAY_DEFAULTS, SPRAY_SHAPES, SPRAY_SHAPE_LABELS
+        o = dict(SPRAY_DEFAULTS)
+        o.update(opts or {})
+        emit = self.spray_changed.emit
+        self._add_separator()
+        self._add_spinbox("粒の数", o["density"], 1, 300,
+                          lambda v: emit("density", v), key="spray_density",
+                          tooltip="1回の吹き付けで出す粒の数。多いほど濃く埋まります。")
+        self._add_spinbox("粒の大きさ", o["particle_size"], 1, 60,
+                          lambda v: emit("particle_size", v), key="spray_particle_size",
+                          suffix=" px", tooltip="粒1つの直径。ブラシサイズ（吹き付ける円の大きさ）とは別です。")
+        self._add_spinbox("大きさのばらつき", o["size_jitter"], 0, 100,
+                          lambda v: emit("size_jitter", v), key="spray_size_jitter",
+                          suffix=" %",
+                          tooltip="0 % で全部同じ大きさ。上げると大小の粒が混ざり、\n"
+                                  "飛沫のようになります。")
+        self._add_spinbox("中心への寄せ", o["bias"], 0, 100,
+                          lambda v: emit("bias", v), key="spray_bias", suffix=" %",
+                          tooltip="0 % で円の中に均一に散らします。\n"
+                                  "上げるほど中心が濃く、ふちがまばらになります（スプレー缶風）。")
+        self._add_spinbox("粒の濃さ", o["opacity"], 1, 100,
+                          lambda v: emit("opacity", v), key="spray_opacity", suffix=" %",
+                          tooltip="粒1つの濃さ（ペンの色に対する割合）。")
+        cb = QComboBox()
+        for k in SPRAY_SHAPES:
+            cb.addItem(SPRAY_SHAPE_LABELS[k], k)
+        cb.setCurrentIndex(SPRAY_SHAPES.index(o["shape"]) if o["shape"] in SPRAY_SHAPES else 0)
+        cb.currentIndexChanged.connect(lambda i: emit("shape", cb.itemData(i)))
+        self._add_row("粒の形", cb)
+        self._add_toggle("止めていても吹き続ける", bool(o["continuous"]),
+                         lambda v: emit("continuous", bool(v)),
+                         tooltip="ペンを止めたまま押していると粒が出続け、\n"
+                                 "押している時間だけ濃くなります。")
+        self._add_separator()
 
     def _build_uni_flash(self, opts: dict | None):
         """ウニフラッシュの設定。どれも次に描くウニフラから効く。"""
