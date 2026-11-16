@@ -325,6 +325,31 @@ def panel():
 
 
 class TestPanel:
+    def test_button_row_does_not_force_width(self, panel):
+        """ボタンの列がパネルの最小幅にならないこと。最小幅になると
+        ウィンドウが画面より広がり、タイムラインのスクロールバーが画面外に出る。"""
+        assert panel.minimumSizeHint().width() < 400
+        panel.resize(600, 300)
+        panel.show()
+        QApplication.processEvents()
+        assert panel._top_scroll.horizontalScrollBar().maximum() > 0, \
+            "狭いときにボタンの列を横スクロールできない"
+        panel.close()
+
+    def test_scrolls_to_new_cel(self, panel):
+        """セルを足してコマが右へ延びても、今のコマが見える位置までスクロールする。"""
+        panel.resize(600, 300)
+        panel.show()
+        for _ in range(30):
+            panel._on_new_cel()
+        QApplication.processEvents()
+        bar = panel._scroll.horizontalScrollBar()
+        left = bar.value()
+        x = panel._view.frame_x(panel.stack.anim_frame)
+        vw = panel._scroll.viewport().width()
+        assert left > 0 and left < x < left + vw, "今のコマが見えていない"
+        panel.close()
+
     def test_new_folder_and_cel_buttons(self, panel):
         panel._on_new_cel()   # フォルダが無ければフォルダから作る
         folder = anim.anim_folders(panel.stack.layers)[0]

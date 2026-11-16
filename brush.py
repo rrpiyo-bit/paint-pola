@@ -278,7 +278,17 @@ class BlurBrush(BrushBase):
         # カーネルサイズを強度に連動（1〜size相当）
         k_radius = max(1, int(3 + (size // 2) * self.strength))
         k = k_radius * 2 + 1
-        blurred = cv2.GaussianBlur(region, (k, k), 0)
+        # 透明なピクセルの色（多くは黒 0,0,0）が平均に混ざると、絵のふちや
+        # 薄い所が黒く濁る。不透明度で重み付けして（乗算済みにして）ぼかし、
+        # あとで不透明度で割り戻す。
+        f = region.astype(np.float32)
+        f[:, :, :3] *= f[:, :, 3:4] / 255.0
+        f = cv2.GaussianBlur(f, (k, k), 0)
+        out_a = f[:, :, 3:4]
+        rgb = np.where(out_a > 0, f[:, :, :3] * 255.0 / np.maximum(out_a, 1e-6), 0)
+        blurred = np.empty_like(region)
+        blurred[:, :, :3] = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+        blurred[:, :, 3] = np.clip(out_a[:, :, 0] + 0.5, 0, 255).astype(np.uint8)
 
         rh, rw = region.shape[:2]
         ys, xs = np.mgrid[0:rh, 0:rw]

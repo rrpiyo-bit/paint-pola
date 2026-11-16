@@ -101,6 +101,43 @@ def _draw_item(target: QImage, item, off_x: int, off_y: int, skip=None) -> None:
     p.end()
 
 
+def _draw_clipped_group(target: QImage, base, clips, off_x: int, off_y: int,
+                        skip=None) -> None:
+    """下地 base とそのクリッピングレイヤー clips（下から順）をまとめて target へ。
+
+    下地の色を不透明にした上にクリッピングを重ね、最後に下地の不透明度で
+    切り抜く。線画のふちのような半透明の所でも、クリッピングの色が下地の
+    色を置き換える（下地の色が縁取りのように残らない）。
+    """
+    w, h = target.width(), target.height()
+    mask = _item_buffer(base, w, h, off_x, off_y, skip)
+    buf = mask.convertToFormat(QImage.Format.Format_ARGB32)
+    bits = buf.bits()
+    bits.setsize(buf.sizeInBytes())
+    px = np.frombuffer(bits, dtype=np.uint8).reshape(h, buf.bytesPerLine() // 4, 4)
+    px[:, :, 3] = 255
+    buf = buf.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    p = QPainter(buf)
+    for clip in clips:
+        blend = (None if clip.is_group else
+                 BLEND_KEY_TO_MODE.get(getattr(clip, 'blend_mode', 'normal')))
+        p.setCompositionMode(blend or QPainter.CompositionMode.CompositionMode_SourceOver)
+        p.setOpacity(clip.opacity / 255)
+        p.drawImage(0, 0, _item_buffer(clip, w, h, off_x, off_y, skip))
+    p.setOpacity(1.0)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+    p.drawImage(0, 0, mask)
+    p.end()
+    p = QPainter(target)
+    blend = (None if base.is_group else
+             BLEND_KEY_TO_MODE.get(getattr(base, 'blend_mode', 'normal')))
+    if blend:
+        p.setCompositionMode(blend)
+    p.setOpacity(base.opacity / 255)
+    p.drawImage(0, 0, buf)
+    p.end()
+
+
 def render_items(target: QImage, items, off_x: int = 0, off_y: int = 0,
                  skip=None) -> None:
     """レイヤー列（上が先頭）を target に合成する。合成処理の本体はここだけ。
@@ -126,9 +163,14 @@ def render_items(target: QImage, items, off_x: int = 0, off_y: int = 0,
             clips.append(items[j])
             j -= 1
         if base.visible:
+            shown = [c for c in clips if c.visible and c is not skip]
+            if shown and base is not skip and not (
+                    base.is_group and getattr(base, 'pass_through', False)):
+                _draw_clipped_group(target, base, shown, off_x, off_y, skip)
+                i = j
+                continue
             if base is not skip:
                 _draw_item(target, base, off_x, off_y, skip)
-            shown = [c for c in clips if c.visible and c is not skip]
             if shown:
                 mask = _item_buffer(base, w, h, off_x, off_y, skip)
                 for clip in shown:

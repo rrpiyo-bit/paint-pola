@@ -122,6 +122,30 @@ def _extract_black_mask(bgr: np.ndarray, darkness: int, chroma: int,
     return mask
 
 
+def _extract_soft_alpha(gray: np.ndarray, paper: int, ink: int,
+                        denoise: int) -> np.ndarray:
+    """グレースケールから、濃淡を残した線の不透明度（0〜255）を作る。
+
+    鉛筆の線は濃いところと薄いグレーのところが混ざっている。しきい値で
+    0/255 に分けると薄いグレーが真っ黒になるか消えるかのどちらかになり、
+    鉛筆らしさが失われる。暗さをそのまま不透明度にすれば、白い紙の上では
+    元のグレーと同じに見え、色塗りの上でも下の色が透けてなじむ。
+    paper より明るい所は紙（透明）、ink より暗い所は真っ黒（不透明）とし、
+    その間は直線でつなぐ。紙のざらつきは paper を下げると消える。
+    """
+    paper = int(paper)
+    ink = min(int(ink), paper - 1)
+    g = gray.astype(np.float32)
+    alpha = np.clip((paper - g) / float(paper - ink), 0.0, 1.0) * 255.0
+    alpha = (alpha + 0.5).astype(np.uint8)
+    if denoise > 0:
+        # 濃淡のまま開処理する（小さな点だけ消え、線の濃淡は保たれる）
+        ksize = int(denoise) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, kernel)
+    return alpha
+
+
 class LineExtractionDialog(QDialog):
     """線画抽出ダイアログ。
     色彩補正（彩度・コントラスト・明るさ）＋しきい値／適応的しきい値／黒だけによる
@@ -192,14 +216,17 @@ class LineExtractionDialog(QDialog):
         self._mode_fixed = QRadioButton("しきい値（イラスト・スキャン向け）")
         self._mode_adaptive = QRadioButton("自動（写真・照明ムラに強い）")
         self._mode_black = QRadioButton("黒だけ（カラー絵から黒い線を抜く）")
+        self._mode_soft = QRadioButton("濃淡を残す（鉛筆向け）")
         self._mode_fixed.setChecked(True)
         self._mode_group = QButtonGroup(self)
         self._mode_group.addButton(self._mode_fixed, 0)
         self._mode_group.addButton(self._mode_adaptive, 1)
         self._mode_group.addButton(self._mode_black, 2)
+        self._mode_group.addButton(self._mode_soft, 3)
         mode_layout.addWidget(self._mode_fixed)
         mode_layout.addWidget(self._mode_adaptive)
         mode_layout.addWidget(self._mode_black)
+        mode_layout.addWidget(self._mode_soft)
         root.addWidget(mode_box)
 
         # --- 色彩補正 ---
@@ -225,6 +252,10 @@ class LineExtractionDialog(QDialog):
         self._dark_row = ext_form.rowCount() - 1
         self._chroma = self._add_slider(ext_form, "色みの許容", 0, 255, 24, "")
         self._chroma_row = ext_form.rowCount() - 1
+        self._paper = self._add_slider(ext_form, "紙とみなす明るさ", 1, 255, 225, "")
+        self._paper_row = ext_form.rowCount() - 1
+        self._ink = self._add_slider(ext_form, "真っ黒とみなす濃さ", 0, 254, 90, "")
+        self._ink_row = ext_form.rowCount() - 1
         self._denoise = self._add_slider(ext_form, "ノイズ除去", 0, 6, 0, "px")
         self._ext_form = ext_form
         root.addWidget(ext_box)
@@ -280,14 +311,25 @@ class LineExtractionDialog(QDialog):
         """抽出方式に応じて関係のないスライダーを隠す。"""
         adaptive = self.adaptive()
         black = self.black_only()
-        self._set_row_visible(self._ext_form, self._thresh_row, not adaptive and not black)
+        soft = self.soft()
+        self._set_row_visible(self._ext_form, self._thresh_row,
+                              not adaptive and not black and not soft)
         self._set_row_visible(self._ext_form, self._sens_row, adaptive)
         self._set_row_visible(self._ext_form, self._block_row, adaptive)
         self._set_row_visible(self._ext_form, self._dark_row, black)
         self._set_row_visible(self._ext_form, self._chroma_row, black)
+        self._set_row_visible(self._ext_form, self._paper_row, soft)
+        self._set_row_visible(self._ext_form, self._ink_row, soft)
         # 黒だけ方式は元の色そのものを見るので、明るさをいじる下ごしらえは使わない
         self._corr_box.setVisible(not black)
-        if black:
+        if soft:
+            self._hint.setText(
+                "鉛筆の濃淡をそのまま残して抽出します。暗いところほど濃く、薄い"
+                "グレーは半透明の線になります。紙のざらつきや汚れが残るときは"
+                "「紙とみなす明るさ」を下げ、線全体が薄いときは「真っ黒とみなす"
+                "濃さ」を上げてください。影や明るさのムラがある写真・スキャンは"
+                "「紙のムラを除去」を先に上げると紙の白がそろいます。")
+        elif black:
             self._hint.setText(
                 "カラー絵の中の黒い部分だけを線として抽出します。暗くても色のついた"
                 "部分（濃い青の髪・赤い影など）は拾いません。「黒とみなす暗さ」を"
@@ -316,6 +358,9 @@ class LineExtractionDialog(QDialog):
     def black_only(self) -> bool:
         return self._mode_black.isChecked()
 
+    def soft(self) -> bool:
+        return self._mode_soft.isChecked()
+
     def threshold(self) -> int:
         return self._thresh.value()
 
@@ -327,11 +372,15 @@ class LineExtractionDialog(QDialog):
         return _flatten_paper(gray, int(round(self._flatten.value() * scale)))
 
     def _mask_for(self, bgr: np.ndarray, scale: float = 1.0) -> np.ndarray:
+        """線の不透明度（0〜255）。濃淡を残す方式以外は 0 か 255。"""
         denoise = int(round(self._denoise.value() * scale))
         if self.black_only():
             return _extract_black_mask(bgr, self._darkness.value(),
                                        self._chroma.value(), denoise)
         gray = self._gray_for(bgr, scale)
+        if self.soft():
+            return _extract_soft_alpha(gray, self._paper.value(),
+                                       self._ink.value(), denoise)
         block = max(3, int(round(self._block.value() * scale)))
         return _extract_line_mask(gray, self.adaptive(), self.threshold(),
                                   self._sensitivity.value(), block, denoise)
@@ -343,15 +392,16 @@ class LineExtractionDialog(QDialog):
         """キャンバスにかぶせる原寸の画像。プレビューを切っていれば None。"""
         if not self._preview_check.isChecked():
             return None
-        mask = self._mask_for(self._bgr) > 0
-        h, w = mask.shape
+        alpha = self._mask_for(self._bgr)
+        h, w = alpha.shape
         bgra = np.zeros((h, w, 4), dtype=np.uint8)
         if self._overlay_check.isChecked():
-            bgra[mask] = [*self.OVERLAY_COLOR, 255]
+            bgra[:, :, :3] = self.OVERLAY_COLOR
+            bgra[:, :, 3] = alpha
         else:
             # 線画だけを白い紙の上に（確定後に線画レイヤーだけを見たときと同じ見え方）
-            bgra[:] = [255, 255, 255, 255]
-            bgra[mask] = [0, 0, 0, 255]
+            bgra[:, :, :3] = (255 - alpha)[:, :, None]
+            bgra[:, :, 3] = 255
         return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
 
     def _emit_preview(self):
@@ -360,10 +410,10 @@ class LineExtractionDialog(QDialog):
 
     def extract(self) -> QImage:
         """フルサイズで線画を生成して返す。"""
-        mask = self._mask_for(self._bgr)
-        h, w = mask.shape
+        alpha = self._mask_for(self._bgr)
+        h, w = alpha.shape
         bgra = np.zeros((h, w, 4), dtype=np.uint8)
-        bgra[mask > 0] = [0, 0, 0, 255]
+        bgra[:, :, 3] = alpha  # 色は黒、濃さは不透明度で持つ
         return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
 
 
@@ -540,6 +590,41 @@ def _adjust_line_tone(arr: np.ndarray, brightness: int, contrast: int,
     return out
 
 
+def _sharpen_image(arr: np.ndarray, amount: int, radius: int, tighten: int,
+                   area_mask: np.ndarray | None = None) -> np.ndarray:
+    """BGRA 配列（乗算前）をくっきりさせる。新しい配列を返す（元は変更しない）。
+
+    拡大・変形でぼやけた線は、色がにじむだけでなく透明なレイヤーでは
+    ふちの不透明度がだらだらと薄く広がる。アンシャープマスク（元 +
+    (元 - ぼかし) × 強さ）を乗算済みの色と不透明度の両方にかけ、さらに
+    「ふちを締める」で半端な不透明度を 0 か 255 の側へ寄せる。
+    乗算済みでかけるのは、透明部分の黒がふちの色に混ざらないようにするため。
+    """
+    f = arr.astype(np.float32)
+    f[:, :, :3] *= f[:, :, 3:4] / 255.0
+    if amount > 0:
+        blur = cv2.GaussianBlur(f, (0, 0), max(0.5, float(radius)))
+        f += (f - blur) * (amount / 100.0)
+    alpha = np.clip(f[:, :, 3], 0.0, 255.0)
+    # 乗算済みの色は不透明度を超えられない
+    rgb = np.clip(f[:, :, :3], 0.0, alpha[:, :, None])
+    color = np.where(alpha[:, :, None] > 0,
+                     rgb * 255.0 / np.maximum(alpha[:, :, None], 1e-6), 0.0)
+    if tighten > 0:
+        k = 1.0 + tighten / 25.0  # 100 で傾き5倍
+        alpha = np.clip((alpha - 127.5) * k + 127.5, 0.0, 255.0)
+    out = np.empty_like(arr)
+    out[:, :, :3] = np.clip(color + 0.5, 0, 255).astype(np.uint8)
+    out[:, :, 3] = np.clip(alpha + 0.5, 0, 255).astype(np.uint8)
+    out[out[:, :, 3] == 0] = 0
+
+    if area_mask is not None:
+        # 選択範囲の外は元のまま
+        keep = ~area_mask.astype(bool)
+        out[keep] = arr[keep]
+    return out
+
+
 class ToneAdjustDialog(QDialog):
     """フィルター → 色調補正（線を濃く）: 選択レイヤーの線を濃く・くっきりさせる。
     キャンバス上でリアルタイムにプレビューし、OKで確定・キャンセルで元に戻す。"""
@@ -615,6 +700,55 @@ class ToneAdjustDialog(QDialog):
         self._layer.image = self._orig_image
         self._canvas.update()
         super().reject()
+
+
+class SharpenDialog(ToneAdjustDialog):
+    """フィルター → くっきり（シャープ）: 拡大・変形でぼやけた線をくっきりさせる。
+    プレビュー・キャンセルの仕組みは色調補正と同じ。"""
+
+    def __init__(self, canvas, layer, area_mask: np.ndarray | None, parent=None):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle("くっきり（シャープ）")
+        self.setMinimumWidth(380)
+        self._canvas = canvas
+        self._layer = layer
+        self._orig_image = layer.image.copy()
+        self._area_mask = area_mask
+
+        img = self._orig_image
+        w, h = img.width(), img.height()
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        self._orig_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        root.addLayout(form)
+        self._amount = self._add_slider(form, "強さ", 0, 300, 100, "%")
+        self._radius = self._add_slider(form, "半径", 1, 10, 2, "px")
+        self._tighten = self._add_slider(form, "ふちを締める", 0, 100, 50, "")
+
+        hint = QLabel(
+            "拡大・変形でぼやけた線をくっきりさせます。「強さ」と「半径」で"
+            "色の境目を際立たせ、「ふちを締める」で線のふちの薄くにじんだ所を"
+            "はっきりさせます。半径はぼやけた幅に合わせると効きやすいです。"
+            "選択範囲があればその中だけにかかります。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        root.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._update_preview()
+
+    def result_array(self) -> np.ndarray:
+        return _sharpen_image(self._orig_arr, self._amount.value(),
+                              self._radius.value(), self._tighten.value(),
+                              self._area_mask)
 
 
 class DespeckleDialog(QDialog):
@@ -1887,6 +2021,7 @@ class MainWindow(QMainWindow):
         self._add_action(filter_menu, "ぼかし (ガウス)...", self._filter_blur)
         self._add_action(filter_menu, "ゴミ取り...", self._filter_despeckle)
         self._add_action(filter_menu, "色調補正（線を濃く）...", self._filter_tone_adjust)
+        self._add_action(filter_menu, "くっきり（シャープ）...", self._filter_sharpen)
 
         view_menu = mb.addMenu("表示")
         zoom_menu = view_menu.addMenu("ズーム")
@@ -3305,6 +3440,26 @@ class MainWindow(QMainWindow):
 
         self.canvas._save_history()
         dlg = ToneAdjustDialog(self.canvas, layer, local_mask, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # キャンセル時は _save_history() で積んだ undo エントリを巻き戻す
+            if self.canvas._history and self.canvas._history[-1][0] == "pixel":
+                self.canvas._history.pop()
+            return
+        self.layer_panel.refresh()
+        self.canvas.update()
+        self.navigator.refresh()
+
+    def _filter_sharpen(self):
+        """フィルター → くっきり（シャープ）: 拡大・変形でぼやけた線をくっきりさせる。"""
+        layer = self._filter_target("くっきり（シャープ）")
+        if layer is None:
+            return
+
+        local_mask = _selection_mask_for_layer(
+            layer, self.canvas._selection_rect, self.canvas._lasso_mask)
+
+        self.canvas._save_history()
+        dlg = SharpenDialog(self.canvas, layer, local_mask, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             # キャンセル時は _save_history() で積んだ undo エントリを巻き戻す
             if self.canvas._history and self.canvas._history[-1][0] == "pixel":

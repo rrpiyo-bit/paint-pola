@@ -382,8 +382,8 @@ class AnimationPanel(QWidget):
         # コピーしたコマ: コマごとのセル（空きコマは None）
         self._clip: list | None = None
 
-        self.setFixedHeight(28 + _HEADER_H + 2 * _ROW_H + _BG_ROW_H + 24)
         self._build_ui()
+        self._fit_height()
 
     # ── UI ──
 
@@ -418,7 +418,12 @@ class AnimationPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 2, 4, 2)
         root.setSpacing(2)
-        top = QHBoxLayout()
+        # ボタンの列は横に長い。そのまま置くとパネルの最小幅になり、ウィンドウが
+        # 画面より広がってタイムラインの右端（縦スクロールバー）が画面外に出て
+        # いた。列だけ横スクロールできるようにして、パネルの幅を縛らない。
+        self._top_inner = QWidget()
+        top = QHBoxLayout(self._top_inner)
+        top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(3)
 
         self._folder_btn = self._btn(top, "🎞＋フォルダ",
@@ -480,7 +485,12 @@ class AnimationPanel(QWidget):
         top.addStretch()
         self._frame_label = QLabel()
         top.addWidget(self._frame_label)
-        root.addLayout(top)
+        self._top_scroll = QScrollArea()
+        self._top_scroll.setWidgetResizable(True)
+        self._top_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._top_scroll.setWidget(self._top_inner)
+        root.addWidget(self._top_scroll)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(False)
@@ -495,6 +505,20 @@ class AnimationPanel(QWidget):
         self._scroll.setWidget(self._view)
         root.addWidget(self._scroll, 1)
         self.sync()
+
+    def _fit_height(self) -> None:
+        """ボタンの列が入りきらないときだけ、その横スクロールバーのぶん高くする。"""
+        row_h = self._top_inner.sizeHint().height()
+        margins = self.layout().contentsMargins()
+        narrow = self._top_inner.sizeHint().width() > \
+            self.width() - margins.left() - margins.right()
+        bar_h = self._top_scroll.horizontalScrollBar().sizeHint().height() if narrow else 0
+        self._top_scroll.setFixedHeight(row_h + bar_h)
+        self.setFixedHeight(row_h + bar_h + _HEADER_H + 2 * _ROW_H + _BG_ROW_H + 24 + 6)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_height()
 
     @staticmethod
     def _sep_v() -> QFrame:
@@ -675,7 +699,19 @@ class AnimationPanel(QWidget):
 
     # ── 内部 ──
 
+    def _scroll_to_current(self) -> None:
+        """今のコマと選んでいるフォルダの行が見えるようにスクロールする
+        （セルを足してコマ数が延びたとき、画面の外で描くことにならないように）。"""
+        folders = anim.anim_folders(self.stack.layers)
+        folder = self.current_folder()
+        row = next((i for i, f in enumerate(folders) if f is folder), 0)
+        x = self._view.frame_x(self.stack.anim_frame) + _CELL_W // 2
+        y = _HEADER_H + row * _ROW_H + _ROW_H // 2
+        # 左端のトラック名の列がコマに重なって描かれるので、そのぶん余白を取る
+        self._scroll.ensureVisible(x, y, _NAME_W + _CELL_W, _ROW_H // 2 + _HEADER_H)
+
     def _after_frame_change(self) -> None:
+        self._scroll_to_current()
         self._view.update()
         self._update_label()
         self._update_preview()
@@ -690,6 +726,7 @@ class AnimationPanel(QWidget):
 
     def _changed(self) -> None:
         self.sync()
+        self._scroll_to_current()
         self.frames_changed.emit()
         self.frame_changed.emit()
         self.onion_skin_changed.emit()

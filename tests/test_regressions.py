@@ -1987,3 +1987,82 @@ class TestSprayOnCanvas:
             assert win.canvas._pen_brush().settings["density"] == 7
         finally:
             w2.close()
+
+
+class TestSharpen:
+    """フィルター → くっきり（シャープ）: 拡大・変形でぼやけた線をくっきりさせる。"""
+
+    def _blurry_line(self):
+        import numpy as np
+        import cv2
+        arr = np.zeros((60, 60, 4), dtype=np.uint8)
+        arr[:, 27:33] = (40, 80, 200, 255)  # BGRA: 赤っぽい縦線
+        f = arr.astype(np.float32)
+        f[:, :, :3] *= f[:, :, 3:4] / 255.0
+        f = cv2.GaussianBlur(f, (0, 0), 2.5)  # 拡大でにじんだ線（乗算済みでぼかす）
+        a = f[:, :, 3:4]
+        rgb = np.where(a > 0, f[:, :, :3] * 255 / np.maximum(a, 1e-6), 0)
+        out = np.zeros_like(arr)
+        out[:, :, :3] = np.clip(rgb + 0.5, 0, 255)
+        out[:, :, 3] = np.clip(a[:, :, 0] + 0.5, 0, 255)
+        return out
+
+    def test_edges_become_crisp_and_keep_color(self):
+        import numpy as np
+        from main import _sharpen_image
+        src = self._blurry_line()
+        out = _sharpen_image(src, 100, 2, 50)
+        half = lambda a: ((a[:, :, 3] > 20) & (a[:, :, 3] < 235)).sum()
+        assert half(out) < half(src) / 2, "ふちの半端な不透明度が減っていない"
+        assert out[30, 30, 3] == 255
+        vis = out[:, :, 3] > 30
+        # 透明の黒が混ざって線の色が黒ずまない
+        assert np.abs(out[vis][:, :3].astype(int) - (40, 80, 200)).max() <= 8
+        assert (out[:, :8, 3] == 0).all(), "離れた所に色がにじみ出ている"
+
+    def test_zero_settings_change_nothing(self):
+        import numpy as np
+        from main import _sharpen_image
+        src = self._blurry_line()
+        out = _sharpen_image(src, 0, 2, 0)
+        diff = np.abs(out.astype(int) - src.astype(int))
+        assert diff[src[:, :, 3] > 30].max() <= 2
+
+    def test_selection_limits_area(self):
+        import numpy as np
+        from main import _sharpen_image
+        src = self._blurry_line()
+        mask = np.zeros(src.shape[:2], dtype=bool)
+        mask[:30] = True
+        out = _sharpen_image(src, 100, 2, 50, mask)
+        assert (out[30:] == src[30:]).all()
+        assert (out[:30] != src[:30]).any()
+
+    def test_menu_dialog_preview_cancel_and_undo(self, win, monkeypatch):
+        from main import SharpenDialog
+        from PyQt6.QtWidgets import QDialog
+        acts = [a.text() for m in win.menuBar().actions() if m.text() == "フィルター"
+                for a in m.menu().actions()]
+        assert "くっきり（シャープ）..." in acts
+        layer = win.layer_stack.active
+        arr = self._blurry_line()
+        layer.image = QImage(arr.tobytes(), 60, 60, 240, QImage.Format.Format_ARGB32).copy()
+        before = layer.image.copy()
+
+        dlg = SharpenDialog(win.canvas, layer, None, win)
+        assert layer.image != before, "プレビューが効いていない"
+        dlg.reject()
+        assert layer.image == before, "キャンセルで戻っていない"
+
+        hist = len(win.canvas._history)
+        monkeypatch.setattr(SharpenDialog, "exec",
+                            lambda self: (self.reject(), QDialog.DialogCode.Rejected)[1])
+        win._filter_sharpen()
+        assert len(win.canvas._history) == hist and layer.image == before
+
+        monkeypatch.setattr(SharpenDialog, "exec",
+                            lambda self: QDialog.DialogCode.Accepted)
+        win._filter_sharpen()
+        assert win.layer_stack.active.image != before
+        win.canvas.undo()
+        assert win.layer_stack.active.image == before

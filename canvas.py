@@ -1993,11 +1993,15 @@ class Canvas(QWidget):
         out_w = max(bb_max_x - bb_min_x, 1)
         out_h = max(bb_max_y - bb_min_y, 1)
 
-        bits = img.bits()
-        bits.setsize(img.sizeInBytes())
-        arr = np.frombuffer(bits, dtype=np.uint8).reshape(sh, sw, 4).copy()
+        # 乗算済みで補間する（透明部分の黒がふちに混ざらないように）
+        pre = img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        bits = pre.constBits()
+        bits.setsize(pre.sizeInBytes())
+        arr = np.frombuffer(bits, dtype=np.uint8).reshape(
+            sh, pre.bytesPerLine() // 4, 4)[:, :sw]
 
         result_arr = np.zeros((out_h, out_w, 4), dtype=np.uint8)
+        pad = 2  # 補間で隣のセルの端の色も拾えるよう少し広く切り出す
 
         for row in range(n):
             for col in range(n):
@@ -2006,27 +2010,43 @@ class Canvas(QWidget):
                 sy0 = sh * row / n
                 sx1 = sw * (col + 1) / n
                 sy1 = sh * (row + 1) / n
-                src_pts = np.float32([[sx0, sy0], [sx1, sy0], [sx1, sy1], [sx0, sy1]])
+                cx0 = max(0, int(math.floor(sx0)) - pad)
+                cy0 = max(0, int(math.floor(sy0)) - pad)
+                cx1 = min(sw, int(math.ceil(sx1)) + pad)
+                cy1 = min(sh, int(math.ceil(sy1)) + pad)
+                src_pts = np.float32([[sx0 - cx0, sy0 - cy0], [sx1 - cx0, sy0 - cy0],
+                                      [sx1 - cx0, sy1 - cy0], [sx0 - cx0, sy1 - cy0]])
 
                 # デスト四角形（メッシュ格子点）
-                dst_pts = np.float32([
-                    [grid[row][col].x() - bb_min_x, grid[row][col].y() - bb_min_y],
-                    [grid[row][col+1].x() - bb_min_x, grid[row][col+1].y() - bb_min_y],
-                    [grid[row+1][col+1].x() - bb_min_x, grid[row+1][col+1].y() - bb_min_y],
-                    [grid[row+1][col].x() - bb_min_x, grid[row+1][col].y() - bb_min_y],
-                ])
+                quad = [grid[row][col], grid[row][col + 1],
+                        grid[row + 1][col + 1], grid[row + 1][col]]
+                dst_pts = np.float32([[q.x() - bb_min_x, q.y() - bb_min_y] for q in quad])
+                dx0 = max(0, int(math.floor(dst_pts[:, 0].min())))
+                dy0 = max(0, int(math.floor(dst_pts[:, 1].min())))
+                dx1 = min(out_w, int(math.ceil(dst_pts[:, 0].max())) + 1)
+                dy1 = min(out_h, int(math.ceil(dst_pts[:, 1].max())) + 1)
+                if dx1 <= dx0 or dy1 <= dy0:
+                    continue
+                local = dst_pts - np.float32([dx0, dy0])
 
-                M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-                cell = cv2.warpPerspective(arr, M, (out_w, out_h),
+                M = cv2.getPerspectiveTransform(src_pts, local)
+                cell = cv2.warpPerspective(arr[cy0:cy1, cx0:cx1], M, (dx1 - dx0, dy1 - dy0),
                                            flags=cv2.INTER_LINEAR,
                                            borderMode=cv2.BORDER_CONSTANT,
                                            borderValue=(0, 0, 0, 0))
-                # アルファ合成（後のセルが上書き）
-                alpha = cell[:, :, 3:4].astype(np.float32) / 255.0
-                result_arr = (result_arr.astype(np.float32) * (1 - alpha) + cell.astype(np.float32) * alpha).astype(np.uint8)
+                # このセルの四角形の中だけを使う。射影変換は四角形の外にも
+                # 画像全体を写すので、そのまま重ねると絵の分身が出る。
+                mask = np.zeros((dy1 - dy0, dx1 - dx0), dtype=np.uint8)
+                cv2.fillConvexPoly(mask, np.round(local).astype(np.int32), 1)
+                if not mask.any():
+                    continue
+                dst = result_arr[dy0:dy1, dx0:dx1]
+                sel = mask.astype(bool)
+                dst[sel] = cell[sel]
 
         result_img = QImage(result_arr.data, out_w, out_h, result_arr.strides[0],
-                            QImage.Format.Format_ARGB32).copy()
+                            QImage.Format.Format_ARGB32_Premultiplied).convertToFormat(
+                                QImage.Format.Format_ARGB32)
         return result_img, bb_min_x, bb_min_y
 
     def _paint_stroke_layers(self, p: QPainter) -> bool:

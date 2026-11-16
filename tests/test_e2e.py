@@ -4059,3 +4059,69 @@ class TestColorWheel:
         _click(wheel, x, y)
         got = w.canvas.pen_color.hue()
         assert min(abs(got - 120), 360 - abs(got - 120)) <= 3
+
+
+class TestLineExtractSoftPencil:
+    """線画抽出の「濃淡を残す（鉛筆向け）」: 鉛筆のグレーを半透明の黒として残す。"""
+
+    def _pencil(self):
+        """紙（少しざらつく白）に、濃い線と薄いグレーの線を引いた絵。"""
+        import numpy as np
+        import cv2
+        from PyQt6.QtGui import QImage
+        rng = np.random.default_rng(0)
+        g = np.full((80, 120), 245, np.float32) + rng.normal(0, 4, (80, 120))
+        g[:, 30:34] = 60    # 濃い線
+        g[:, 80:84] = 170   # 薄いグレーの線
+        g = cv2.GaussianBlur(g, (0, 0), 0.8)
+        g = np.clip(g, 0, 255).astype(np.uint8)
+        bgra = np.dstack([g, g, g, np.full_like(g, 255)])
+        return QImage(bgra.tobytes(), 120, 80, 480, QImage.Format.Format_ARGB32).copy()
+
+    def _alpha(self, img):
+        import numpy as np
+        b = img.constBits()
+        b.setsize(img.sizeInBytes())
+        return np.frombuffer(b, np.uint8).reshape(img.height(), img.width(), 4)[:, :, 3].copy()
+
+    def test_keeps_gray_as_partial_alpha(self):
+        import numpy as np
+        from main import LineExtractionDialog
+        dlg = LineExtractionDialog(self._pencil())
+        dlg._mode_soft.setChecked(True)
+        out = dlg.extract()
+        a = self._alpha(out)
+        assert a[40, 32] == 255, "濃い線が不透明になっていない"
+        assert 60 < a[40, 82] < 200, "薄いグレーが半透明で残っていない"
+        assert a[:, 5:20].max() == 0, "紙のざらつきが残っている"
+        # 線の色は黒
+        b = out.constBits(); b.setsize(out.sizeInBytes())
+        rgb = np.frombuffer(b, np.uint8).reshape(80, 120, 4)[:, :, :3]
+        assert rgb.max() == 0
+
+    def test_sliders_and_preview(self):
+        import numpy as np
+        from main import LineExtractionDialog
+        dlg = LineExtractionDialog(self._pencil())
+        dlg._mode_soft.setChecked(True)
+        assert dlg._paper.isVisibleTo(dlg) and dlg._ink.isVisibleTo(dlg)
+        assert not dlg._thresh.isVisibleTo(dlg)
+        base = dlg._mask_for(dlg._bgr)[40, 82]
+        dlg._ink.setValue(160)  # 真っ黒の範囲を広げると薄い線も濃くなる
+        assert dlg._mask_for(dlg._bgr)[40, 82] > base
+        dlg._paper.setValue(160)  # 紙の範囲を広げると薄い線は消える
+        assert dlg._mask_for(dlg._bgr)[40, 82] == 0
+        dlg._paper.setValue(225); dlg._ink.setValue(90)
+        # 白い紙の上のプレビューは元の鉛筆と同じくらいのグレーに見える
+        pv = dlg.preview_image()
+        b = pv.constBits(); b.setsize(pv.sizeInBytes())
+        px = np.frombuffer(b, np.uint8).reshape(80, 120, 4)
+        assert px[40, 32, 0] == 0 and px[40, 5, 0] == 255
+        assert 90 < px[40, 82, 0] < 220
+
+    def test_other_modes_stay_binary(self):
+        import numpy as np
+        from main import LineExtractionDialog
+        dlg = LineExtractionDialog(self._pencil())
+        a = self._alpha(dlg.extract())
+        assert set(np.unique(a).tolist()) <= {0, 255}
