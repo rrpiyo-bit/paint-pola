@@ -625,6 +625,48 @@ def _sharpen_image(arr: np.ndarray, amount: int, radius: int, tighten: int,
     return out
 
 
+def _change_stroke_width(arr: np.ndarray, amount: int,
+                         area_mask: np.ndarray | None = None) -> np.ndarray:
+    """BGRA 配列（乗算前）に描かれたものの幅を変える。新しい配列を返す。
+
+    amount はふち1辺あたりの px。負で細く、正で太くする（線の幅は 2×amount
+    変わる）。不透明度に最小値／最大値フィルターをかけるので、ふちの
+    アンチエイリアスの段階はそのまま保たれる。太らせて新しく塗られた所には、
+    いちばん近い線の色を使う（透明部分の RGB は意味が無く、黒になりがち）。
+    """
+    out = arr.copy()
+    r = abs(int(amount))
+    if r > 0:
+        ksize = r * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        alpha = arr[:, :, 3]
+        if amount < 0:
+            out[:, :, 3] = cv2.erode(alpha, kernel)
+        else:
+            grown = cv2.dilate(alpha, kernel)
+            added = (alpha == 0) & (grown > 0)
+            ink = alpha >= 128
+            if not ink.any():
+                ink = alpha > 0
+            if added.any() and ink.any():
+                # 線の画素からの距離を測り、いちばん近い線の画素の色をもらう
+                src = np.where(ink, 0, 255).astype(np.uint8)
+                _, labels = cv2.distanceTransformWithLabels(
+                    src, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+                lut = np.zeros(labels.max() + 1, dtype=np.int64)
+                lut[labels[ink]] = np.flatnonzero(ink)
+                nearest = lut[labels[added]]
+                out[:, :, :3][added] = arr[:, :, :3].reshape(-1, 3)[nearest]
+            out[:, :, 3] = grown
+        out[out[:, :, 3] == 0] = 0
+
+    if area_mask is not None:
+        # 選択範囲の外は元のまま
+        keep = ~area_mask.astype(bool)
+        out[keep] = arr[keep]
+    return out
+
+
 class ToneAdjustDialog(QDialog):
     """フィルター → 色調補正（線を濃く）: 選択レイヤーの線を濃く・くっきりさせる。
     キャンバス上でリアルタイムにプレビューし、OKで確定・キャンセルで元に戻す。"""
@@ -749,6 +791,52 @@ class SharpenDialog(ToneAdjustDialog):
         return _sharpen_image(self._orig_arr, self._amount.value(),
                               self._radius.value(), self._tighten.value(),
                               self._area_mask)
+
+
+class StrokeWidthDialog(ToneAdjustDialog):
+    """フィルター → 線の太さを変える: 選択レイヤーに描かれたものを細く・太くする。
+    プレビュー・キャンセルの仕組みは色調補正と同じ。"""
+
+    def __init__(self, canvas, layer, area_mask: np.ndarray | None, parent=None):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle("線の太さを変える")
+        self.setMinimumWidth(380)
+        self._canvas = canvas
+        self._layer = layer
+        self._orig_image = layer.image.copy()
+        self._area_mask = area_mask
+
+        img = self._orig_image
+        w, h = img.width(), img.height()
+        ptr = img.bits()
+        ptr.setsize(img.sizeInBytes())
+        self._orig_arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        root.addLayout(form)
+        self._amount = self._add_slider(form, "太さ（ふち1辺）", -10, 10, -1, "px")
+
+        hint = QLabel(
+            "マイナスで細く、プラスで太くします。ふちの両側が変わるので、"
+            "-1 で線の幅はおよそ2px細くなります。細い線は細くしすぎると消えます。"
+            "太くした所は近くの線の色で塗ります。"
+            "選択範囲があればその中だけにかかります。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        root.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._update_preview()
+
+    def result_array(self) -> np.ndarray:
+        return _change_stroke_width(self._orig_arr, self._amount.value(),
+                                    self._area_mask)
 
 
 class DespeckleDialog(QDialog):
@@ -2022,6 +2110,7 @@ class MainWindow(QMainWindow):
         self._add_action(filter_menu, "ゴミ取り...", self._filter_despeckle)
         self._add_action(filter_menu, "色調補正（線を濃く）...", self._filter_tone_adjust)
         self._add_action(filter_menu, "くっきり（シャープ）...", self._filter_sharpen)
+        self._add_action(filter_menu, "線の太さを変える...", self._filter_stroke_width)
 
         view_menu = mb.addMenu("表示")
         zoom_menu = view_menu.addMenu("ズーム")
@@ -3460,6 +3549,26 @@ class MainWindow(QMainWindow):
 
         self.canvas._save_history()
         dlg = SharpenDialog(self.canvas, layer, local_mask, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            # キャンセル時は _save_history() で積んだ undo エントリを巻き戻す
+            if self.canvas._history and self.canvas._history[-1][0] == "pixel":
+                self.canvas._history.pop()
+            return
+        self.layer_panel.refresh()
+        self.canvas.update()
+        self.navigator.refresh()
+
+    def _filter_stroke_width(self):
+        """フィルター → 線の太さを変える: 選択レイヤーに描かれたものを細く・太くする。"""
+        layer = self._filter_target("線の太さを変える")
+        if layer is None:
+            return
+
+        local_mask = _selection_mask_for_layer(
+            layer, self.canvas._selection_rect, self.canvas._lasso_mask)
+
+        self.canvas._save_history()
+        dlg = StrokeWidthDialog(self.canvas, layer, local_mask, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             # キャンセル時は _save_history() で積んだ undo エントリを巻き戻す
             if self.canvas._history and self.canvas._history[-1][0] == "pixel":

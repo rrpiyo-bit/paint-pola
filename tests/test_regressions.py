@@ -2066,3 +2066,83 @@ class TestSharpen:
         assert win.layer_stack.active.image != before
         win.canvas.undo()
         assert win.layer_stack.active.image == before
+
+
+class TestStrokeWidth:
+    """フィルター → 線の太さを変える: 描かれたものを細く・太くする。"""
+
+    def _lines(self):
+        import numpy as np
+        import cv2
+        arr = np.zeros((60, 80, 4), dtype=np.uint8)
+        arr[5:55, 8:13] = (0, 0, 0, 255)        # 黒い縦線（幅5）
+        arr[5:55, 38:43] = (200, 60, 20, 255)   # 青い縦線（幅5）
+        return arr
+
+    def _width(self, arr, x0, x1, y=30):
+        return int((arr[y, x0:x1, 3] > 127).sum())
+
+    def test_thin_and_thicken(self):
+        from main import _change_stroke_width
+        src = self._lines()
+        assert self._width(src, 0, 25) == 5
+        thin = _change_stroke_width(src, -1)
+        assert self._width(thin, 0, 25) == 3
+        thick = _change_stroke_width(src, 2)
+        assert self._width(thick, 0, 25) == 9
+        assert _change_stroke_width(src, 0).tolist() == src.tolist()
+
+    def test_thickened_edge_uses_nearby_line_color(self):
+        import numpy as np
+        from main import _change_stroke_width
+        out = _change_stroke_width(self._lines(), 3)
+        vis = out[:, :, 3] > 0
+        left, right = vis.copy(), vis.copy()
+        left[:, 25:] = False
+        right[:, :25] = False
+        assert (out[left][:, :3] == 0).all(), "黒い線の太らせた所が黒でない"
+        assert (out[right][:, :3] == (200, 60, 20)).all(), "青い線の色が混ざった・黒くなった"
+
+    def test_antialiased_edges_and_selection(self):
+        import numpy as np
+        import cv2
+        from main import _change_stroke_width
+        arr = np.zeros((60, 60, 4), dtype=np.uint8)
+        cv2.circle(arr, (30, 30), 15, (0, 0, 0, 255), 3, cv2.LINE_AA)
+        thin = _change_stroke_width(arr, -1)
+        half = (thin[:, :, 3] > 0) & (thin[:, :, 3] < 255)
+        assert half.any(), "ふちのアンチエイリアスが消えた"
+        mask = np.zeros((60, 60), dtype=bool)
+        mask[:30] = True
+        part = _change_stroke_width(arr, -1, mask)
+        assert (part[30:] == arr[30:]).all()
+        assert (part[:30] != arr[:30]).any()
+
+    def test_menu_dialog_preview_cancel_and_undo(self, win, monkeypatch):
+        from main import StrokeWidthDialog
+        from PyQt6.QtWidgets import QDialog
+        acts = [a.text() for m in win.menuBar().actions() if m.text() == "フィルター"
+                for a in m.menu().actions()]
+        assert "線の太さを変える..." in acts
+        layer = win.layer_stack.active
+        arr = self._lines()
+        layer.image = QImage(arr.tobytes(), 80, 60, 320, QImage.Format.Format_ARGB32).copy()
+        before = layer.image.copy()
+
+        dlg = StrokeWidthDialog(win.canvas, layer, None, win)
+        assert layer.image != before, "プレビューが効いていない"
+        dlg.reject()
+        assert layer.image == before, "キャンセルで戻っていない"
+
+        hist = len(win.canvas._history)
+        monkeypatch.setattr(StrokeWidthDialog, "exec",
+                            lambda self: (self.reject(), QDialog.DialogCode.Rejected)[1])
+        win._filter_stroke_width()
+        assert len(win.canvas._history) == hist and layer.image == before
+
+        monkeypatch.setattr(StrokeWidthDialog, "exec",
+                            lambda self: QDialog.DialogCode.Accepted)
+        win._filter_stroke_width()
+        assert win.layer_stack.active.image != before
+        win.canvas.undo()
+        assert win.layer_stack.active.image == before
