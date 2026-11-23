@@ -5,6 +5,7 @@ import cv2
 from PyQt6.QtGui import QImage, QPainter, QColor
 from PyQt6.QtCore import Qt
 
+DEFAULT_DPI = 300
 CANVAS_W = 2500
 CANVAS_H = 2500
 
@@ -511,6 +512,9 @@ class LayerStack:
         self.active_path: list[int] = [0]
         self.width = w
         self.height = h
+        # 解像度（1インチあたりの画素数）。印刷サイズの計算と、書き出す画像に
+        # 埋め込む値に使う。画素そのものには影響しない。
+        self.dpi = DEFAULT_DPI
         # アニメーションの再生時間（コマ数）と今のコマ（anim.py）
         self.anim_length = 8
         self.anim_frame = 0

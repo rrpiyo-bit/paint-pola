@@ -1272,15 +1272,71 @@ class Canvas(QWidget):
 
         return sum(_snap_bytes(s) for s in entry[1].get("layers", []))
 
+    @staticmethod
+    def _entry_images(entry):
+        """履歴エントリ1件が抱えている画像（共有の見分けに使う）。"""
+        kind = entry[0]
+        if kind == "pixel":
+            yield entry[2]
+        elif kind == "patch":
+            yield entry[3]
+        elif kind == "selection":
+            if entry[2] is not None:
+                yield entry[2]
+        elif kind == "structure":
+            def _walk(snap):
+                if snap.get("type") == "group":
+                    for ch in snap.get("children", []):
+                        yield from _walk(ch)
+                elif hasattr(snap.get("image"), "sizeInBytes"):
+                    yield snap["image"]
+            for s in entry[1].get("layers", []):
+                yield from _walk(s)
+
+    def _live_image_keys(self) -> set:
+        """今のレイヤーが使っている画像。履歴がこれと共有していても余分なメモリは食わない。"""
+        keys = set()
+
+        def _walk(items):
+            for l in items:
+                if l.is_group:
+                    _walk(l.children)
+                elif getattr(l, "image", None) is not None:
+                    keys.add(l.image.cacheKey())
+        _walk(self.layer_stack.layers)
+        return keys
+
+    def _history_bytes(self, entries, live: set) -> int:
+        """履歴が実際に使っているメモリ量のおおよそ。
+
+        構造の控えは変わっていないレイヤーの画像を今のレイヤーや他の控えと
+        共有しているので、同じ画像は1回だけ、今のレイヤーと共有中のものは
+        数えない。画像以外（線など）は _entry_bytes の見積もりを足す。
+        """
+        seen = set(live)
+        total = 0
+        for e in entries:
+            if e[0] == "vector":
+                total += self._entry_bytes(e)
+                continue
+            for img in self._entry_images(e):
+                k = img.cacheKey()
+                if k in seen:
+                    continue
+                seen.add(k)
+                total += img.sizeInBytes()
+        return total
+
     def _trim_history(self):
         """履歴を件数と総メモリ量の両方で打ち切る。
         件数だけで見ていると大きなキャンバスでは 50 件で 1GB を超え、
         メモリ不足でアプリごと落ちるため、バイト数でも制限する。"""
         while len(self._history) > HISTORY_LIMIT:
             self._history.pop(0)
-        total = sum(self._entry_bytes(e) for e in self._history)
-        while len(self._history) > HISTORY_MIN_ENTRIES and total > HISTORY_MEMORY_LIMIT:
-            total -= self._entry_bytes(self._history.pop(0))
+        live = self._live_image_keys()
+        while (len(self._history) > HISTORY_MIN_ENTRIES
+               and self._history_bytes(self._history, live) > HISTORY_MEMORY_LIMIT):
+            self._history.pop(0)
 
     def _compact_history_top(self):
         """末尾の "pixel" 履歴を、変わった範囲だけの "patch" に縮める。
@@ -1349,7 +1405,11 @@ class Canvas(QWidget):
             "opacity": lyr.opacity, "clipping": lyr.clipping,
             "reference": lyr.reference, "locked": lyr.locked,
             "alpha_locked": getattr(lyr, "alpha_locked", False),
-            "image": lyr.image.copy(),
+            # 中身は複製せず共有する（QImage は書き込まれた側だけが自動で別の
+            # メモリになる）。丸ごと複製すると、表示の切り替えなど1回ごとに
+            # 全レイヤーぶん（A4 で1枚 35MB）を食い、すぐ履歴の上限に達して
+            # 数回前までしか戻れなくなっていた。
+            "image": QImage(lyr.image),
             "blend_mode": lyr.blend_mode,
             "offset_x": lyr.offset_x, "offset_y": lyr.offset_y,
             "border_enabled": lyr.border_enabled, "border_size": lyr.border_size,
@@ -1389,7 +1449,8 @@ class Canvas(QWidget):
             lyr.mark_dirty()
         else:
             lyr = Layer(snap["name"], snap["image"].width(), snap["image"].height())
-            lyr.image = snap["image"].copy()
+            # 共有で十分（描いた時点でレイヤー側だけ別のメモリになる）
+            lyr.image = QImage(snap["image"])
         for k in ("visible", "opacity", "clipping", "reference", "locked", "blend_mode",
                   "offset_x", "offset_y",
                   "border_enabled", "border_size", "border_color",
@@ -1414,6 +1475,7 @@ class Canvas(QWidget):
             # キャンバスサイズも一緒に控える。サイズ変更を元に戻したとき、
             # 画像だけ旧サイズに戻ってキャンバスと食い違うのを防ぐ。
             "canvas_size": (ls.width, ls.height),
+            "dpi": getattr(ls, "dpi", None),
             "anim": (ls.anim_length, ls.anim_frame),
         }
 
@@ -1516,6 +1578,8 @@ class Canvas(QWidget):
 
     def _apply_structure_snapshot(self, snap: dict):
         ls = self.layer_stack
+        if snap.get("dpi"):
+            ls.dpi = int(snap["dpi"])
         size = snap.get("canvas_size")
         if size and (ls.width, ls.height) != tuple(size):
             ls.width, ls.height = int(size[0]), int(size[1])
@@ -1644,12 +1708,9 @@ class Canvas(QWidget):
                 layer.offset_y = old_oy  # type: ignore
             elif entry[0] == "structure":
                 _, snap = entry
-                dst.append(("structure", {
-                    "layers": [self._snapshot_layer(l) for l in self.layer_stack.layers],
-                    "active_path": list(self.layer_stack.active_path),
-                    "canvas_size": (self.layer_stack.width, self.layer_stack.height),
-                    "anim": (self.layer_stack.anim_length, self.layer_stack.anim_frame),
-                }))
+                # 控えを取る処理は1か所にまとめる。ここだけ別に書いていたせいで
+                # 解像度が抜け、やり直しで dpi が戻らなかった。
+                dst.append(("structure", self.structure_snapshot()))
                 self._apply_structure_snapshot(snap)
                 # 作り直したレイヤーには選択中のベクター線は無い
                 if self._vector_selected is not None:

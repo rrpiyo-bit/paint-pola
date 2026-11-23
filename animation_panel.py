@@ -1006,11 +1006,17 @@ class AnimationPanel(QWidget):
     def _on_export_gif(self):
         if not self._check_exportable("GIF書き出し"):
             return
-        path, _ = QFileDialog.getSaveFileName(self, "GIF書き出し", "", "GIF (*.gif)")
+        # 本体ウィンドウの「前回保存したフォルダ・今のファイル名」を使う
+        win = self.window()
+        start = (win._default_save_path(".gif")
+                 if hasattr(win, "_default_save_path") else "")
+        path, _ = QFileDialog.getSaveFileName(self, "GIF書き出し", start, "GIF (*.gif)")
         if not path:
             return
         if not path.lower().endswith(".gif"):
             path += ".gif"
+        if hasattr(win, "_remember_dir"):
+            win._remember_dir(win._SAVE_DIR_KEY, path)
         self._export_gif_to(path)
 
     def _export_gif_to(self, path: str) -> bool:

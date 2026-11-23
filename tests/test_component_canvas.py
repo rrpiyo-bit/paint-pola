@@ -665,6 +665,77 @@ class TestHistoryMemoryLimit:
         assert len(c._history) == before
 
 
+class TestStructureHistorySharing:
+    """レイヤーの表示切り替えなどの控えが全レイヤーを丸ごと複製していて、
+    大きなキャンバスでは数回前までしか戻れなくなっていた不具合の再発防止。"""
+
+    def _a4(self, layers=8):
+        import canvas as canvas_mod
+        ls = LayerStack(2480, 3508)
+        for i in range(layers):
+            ls.add(f"L{i}")
+        c = canvas_mod.Canvas(ls)
+        return ls, c
+
+    def _stroke(self, ls, c, i):
+        c._save_history()
+        p = QPainter(ls.active.image)
+        p.fillRect(i * 10, i * 10, 30, 30, QColor(255, 0, 0))
+        p.end()
+
+    def test_layer_operations_do_not_eat_undo_depth(self):
+        ls, c = self._a4()
+        n = 0
+        for i in range(40):
+            if i % 5 == 4:
+                c.save_property_history(("visible", i))
+            else:
+                self._stroke(ls, c, i)
+            n += 1
+        assert len(c._history) == n, f"{n} 回操作して {len(c._history)} 回しか戻れない"
+
+    def test_snapshot_survives_later_painting(self):
+        ls, c = self._a4(layers=2)
+        layer = ls.active
+        layer.image.fill(QColor(0, 0, 0, 0))
+        layer.image.setPixelColor(5, 5, QColor(0, 0, 255))
+        c.save_structure_history()
+        # 控えた後に描き足しても、控えの中身は変わらない
+        layer.image.setPixelColor(5, 5, QColor(255, 0, 0))
+        layer.image.setPixelColor(6, 6, QColor(255, 0, 0))
+        c.undo()
+        restored = ls.active.image
+        assert restored.pixelColor(5, 5) == QColor(0, 0, 255)
+        assert restored.pixelColor(6, 6).alpha() == 0
+        c.redo()
+        assert ls.active.image.pixelColor(5, 5) == QColor(255, 0, 0)
+        assert ls.active.image.pixelColor(6, 6) == QColor(255, 0, 0)
+
+    def test_restored_layer_does_not_write_back_into_history(self):
+        ls, c = self._a4(layers=1)
+        ls.active.image.fill(QColor(0, 0, 0, 0))
+        c.save_structure_history()
+        ls.active.image.setPixelColor(1, 1, QColor(0, 255, 0))
+        c.undo()
+        # 戻したレイヤーに描いても、やり直し用の控えは汚れない
+        ls.active.image.setPixelColor(2, 2, QColor(0, 0, 255))
+        c.redo()
+        assert ls.active.image.pixelColor(1, 1) == QColor(0, 255, 0)
+        assert ls.active.image.pixelColor(2, 2).alpha() == 0
+
+    def test_memory_still_capped(self):
+        """控えが本当に別の絵を抱えている分はちゃんと数えて上限で止める。"""
+        import canvas as canvas_mod
+        ls, c = self._a4(layers=1)
+        for i in range(60):
+            c.save_structure_history()
+            ls.active.image.fill(QColor(i, 0, 0))  # 毎回全面が変わる
+        used = c._history_bytes(c._history, c._live_image_keys())
+        # 打ち切りは積んだ時点で判定するので、その後に描いた1枚分だけはみ出しうる
+        assert used <= canvas_mod.HISTORY_MEMORY_LIMIT + ls.active.image.sizeInBytes()
+        assert len(c._history) < 60
+
+
 class TestLassoFillShapes:
     """囲って塗る（LASSO_FILL）が様々な形・大きさの投げなわで落ちないこと。
     極小・自己交差・キャンバス外・負座標など異常な入力でも例外を投げない。"""

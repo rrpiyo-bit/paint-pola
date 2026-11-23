@@ -14,12 +14,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QFileDialog,
                               QDialog, QDialogButtonBox, QSlider, QFormLayout,
                               QSpinBox, QRadioButton, QButtonGroup, QGroupBox,
                               QVBoxLayout, QSplitter, QPushButton, QCheckBox,
-                              QSizePolicy)
+                              QSizePolicy, QComboBox)
 from PyQt6.QtCore import Qt, QSize, QRect, QPoint,QByteArray, QBuffer, QIODevice, QPropertyAnimation, QEasingCurve, QRectF, QEvent, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import (QAction, QImage, QPixmap, QKeySequence, QColor,
                           QFont, QPainter, QIcon, QImageReader)
 
-from layer import LayerStack, Layer, GroupLayer, CANVAS_W, CANVAS_H, render_items
+from layer import (LayerStack, Layer, GroupLayer, CANVAS_W, CANVAS_H, render_items,
+                   DEFAULT_DPI)
 from vector import VectorLayer
 from animation_panel import AnimationPanel
 import anim
@@ -913,43 +914,93 @@ class DespeckleDialog(QDialog):
         super().reject()
 
 
-class NewCanvasDialog(QDialog):
-    PRESETS = [
-        ("正方形 2500px",  2500, 2500),
-        ("A4 縦 300dpi", 2480, 3508),
-        ("A4 横 300dpi", 3508, 2480),
-        ("A5 縦 300dpi", 1748, 2480),
-        ("正方形 2000px",  2000, 2000),
-        ("カスタム", 0, 0),
-    ]
+# 用紙サイズ（mm、縦向き）。ピクセル数は解像度（dpi）から計算する。
+PAPER_SIZES_MM = [
+    ("A3", 297, 420),
+    ("A4", 210, 297),
+    ("A5", 148, 210),
+    ("A6", 105, 148),
+    ("B4（JIS）", 257, 364),
+    ("B5（JIS）", 182, 257),
+    ("B6（JIS）", 128, 182),
+    ("はがき", 100, 148),
+]
+DPI_CHOICES = [72, 150, 300, 350, 600]
+MAX_CANVAS_PX = 10000
 
-    def __init__(self, current_w: int = CANVAS_W, current_h: int = CANVAS_H, parent=None):
+
+def paper_px(mm: float, dpi: int) -> int:
+    """用紙の長さ（mm）を、その解像度でのピクセル数にする。"""
+    return max(1, min(MAX_CANVAS_PX, round(mm / 25.4 * dpi)))
+
+
+def paper_size_px(name: str, dpi: int, landscape: bool = False) -> tuple[int, int]:
+    for n, w_mm, h_mm in PAPER_SIZES_MM:
+        if n == name:
+            w, h = paper_px(w_mm, dpi), paper_px(h_mm, dpi)
+            return (h, w) if landscape else (w, h)
+    raise KeyError(name)
+
+
+def _make_dpi_combo(dpi: int) -> QComboBox:
+    """よく使う解像度から選べて、数字を直接打ち込むこともできる欄。"""
+    from PyQt6.QtGui import QIntValidator
+    combo = QComboBox()
+    combo.setEditable(True)
+    for d in DPI_CHOICES:
+        combo.addItem(str(d))
+    combo.setValidator(QIntValidator(1, 1200, combo))
+    combo.setCurrentText(str(dpi))
+    return combo
+
+
+def _dpi_from_combo(combo: QComboBox, fallback: int = DEFAULT_DPI) -> int:
+    try:
+        v = int(combo.currentText())
+    except ValueError:
+        return fallback
+    return v if 1 <= v <= 1200 else fallback
+
+
+class NewCanvasDialog(QDialog):
+    # (表示名, 幅px, 高さpx)。幅が None の項目は用紙（解像度から計算）。
+    # 0 はカスタム。
+    PRESETS = ([("正方形 2500px", 2500, 2500), ("正方形 2000px", 2000, 2000)]
+               + [(n, None, None) for n, _w, _h in PAPER_SIZES_MM]
+               + [("カスタム", 0, 0)])
+
+    def __init__(self, current_w: int = CANVAS_W, current_h: int = CANVAS_H, parent=None,
+                 dpi: int = DEFAULT_DPI):
         super().__init__(parent)
         self.setWindowTitle("新規キャンバス")
         layout = QFormLayout(self)
 
-        self._preset_group = QButtonGroup(self)
-        preset_box = QGroupBox("プリセット")
-        preset_layout = QVBoxLayout(preset_box)
-        for i, (label, pw, ph) in enumerate(self.PRESETS):
-            rb = QRadioButton(label)
-            self._preset_group.addButton(rb, i)
-            preset_layout.addWidget(rb)
-        self._preset_group.button(0).setChecked(True)
-        self._preset_group.idClicked.connect(self._on_preset)
-        layout.addRow(preset_box)
+        self._preset = QComboBox()
+        for label, _pw, _ph in self.PRESETS:
+            self._preset.addItem(label)
+        layout.addRow("サイズ", self._preset)
+
+        self._orient = QComboBox()
+        self._orient.addItems(["縦", "横"])
+        layout.addRow("向き", self._orient)
+
+        self._dpi = _make_dpi_combo(dpi)
+        layout.addRow("解像度 (dpi)", self._dpi)
 
         self._w = QSpinBox()
-        self._w.setRange(1, 10000)
+        self._w.setRange(1, MAX_CANVAS_PX)
         self._w.setValue(CANVAS_W)
         self._w.setSuffix(" px")
         layout.addRow("幅", self._w)
 
         self._h = QSpinBox()
-        self._h.setRange(1, 10000)
+        self._h.setRange(1, MAX_CANVAS_PX)
         self._h.setValue(CANVAS_H)
         self._h.setSuffix(" px")
         layout.addRow("高さ", self._h)
+
+        self._print_label = QLabel()
+        layout.addRow("印刷サイズ", self._print_label)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
@@ -957,21 +1008,81 @@ class NewCanvasDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addRow(btns)
 
-        self._on_preset(0)
+        self._preset.currentIndexChanged.connect(self._on_preset)
+        self._orient.currentIndexChanged.connect(self._on_preset)
+        self._dpi.currentTextChanged.connect(self._on_preset)
+        self._w.valueChanged.connect(self._update_print_label)
+        self._h.valueChanged.connect(self._update_print_label)
+        self._on_preset()
 
-    def _on_preset(self, idx: int):
-        _, pw, ph = self.PRESETS[idx]
-        if pw > 0:
+    def _on_preset(self, *_args):
+        label, pw, ph = self.PRESETS[self._preset.currentIndex()]
+        is_paper = pw is None
+        self._orient.setEnabled(is_paper)
+        if is_paper:
+            pw, ph = paper_size_px(label, self.dpi(), self._orient.currentIndex() == 1)
+        if pw:
             self._w.setValue(pw)
             self._h.setValue(ph)
-            self._w.setEnabled(False)
-            self._h.setEnabled(False)
-        else:
-            self._w.setEnabled(True)
-            self._h.setEnabled(True)
+        custom = pw == 0
+        self._w.setEnabled(custom)
+        self._h.setEnabled(custom)
+        self._update_print_label()
+
+    def _update_print_label(self, *_args):
+        d = self.dpi()
+        self._print_label.setText(
+            f"{self._w.value() / d * 25.4:.1f} x {self._h.value() / d * 25.4:.1f} mm")
+
+    def dpi(self) -> int:
+        return _dpi_from_combo(self._dpi)
 
     def values(self) -> tuple[int, int]:
         return self._w.value(), self._h.value()
+
+
+class DpiDialog(QDialog):
+    """解像度（dpi）の変更。印刷サイズを保つならピクセル数も拡縮する。"""
+
+    def __init__(self, w: int, h: int, dpi: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("解像度を変更")
+        self._w0, self._h0, self._dpi0 = w, h, dpi
+        layout = QFormLayout(self)
+        layout.addRow("今の解像度", QLabel(f"{dpi} dpi（{w} x {h} px）"))
+        self._dpi = _make_dpi_combo(dpi)
+        layout.addRow("新しい解像度 (dpi)", self._dpi)
+        self._resample = QCheckBox("印刷サイズを保つ（絵を拡大・縮小する）")
+        layout.addRow(self._resample)
+        self._info = QLabel()
+        layout.addRow(self._info)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+        self._dpi.currentTextChanged.connect(self._update_info)
+        self._resample.toggled.connect(self._update_info)
+        self._update_info()
+
+    def _update_info(self, *_args):
+        w, h = self.new_size()
+        d = self.dpi()
+        self._info.setText(f"変更後: {w} x {h} px ／ "
+                           f"印刷 {w / d * 25.4:.1f} x {h / d * 25.4:.1f} mm")
+
+    def dpi(self) -> int:
+        return _dpi_from_combo(self._dpi, self._dpi0)
+
+    def resample(self) -> bool:
+        return self._resample.isChecked()
+
+    def new_size(self) -> tuple[int, int]:
+        if not self.resample():
+            return self._w0, self._h0
+        r = self.dpi() / self._dpi0
+        return (max(1, min(MAX_CANVAS_PX, round(self._w0 * r))),
+                max(1, min(MAX_CANVAS_PX, round(self._h0 * r))))
 
 
 class AnchorWidget(QWidget):
@@ -1131,11 +1242,14 @@ class CanvasPreviewWidget(QWidget):
 
 
 class ResizeCanvasDialog(QDialog):
-    def __init__(self, current_w: int, current_h: int, parent=None, composite: QImage | None = None):
+    def __init__(self, current_w: int, current_h: int, parent=None, composite: QImage | None = None,
+                 dpi: int = DEFAULT_DPI, selection_rect: QRect | None = None):
         super().__init__(parent)
         self.setWindowTitle("キャンバスサイズ変更")
         self._current_w = current_w
         self._current_h = current_h
+        self._dpi = dpi
+        self._use_selection = False
 
         root = QHBoxLayout(self)
 
@@ -1143,21 +1257,47 @@ class ResizeCanvasDialog(QDialog):
         left = QVBoxLayout()
         form = QFormLayout()
 
+        # 用紙サイズの候補（今の解像度で計算）
+        self._paper = QComboBox()
+        self._paper.addItem("（候補から選ぶ）")
+        for n, _w_mm, _h_mm in PAPER_SIZES_MM:
+            self._paper.addItem(n)
+        self._paper_orient = QComboBox()
+        self._paper_orient.addItems(["縦", "横"])
+        paper_row = QHBoxLayout()
+        paper_row.addWidget(self._paper, 1)
+        paper_row.addWidget(self._paper_orient)
+        form.addRow(f"用紙（{dpi} dpi）", paper_row)
+        self._paper.currentIndexChanged.connect(self._on_paper)
+        self._paper_orient.currentIndexChanged.connect(self._on_paper)
+
         self._w = QSpinBox()
-        self._w.setRange(1, 10000)
+        self._w.setRange(1, MAX_CANVAS_PX)
         self._w.setValue(current_w)
         self._w.setSuffix(" px")
         self._w.valueChanged.connect(self._on_param_changed)
         form.addRow("新しい幅", self._w)
 
         self._h = QSpinBox()
-        self._h.setRange(1, 10000)
+        self._h.setRange(1, MAX_CANVAS_PX)
         self._h.setValue(current_h)
         self._h.setSuffix(" px")
         self._h.valueChanged.connect(self._on_param_changed)
         form.addRow("新しい高さ", self._h)
 
         left.addLayout(form)
+
+        # 選択範囲の大きさと場所でキャンバスを切り抜く
+        self._sel_btn = QPushButton("選択範囲の大きさ・場所で切り抜く")
+        if selection_rect is None or selection_rect.isEmpty():
+            self._sel_btn.setEnabled(False)
+            self._sel_btn.setToolTip("先に選択範囲を作ってください")
+        else:
+            self._sel_btn.setToolTip(
+                f"{selection_rect.width()} x {selection_rect.height()} px "
+                f"（左上 {selection_rect.x()}, {selection_rect.y()}）")
+        self._sel_btn.clicked.connect(self._on_use_selection)
+        left.addWidget(self._sel_btn)
 
         # アンカーポイント
         anchor_box = QGroupBox("基準点")
@@ -1197,6 +1337,22 @@ class ResizeCanvasDialog(QDialog):
             composite.fill(Qt.GlobalColor.white)
         self._preview = CanvasPreviewWidget(composite)
         root.addWidget(self._preview)
+
+    def _on_paper(self, *_args):
+        idx = self._paper.currentIndex()
+        if idx <= 0:
+            return
+        name = PAPER_SIZES_MM[idx - 1][0]
+        w, h = paper_size_px(name, self._dpi, self._paper_orient.currentIndex() == 1)
+        self._w.setValue(w)
+        self._h.setValue(h)
+
+    def _on_use_selection(self):
+        self._use_selection = True
+        self.accept()
+
+    def use_selection(self) -> bool:
+        return self._use_selection
 
     def _on_param_changed(self, *_args):
         ax, ay = self._anchor.anchor()
@@ -1580,9 +1736,12 @@ class MainWindow(QMainWindow):
         self._status_coord.setFixedWidth(140)
         self._status_zoom.setFixedWidth(80)
         self._status_canvas_size.setFixedWidth(180)
+        self._status_dpi = QLabel(f"{self.layer_stack.dpi} dpi")
+        self._status_dpi.setFixedWidth(70)
         status.addWidget(self._status_coord)
         status.addWidget(self._status_zoom)
         status.addPermanentWidget(self._status_canvas_size)
+        status.addPermanentWidget(self._status_dpi)
         self.canvas.status_message.connect(self._on_status_message)
         self.canvas.zoom_changed.connect(self._on_zoom_changed)
 
@@ -1621,6 +1780,7 @@ class MainWindow(QMainWindow):
         self.layer_stack.layers.clear()
         self.layer_stack.width = w
         self.layer_stack.height = h
+        self.layer_stack.dpi = DEFAULT_DPI
         self.layer_stack.active_path = [0]
         self.layer_stack.anim_length = anim.DEFAULT_LENGTH
         self.layer_stack.anim_frame = 0
@@ -2076,6 +2236,8 @@ class MainWindow(QMainWindow):
                                             self.canvas.cancel_transform)
         edit_menu.addSeparator()
         self._add_action(edit_menu, "キャンバスサイズを変更...", self._resize_canvas)
+        self._add_action(edit_menu, "選択範囲でキャンバスを切り抜く", self._crop_canvas_to_selection)
+        self._add_action(edit_menu, "解像度（dpi）を変更...", self._change_dpi)
         # 状況に合わない項目は開いたときにグレーにする（閉じたら戻す。
         # 無効のままだとショートカットまで効かなくなるため）
         edit_menu.aboutToShow.connect(self._update_edit_menu)
@@ -2219,12 +2381,15 @@ class MainWindow(QMainWindow):
     def _new(self):
         if not self._confirm_discard("新規作成"):
             return
-        dialog = NewCanvasDialog(self.layer_stack.width, self.layer_stack.height, self)
+        dialog = NewCanvasDialog(self.layer_stack.width, self.layer_stack.height, self,
+                                 dpi=getattr(self.layer_stack, "dpi", DEFAULT_DPI))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         w, h = dialog.values()
+        dpi = dialog.dpi() if hasattr(dialog, "dpi") else DEFAULT_DPI
         self.canvas.reset_state()
         self._init_canvas(w, h)
+        self.layer_stack.dpi = dpi
         self._document_replaced(None)
 
     def _document_replaced(self, path: str | None):
@@ -2245,16 +2410,58 @@ class MainWindow(QMainWindow):
         self._update_canvas_size_label()
         self.navigator.refresh()
 
+    # ── 前回使ったフォルダの記憶 ──────────────────────────────────────────
+
+    _SAVE_DIR_KEY = "last_save_dir"
+    _OPEN_DIR_KEY = "last_open_dir"
+
+    def _last_dir(self, key: str) -> str:
+        """設定に覚えておいたフォルダ。無い・消えていたら空文字。"""
+        try:
+            v = self._settings.value(key, "")
+        except Exception:
+            return ""
+        if isinstance(v, list):
+            v = v[0] if v else ""
+        v = v if isinstance(v, str) else ""
+        return v if v and os.path.isdir(v) else ""
+
+    def _remember_dir(self, key: str, path: str) -> None:
+        d = os.path.dirname(os.path.abspath(path))
+        try:
+            self._settings.setValue(key, d)
+            self._settings.sync()
+        except Exception:
+            pass
+
+    def _default_save_path(self, ext: str) -> str:
+        """保存・書き出しダイアログに最初に入れておくパス。
+
+        フォルダは前回保存した場所（無ければ今開いているファイルの場所）、
+        名前は今開いている .pola の名前（無ければ untitled）。
+        """
+        cur = self._current_path
+        base = os.path.splitext(os.path.basename(cur))[0] if cur else "untitled"
+        folder = self._last_dir(self._SAVE_DIR_KEY)
+        if not folder and cur:
+            folder = os.path.dirname(cur)
+        name = base + ext
+        return os.path.join(folder, name) if folder else name
+
+    def _default_open_dir(self) -> str:
+        return self._last_dir(self._OPEN_DIR_KEY) or self._last_dir(self._SAVE_DIR_KEY)
+
     def _open(self):
         if not self._confirm_discard("ファイルを開く"):
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "開く", "",
+            self, "開く", self._default_open_dir(),
             "すべて対応ファイル (*.pola *.png *.jpg *.jpeg *.bmp *.webp);;"
             "PaintPola プロジェクト (*.pola);;"
             "画像ファイル (*.png *.jpg *.jpeg *.bmp *.webp)")
         if not path:
             return
+        self._remember_dir(self._OPEN_DIR_KEY, path)
         if path.lower().endswith(".pola"):
             self._load_pola(path)
         else:
@@ -2265,12 +2472,20 @@ class MainWindow(QMainWindow):
         if img.isNull():
             QMessageBox.warning(self, "エラー", "画像を読み込めませんでした。")
             return
+        # 画像に記録された解像度を引き継ぐ。記録が無い画像には Qt が画面の値
+        # （96dpi など）を入れてくるので、それと同じなら「記録なし」とみなす。
+        qt_default = QImage(1, 1, QImage.Format.Format_ARGB32).dotsPerMeterX()
+        dpm = img.dotsPerMeterX()
+        dpi = round(dpm * 0.0254)
+        if dpm == qt_default or not 1 <= dpi <= 1200:
+            dpi = DEFAULT_DPI
         img = img.convertToFormat(QImage.Format.Format_ARGB32)
         iw, ih = img.width(), img.height()
         self.canvas.reset_state()
         self.layer_stack.layers.clear()
         self.layer_stack.width = iw
         self.layer_stack.height = ih
+        self.layer_stack.dpi = dpi
         self.layer_stack.active_path = [0]
         self.layer_stack.anim_length = anim.DEFAULT_LENGTH
         self.layer_stack.anim_frame = 0
@@ -2285,18 +2500,20 @@ class MainWindow(QMainWindow):
 
     def _save(self):
         if self._current_path:
+            self._remember_dir(self._SAVE_DIR_KEY, self._current_path)
             self._write_pola(self._current_path)
         else:
             self._save_as_pola()
 
     def _save_as_pola(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "名前を付けて保存", "untitled.pola",
+            self, "名前を付けて保存", self._default_save_path(".pola"),
             "PaintPola プロジェクト (*.pola)")
         if not path:
             return
         if not path.lower().endswith(".pola"):
             path += ".pola"
+        self._remember_dir(self._SAVE_DIR_KEY, path)
         self._write_pola(path)
 
     # 保存するレイヤー1枚の上限（px）。Qt の画像読み込み上限に
@@ -2355,6 +2572,7 @@ class MainWindow(QMainWindow):
             "version": 1,
             "canvas_w": ls.width,
             "canvas_h": ls.height,
+            "dpi": getattr(ls, "dpi", DEFAULT_DPI),
             "active_path": list(ls.active_path),
             "view_rotation": self.canvas._rotation,
             "view_flip_h": self.canvas._flip_h,
@@ -2651,6 +2869,11 @@ class MainWindow(QMainWindow):
 
                 w = self._clamp(meta.get("canvas_w", CANVAS_W), 1, MAX_CANVAS, CANVAS_W)
                 h = self._clamp(meta.get("canvas_h", CANVAS_H), 1, MAX_CANVAS, CANVAS_H)
+                # 古いファイルには無いので既定の解像度で開く
+                raw_dpi = meta.get("dpi", DEFAULT_DPI)
+                if isinstance(raw_dpi, float) and not math.isfinite(raw_dpi):
+                    raw_dpi = DEFAULT_DPI
+                dpi = self._clamp(raw_dpi, 1, 1200, DEFAULT_DPI)
 
                 layer_count = [0]
 
@@ -2768,6 +2991,7 @@ class MainWindow(QMainWindow):
         ls.layers.clear()
         ls.width = w
         ls.height = h
+        ls.dpi = dpi
         ls.layers.extend(layers)
         if "active_path" in meta:
             ap = meta["active_path"]
@@ -2807,10 +3031,11 @@ class MainWindow(QMainWindow):
     def _export_png(self):
         composite = self.layer_stack.composite()
         path, _ = QFileDialog.getSaveFileName(
-            self, "画像を書き出し", "untitled.png",
+            self, "画像を書き出し", self._default_save_path(".png"),
             "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp)")
         if not path:
             return
+        self._remember_dir(self._SAVE_DIR_KEY, path)
         fmt = "PNG"
         if path.lower().endswith((".jpg", ".jpeg")):
             fmt = "JPEG"
@@ -2823,6 +3048,10 @@ class MainWindow(QMainWindow):
             op.drawImage(0, 0, composite)
             op.end()
             composite = opaque
+        # 解像度を画像に埋め込む（印刷ソフトなどがこの値で原寸を決める）
+        dpm = round(getattr(self.layer_stack, "dpi", DEFAULT_DPI) / 0.0254)
+        composite.setDotsPerMeterX(dpm)
+        composite.setDotsPerMeterY(dpm)
         if not composite.save(path, fmt):
             QMessageBox.warning(self, "エラー", "書き出しに失敗しました。")
 
@@ -2879,6 +3108,8 @@ class MainWindow(QMainWindow):
     def _update_canvas_size_label(self):
         self._status_canvas_size.setText(
             f"{self.layer_stack.width} x {self.layer_stack.height} px")
+        if hasattr(self, "_status_dpi"):
+            self._status_dpi.setText(f"{getattr(self.layer_stack, 'dpi', DEFAULT_DPI)} dpi")
 
     def _mark_dirty(self):
         if not self._dirty:
@@ -2932,21 +3163,30 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
+    def _selection_canvas_rect(self) -> QRect | None:
+        """今の選択範囲（投げなわなら外接矩形）を、キャンバス内に収めたもの。"""
+        sel = self.canvas._selection_rect
+        if sel is None:
+            return None
+        r = QRect(sel).intersected(
+            QRect(0, 0, self.layer_stack.width, self.layer_stack.height))
+        return None if r.isEmpty() else r
+
     def _resize_canvas(self):
         composite = self.layer_stack.composite()
+        sel = self._selection_canvas_rect()
         dialog = ResizeCanvasDialog(self.layer_stack.width, self.layer_stack.height,
-                                     self, composite)
+                                     self, composite,
+                                     dpi=getattr(self.layer_stack, "dpi", DEFAULT_DPI),
+                                     selection_rect=sel)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if getattr(dialog, "use_selection", lambda: False)():
+            self._crop_canvas_to_selection()
             return
         new_w, new_h, mode, anchor = dialog.values()
         if new_w == self.layer_stack.width and new_h == self.layer_stack.height:
             return
-
-        # 変形や選択範囲を抱えたままサイズを変えると、古い座標のまま残って
-        # 見えない位置に選択範囲が残るので、先に片付ける。
-        self.canvas.reset_state()
-        # サイズ変更を元に戻せるようにしておく。
-        self.canvas.save_structure_history()
 
         old_w, old_h = self.layer_stack.width, self.layer_stack.height
         ax, ay = anchor
@@ -2959,8 +3199,59 @@ class MainWindow(QMainWindow):
             else:
                 return new_dim - old_dim
 
-        offset_x = _calc_offset(old_w, new_w, ax)
-        offset_y = _calc_offset(old_h, new_h, ay)
+        self._apply_canvas_resize(new_w, new_h, mode,
+                                  _calc_offset(old_w, new_w, ax),
+                                  _calc_offset(old_h, new_h, ay))
+
+    def _crop_canvas_to_selection(self):
+        """選択範囲の大きさと場所でキャンバスを切り抜く。"""
+        sel = self._selection_canvas_rect()
+        if sel is None:
+            QMessageBox.information(self, "選択範囲でキャンバスを切り抜く",
+                                    "先に選択範囲を作ってください。")
+            return
+        if sel == QRect(0, 0, self.layer_stack.width, self.layer_stack.height):
+            return
+        self._apply_canvas_resize(sel.width(), sel.height(), "crop", -sel.x(), -sel.y())
+
+    def _change_dpi(self):
+        ls = self.layer_stack
+        dialog = DpiDialog(ls.width, ls.height, getattr(ls, "dpi", DEFAULT_DPI), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_dpi = dialog.dpi()
+        new_w, new_h = dialog.new_size()
+        if new_dpi == ls.dpi and (new_w, new_h) == (ls.width, ls.height):
+            return
+        if (new_w, new_h) != (ls.width, ls.height):
+            # 拡縮と解像度の変更を「元に戻す」1回で戻せるよう、先に dpi を変えずに
+            # 控えを取る（_apply_canvas_resize の中で取られる）。
+            self._apply_canvas_resize(new_w, new_h, "scale", 0, 0)
+        else:
+            if self.canvas._transform_image is not None:
+                self.canvas._commit_transform()
+            self.canvas.reset_state()
+            self.canvas.save_structure_history()
+        ls.dpi = new_dpi
+        self._update_canvas_size_label()
+
+    def _apply_canvas_resize(self, new_w: int, new_h: int, mode: str,
+                             offset_x: int, offset_y: int):
+        """キャンバスを new_w x new_h にする。
+
+        mode が "crop" なら絵はそのままの大きさで (offset_x, offset_y) だけずらし、
+        "scale" なら新しい大きさへ拡縮する。
+        """
+        # 変形中の絵は確定してから片付ける（reset_state は変形を黙って捨てる）。
+        if self.canvas._transform_image is not None:
+            self.canvas._commit_transform()
+        # 変形や選択範囲を抱えたままサイズを変えると、古い座標のまま残って
+        # 見えない位置に選択範囲が残るので、先に片付ける。
+        self.canvas.reset_state()
+        # サイズ変更を元に戻せるようにしておく。
+        self.canvas.save_structure_history()
+
+        old_w, old_h = self.layer_stack.width, self.layer_stack.height
 
         def _resize_layer_image(lyr, nw: int, nh: int, scale_mode: bool):
             if lyr.is_vector:
@@ -3028,10 +3319,11 @@ class MainWindow(QMainWindow):
 
     def _import_as_layer(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "画像をレイヤーとして追加", "",
+            self, "画像をレイヤーとして追加", self._default_open_dir(),
             "画像ファイル (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tiff *.tif)")
         if not paths:
             return
+        self._remember_dir(self._OPEN_DIR_KEY, paths[0])
         cw, ch = self.layer_stack.width, self.layer_stack.height
         saved = False
         for path in paths:
