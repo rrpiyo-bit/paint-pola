@@ -4,6 +4,7 @@ import io
 import json
 import math
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
@@ -2565,6 +2566,22 @@ class MainWindow(QMainWindow):
             return image, offset_x, offset_y
         return image.copy(local), offset_x + local.x(), offset_y + local.y()
 
+    @staticmethod
+    def _encode_png(image: QImage) -> bytes:
+        """レイヤー画像を PNG のバイト列にする（別スレッドから呼んでよい）。
+
+        QImage の保存は処理中に Python の他のスレッドを止めないので、
+        画像ごとに別スレッドで呼べば複数コアで同時に進む。
+        """
+        buf = QByteArray()
+        buf_io = QBuffer(buf)
+        buf_io.open(QIODevice.OpenModeFlag.WriteOnly)
+        ok = image.save(buf_io, "PNG")
+        buf_io.close()
+        if not ok:
+            raise RuntimeError("PNG に変換できませんでした")
+        return bytes(buf)
+
     def _write_pola(self, path: str):
         """レイヤー構造を .pola（ZIP）形式で保存する。"""
         ls = self.layer_stack
@@ -2585,6 +2602,7 @@ class MainWindow(QMainWindow):
         try:
             with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 img_index = 0
+                pending: list[tuple[str, QImage]] = []
 
                 def _write_layer(lyr) -> dict:
                     nonlocal img_index
@@ -2643,13 +2661,9 @@ class MainWindow(QMainWindow):
                             lyr.image, lyr.offset_x, lyr.offset_y, ls.width, ls.height)
                         info["offset_x"] = save_ox
                         info["offset_y"] = save_oy
-                        buf = QByteArray()
-                        buf_io = QBuffer(buf)
-                        buf_io.open(QIODevice.OpenModeFlag.WriteOnly)
-                        save_img.save(buf_io, "PNG")
-                        buf_io.close()
                         fname = f"layer_{img_index}.png"
-                        zf.writestr(fname, bytes(buf))
+                        # PNG 化は重いので、ここでは控えるだけにして後でまとめて並列に行う
+                        pending.append((fname, save_img))
                         info["image"] = fname
                         img_index += 1
                         if lyr.is_vector:
@@ -2667,6 +2681,14 @@ class MainWindow(QMainWindow):
                     return info
 
                 meta["layers"] = [_write_layer(lyr) for lyr in ls.layers]
+                # 1枚ずつ Qt で PNG にしていたため、A4 10枚で5秒ほど固まっていた。
+                # 画像ごとに別スレッドで PNG にして、複数コアで同時に作る。
+                # PNG はすでに圧縮済みなので ZIP では圧縮し直さない（時間の無駄）。
+                with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 2)) as pool:
+                    encoded = list(pool.map(
+                        lambda job: self._encode_png(job[1]), pending))
+                for (fname, _), data in zip(pending, encoded):
+                    zf.writestr(fname, data, compress_type=zipfile.ZIP_STORED)
                 self._write_anim_frames(zf, meta)
                 zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
             os.replace(tmp_path, path)
