@@ -936,24 +936,41 @@ class LayerStack:
                 vals[3] = max(vals[3], oy + child.image.height())
 
     @staticmethod
-    def _render_key(items) -> tuple:
+    def _render_key(items, ignore=None) -> tuple:
         """合成結果を決める値をすべて集めたキー。
 
         レイヤー画像の変更は Layer._effect_key() の cacheKey で拾う。
         render_items が見る属性を増やしたときはここにも足すこと。
+        ignore に渡したレイヤーは、絵・位置・不透明度・表示を見ない
+        （そのレイヤーを除いた下と上の合成 stroke_preview_parts 用）。
         """
         key = []
         for it in items:
-            if it.is_group:
+            if it is ignore:
+                key.append(("x", id(it), it.clipping,
+                            getattr(it, 'blend_mode', 'normal')))
+            elif it.is_group:
                 key.append(("g", id(it), it.visible, it.opacity, it.clipping,
                             getattr(it, 'pass_through', False),
-                            LayerStack._render_key(it.children)))
+                            LayerStack._render_key(it.children, ignore)))
             else:
                 key.append(("l", id(it), it.visible, it.opacity, it.clipping,
                             getattr(it, 'blend_mode', 'normal'),
                             getattr(it, 'offset_x', 0), getattr(it, 'offset_y', 0),
                             it._effect_key()))
         return tuple(key)
+
+    def render_key(self) -> tuple:
+        """今の合成結果を決める値の組。同じなら合成結果も同じ。"""
+        return (self.width, self.height, self._render_key(self.layers))
+
+    def preview_parts_key(self, layer) -> tuple:
+        """stroke_preview_parts(layer) の結果を決める値の組。
+
+        同じレイヤーに続けて描くとき、下と上は変わっていないので作り直さずに済む。
+        """
+        return (self.width, self.height, id(layer),
+                self._render_key(self.layers, ignore=layer))
 
     def composite(self, skip: object = None) -> QImage:
         """全レイヤーを合成する。skip を指定すると、そのトップレベルレイヤー
@@ -966,7 +983,7 @@ class LayerStack:
         キャッシュは壊れない。
         """
         if skip is None:
-            key = (self.width, self.height, self._render_key(self.layers))
+            key = self.render_key()
             cache = getattr(self, '_composite_cache', None)
             if cache is None or cache[0] != key:
                 cache = (key, self._composite_uncached(None))
@@ -988,25 +1005,79 @@ class LayerStack:
         (下, 上) の組で、上に何も無ければ上は None。下・layer・上の順に普通に
         重ねれば全体の合成と同じ見た目になる。上のレイヤーに合成モードや
         通過フォルダがあると、下の絵しだいで色が変わるので分けられない。
-        その場合と can_fast_preview が False の場合は None。
+        その場合と、layer がクリッピングに関わる場合は None。
+
+        グループの中のレイヤーでも、通り道のグループが「見えていて・不透明度
+        100%・クリッピングと無関係」なら分けられる。普通の重ね方（A の上に B）は
+        どこで括っても結果が同じなので、
+          グループの外の下 ＋ グループの中の下（グループの中だけで合成）
+          ＋ layer ＋ グループの中の上 ＋ グループの外の上
+        と順に重ねれば全体の合成と一致する。以前はトップレベルのレイヤーだけ
+        だったため、フォルダの中で描くと1回動かすごとに全レイヤー（600dpi の
+        A4 で 3600 万画素 × 枚数）を合成し直し、ペンがもっさりしていた。
         """
-        if not self.can_fast_preview(layer):
+        if layer is None or layer.is_group:  # type: ignore
             return None
-        i = self.layers.index(layer)  # type: ignore
-        above = self.layers[:i]
-        for it in above:
-            if it.is_group:
-                if getattr(it, 'pass_through', False):
-                    return None
-            elif BLEND_KEY_TO_MODE.get(getattr(it, 'blend_mode', 'normal')):
+        path = self._path_to(self.layers, layer)
+        if path is None:
+            return None
+        w, h = self.width, self.height
+        normal = lambda it: not BLEND_KEY_TO_MODE.get(getattr(it, 'blend_mode', 'normal'))
+        # 通り道の各段について、同じ段の上・下のレイヤーと、その段がグループの中か
+        isolated = False  # 通過でないグループの中にいるか（中の下だけで合成される）
+        contexts: list[QImage] = []   # 外側の「下」の合成先（グループに入るたびに積む）
+        below_img = _premul_buffer(w, h)
+        above_levels = []
+        for items, i in path:
+            node = items[i]
+            if node.clipping or (i > 0 and items[i - 1].clipping):
                 return None
-        below_img = _premul_buffer(self.width, self.height)
-        render_items(below_img, self.layers[i + 1:])
+            above = items[:i]
+            for it in above:
+                if it.is_group:
+                    if getattr(it, 'pass_through', False):
+                        return None
+                elif not normal(it):
+                    return None
+            above_levels.append(above)
+            render_items(below_img, items[i + 1:])
+            if node is layer:
+                break
+            if not node.visible or node.opacity < 255:
+                return None
+            if not getattr(node, 'pass_through', False):
+                # 中身はグループ専用のバッファで合成されてから外へ重なる
+                contexts.append(below_img)
+                below_img = _premul_buffer(w, h)
+                isolated = True
+        if isolated and not normal(layer):
+            # 合成モードはグループの中の下だけに効くので、外の下と一緒には描けない
+            return None
+        while contexts:
+            outer = contexts.pop()
+            p = QPainter(outer)
+            p.drawImage(0, 0, below_img)
+            p.end()
+            below_img = outer
         above_img = None
-        if any(it.visible for it in above):
-            above_img = _premul_buffer(self.width, self.height)
-            render_items(above_img, above)
+        if any(it.visible for lv in above_levels for it in lv):
+            above_img = _premul_buffer(w, h)
+            # 内側の段の上から順に重ねる（外側ほど上に来る）
+            for lv in reversed(above_levels):
+                render_items(above_img, lv)
         return below_img, above_img
+
+    @staticmethod
+    def _path_to(items, target):
+        """target までの通り道を [(その段のレイヤー列, 位置), ...] で返す。"""
+        for i, it in enumerate(items):
+            if it is target:
+                return [(items, i)]
+            if it.is_group:
+                sub = LayerStack._path_to(it.children, target)
+                if sub is not None:
+                    return [(items, i)] + sub
+        return None
 
     def can_fast_preview(self, layer: object) -> bool:
         """layer が単独で（クリッピングの授受なしに）差し替え描画できるトップレベル

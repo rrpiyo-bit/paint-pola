@@ -251,7 +251,14 @@ class NavigatorPanel(QWidget):
     def refresh(self):
         """描画・レイヤー変更後に呼ぶ。全レイヤーを合成して縮小する。"""
         self._refresh_timer.stop()
-        composite = self._canvas.layer_stack.composite()
+        if (getattr(self._canvas, "_stroke_bg_cache", None) is not None
+                or getattr(self._canvas, "_stroke_partial", None) is not None):
+            # 描いている最中に全レイヤーを合成し直すと、大きなキャンバスでは
+            # 0.3 秒ほどペンが止まる。描き終えてから更新する。
+            self._refresh_timer.start()
+            return
+        get = getattr(self._canvas, "display_composite", None)
+        composite = get() if get else self._canvas.layer_stack.composite()
 
         rot = self._canvas._rotation
         flip = self._canvas._flip_h

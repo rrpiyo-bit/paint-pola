@@ -12,7 +12,7 @@ from PyQt6.QtGui import (QPainter, QColor, QPen, QImage, QFont, QPixmap,
 from PyQt6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QSize, pyqtSignal, QTimer,
                           QEvent)
 
-from layer import LayerStack, Layer, BLEND_KEY_TO_MODE
+from layer import LayerStack, Layer, BLEND_KEY_TO_MODE, render_items
 from tools import Tool
 from brush import (BrushType, get_brush, StabilizedBrush, BlurBrush, BRUSH_LABELS,
                    SprayBrush, SPRAY_DEFAULTS)
@@ -768,6 +768,13 @@ class Canvas(QWidget):
         # 描いているレイヤーより上の合成（無ければ None）
         self._stroke_fg_cache: QImage | None = None
         self._stroke_layer: object = None
+        # 描き終えた直後の表示（render_key, 画像）。display_composite が使う。
+        self._display_cache: tuple | None = None
+        # 前の線の (preview_parts_key, stroke_preview_parts の結果)
+        self._preview_parts_cache: tuple | None = None
+        # 下と上に分けられないとき（クリッピングレイヤーなど）のストローク中の表示。
+        # 画面の絵を1枚持ち、描いた所だけ合成し直す（_flush_stroke_partial）。
+        self._stroke_partial: dict | None = None
 
         # selection
         self._selection_rect: QRect | None = None
@@ -911,13 +918,18 @@ class Canvas(QWidget):
             return
         if self.tool not in (Tool.PEN, Tool.ERASER) or self._last_pos is None:
             return
+        dirty = QRect()
         for p in tail:
             pt = p.toPoint()
             if pt == self._last_pos:
                 continue
+            seg = self._segment_dirty(self._last_pos, pt)
+            dirty = None if seg is None or dirty is None else dirty.united(seg)
             self._stroke_segment(layer, self._last_pos, pt)
             self._last_pos = pt
-        self._after_stroke_draw(layer, None)
+        if dirty is not None and dirty.isEmpty():
+            return
+        self._after_stroke_draw(layer, dirty)
         self.update()
 
     def set_stabilization(self, value: int):
@@ -1092,11 +1104,22 @@ class Canvas(QWidget):
         layer = self.layer_stack.active
         return layer.uid if layer and not layer.is_group else None
 
-    def _begin_stroke_cache(self, layer) -> None:
+    def _begin_stroke_cache(self, layer, partial: bool = False) -> None:
         """ストローク開始時に「描画中レイヤー以外」の合成結果をキャッシュする。
-        クリッピング等が絡み安全に省略できない場合はキャッシュしない
-        （その場合 paintEvent は毎回フル合成にフォールバックする）。"""
-        parts = self.layer_stack.stroke_preview_parts(layer)
+        クリッピング等が絡み安全に省略できない場合はキャッシュしない。
+        そのとき partial（描いた範囲が分かるペン・消しゴム）なら、描いた所だけ
+        合成し直す表示にする。それもできなければ paintEvent は毎回フル合成。"""
+        self._stroke_partial = None
+        # 同じレイヤーに続けて描くときは、前の線で作った下と上をそのまま使う。
+        # 大きなキャンバスでは作るのに 0.3 秒ほどかかり、描き始めが遅れていた。
+        key = self.layer_stack.preview_parts_key(layer)
+        kept = getattr(self, "_preview_parts_cache", None)
+        if kept is not None and kept[0] == key:
+            parts = kept[1]
+        else:
+            self._preview_parts_cache = None  # 先に手放してメモリを空ける
+            parts = self.layer_stack.stroke_preview_parts(layer)
+            self._preview_parts_cache = (key, parts)
         if parts is not None:
             self._stroke_layer = layer
             self._stroke_bg_cache, self._stroke_fg_cache = parts
@@ -1104,11 +1127,104 @@ class Canvas(QWidget):
             self._stroke_layer = None
             self._stroke_bg_cache = None
             self._stroke_fg_cache = None
+            if partial and self._partial_stroke_ok(layer):
+                self._stroke_partial = {
+                    "layer": layer, "img": self.display_composite(),
+                    "dirty": QRect(), "full": False}
+
+    def _partial_stroke_ok(self, layer) -> bool:
+        """描いた所だけ合成し直してよいか。
+
+        合成は1画素ずつ決まる（クリッピングの切り抜き・合成モード・不透明度）ので、
+        描いた範囲の外の見た目は変わらない。ただし縁取り・影・光彩・ぼかしの
+        効果は描いた所の外まで絵を変える（縁取りは外形全体で決まる）ので除く。
+        """
+        if (layer is None or layer.is_group or getattr(layer, 'is_vector', False)
+                or (self._transform_image and self._transform_rect)):
+            return False
+        if any(getattr(layer, k, False) for k in
+               ('border_enabled', 'shadow_enabled', 'glow_enabled', 'blur_enabled')):
+            return False
+        return self.layer_stack._path_to(self.layer_stack.layers, layer) is not None
+
+    def _mark_stroke_dirty(self, layer, dirty: QRect | None) -> None:
+        """描いた範囲（レイヤーの座標）を、次に表示するとき合成し直す所に足す。
+        None は範囲が分からない（左右対称など）ので全体をやり直す。"""
+        sp = self._stroke_partial
+        if sp is None or sp["layer"] is not layer:
+            return
+        if dirty is None:
+            sp["full"] = True
+            return
+        r = dirty.translated(getattr(layer, 'offset_x', 0), getattr(layer, 'offset_y', 0))
+        sp["dirty"] = sp["dirty"].united(r)
+        sp["all"] = sp.get("all", QRect()).united(r)  # この線で変えた所すべて
+
+    def _flush_stroke_partial(self) -> QImage:
+        """溜まった範囲だけ全レイヤーを合成し直して、表示用の絵に書き戻す。
+
+        36M 画素のキャンバスでクリッピングレイヤーに描くと、毎回の全体合成で
+        1回 0.5 秒以上かかり、ペンも消しゴムも追いつかなかった。
+        """
+        sp = self._stroke_partial
+        ls = self.layer_stack
+        whole = QRect(0, 0, ls.width, ls.height)
+        r = whole if sp["full"] else sp["dirty"].intersected(whole)
+        sp["dirty"] = QRect()
+        sp["full"] = False
+        if not r.isEmpty():
+            sub = QImage(r.width(), r.height(), QImage.Format.Format_ARGB32_Premultiplied)
+            sub.fill(Qt.GlobalColor.transparent)
+            render_items(sub, ls.layers, r.x(), r.y())
+            p = QPainter(sp["img"])
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.drawImage(r.topLeft(), sub)
+            p.end()
+        return sp["img"]
 
     def _end_stroke_cache(self) -> None:
         self._stroke_layer = None
         self._stroke_bg_cache = None
         self._stroke_fg_cache = None
+        self._stroke_partial = None
+
+    def _keep_stroke_result(self) -> None:
+        """描き終えたときの表示を、下・描いたレイヤー・上の控えから作って取っておく。
+
+        描き終えると絵が変わったので全レイヤーの合成をやり直すことになり、
+        大きなキャンバス（600dpi の A4 など）では離すたびに 0.3 秒ほど止まっていた。
+        控えから作れば重ねるだけで済む。レイヤーの中身や並びが変わったら
+        display_composite が気づいて普通に合成し直す。
+        """
+        layer = self._stroke_layer
+        self._display_cache = None
+        sp = self._stroke_partial
+        if sp is not None:
+            if (not (self._transform_image and self._transform_rect)
+                    and self.layer_stack._path_to(self.layer_stack.layers,
+                                                  sp["layer"]) is not None):
+                img = self._flush_stroke_partial()
+                self._display_cache = (self.layer_stack.render_key(), QImage(img))
+            return
+        if (self._stroke_bg_cache is None or layer is None
+                or (self._transform_image and self._transform_rect)
+                or self.layer_stack._path_to(self.layer_stack.layers, layer) is None):
+            return
+        self._display_cache = (self.layer_stack.render_key(),
+                               self._composite_with_floating())
+
+    def display_composite(self) -> QImage:
+        """画面・ナビゲーター用の合成結果。描き終えた直後は控えを使う。
+
+        書き出しや統合は layer_stack.composite() を使う（控えは見た目用で、
+        重ね方の丸めが ±1 ずれることがあるため）。
+        """
+        cache = getattr(self, "_display_cache", None)
+        if cache is not None:
+            if cache[0] == self.layer_stack.render_key():
+                return QImage(cache[1])
+            self._display_cache = None
+        return self.layer_stack.composite()
 
     # ── 選択範囲による描画のマスク ────────────────────────────────────────────
 
@@ -2117,6 +2233,10 @@ class Canvas(QWidget):
         キャッシュ、その上にレイヤー」は同じ見た目になる。毎フレーム
         キャンバス大の画像を複製せずに済む。できない場合は False。
         """
+        if (self._stroke_partial is not None
+                and not (self._transform_image and self._transform_rect)):
+            p.drawImage(0, 0, self._flush_stroke_partial())
+            return True
         layer = self._stroke_layer
         if (self._stroke_bg_cache is None or layer is None
                 or (self._transform_image and self._transform_rect)
@@ -2136,6 +2256,8 @@ class Canvas(QWidget):
         変形中は元の切り取り領域を消した状態でフローティング画像を合成して
         リアルタイムプレビューを正しく表示する。"""
         if not self._transform_image or not self._transform_rect:
+            if self._stroke_partial is not None:
+                return QImage(self._flush_stroke_partial())
             if self._stroke_bg_cache is not None and self._stroke_layer is not None:
                 result = QImage(self._stroke_bg_cache)
                 p = QPainter(result)
@@ -2153,7 +2275,7 @@ class Canvas(QWidget):
                     p.drawImage(0, 0, self._stroke_fg_cache)
                 p.end()
                 return result.convertToFormat(QImage.Format.Format_ARGB32)
-            return self.layer_stack.composite()
+            return self.display_composite()
 
         # 変形元レイヤーから切り取り領域を消去したプレビュー用合成を作る
         # 元レイヤーを一時的に切り取り済み状態にしてから composite() を呼ぶ
@@ -2977,7 +3099,7 @@ class Canvas(QWidget):
 
         elif self.tool == Tool.PEN:
             self._save_history()
-            self._begin_stroke_cache(layer)
+            self._begin_stroke_cache(layer, partial=True)
             self._begin_pen_buffer(layer)
             self._stabilizer.reset()
             if line_from is not None:
@@ -3002,15 +3124,17 @@ class Canvas(QWidget):
 
         elif self.tool == Tool.ERASER:
             self._save_history()
-            self._begin_stroke_cache(layer)
+            self._begin_stroke_cache(layer, partial=True)
             self._stabilizer.reset()
             if line_from is not None:
-                self._press_line(layer, line_from, lp)
+                dirty = self._press_line(layer, line_from, lp)
             else:
                 self._stabilizer.push(lp)
                 self._last_pos = lp
                 self._erase_point(layer.image, lp, self._taper_start_size(layer, lp))  # type: ignore
+                dirty = self._segment_dirty(lp, lp)
             self._apply_clip_to_selection()
+            self._mark_stroke_dirty(layer, dirty)
             self.update()
 
         elif self.tool == Tool.FILL:
@@ -3369,6 +3493,7 @@ class Canvas(QWidget):
             self._remember_stroke_end()
         self._taper_stroke = None
         self._pen_buf = None
+        self._keep_stroke_result()
         self._end_stroke_cache()
         if self._panning:
             self._pan_start_widget = None
@@ -3854,7 +3979,32 @@ class Canvas(QWidget):
             pen_buf["buf"] = img
             self._compose_pen_buffer(layer, None)
         self._apply_clip_to_selection()
+        self._mark_taper_dirty(layer, ts)
         self.update()
+
+    def _mark_taper_dirty(self, layer, ts: dict) -> None:
+        """入り抜きで描き直した範囲を、描いた所だけの再合成に伝える。
+
+        変わるのは「描き直す前の線があった所」（描く前の絵に戻った）と
+        「描き直した線の所」だけ。前者はこれまでに溜めた範囲、後者は線の点の
+        外接矩形を太さぶん広げた範囲に収まる。
+        """
+        sp = self._stroke_partial
+        if sp is None or sp["layer"] is not layer:
+            return
+        pts = list(ts["pts"]) + list(ts.get("stamps", ()))
+        ox = getattr(layer, 'offset_x', 0)
+        oy = getattr(layer, 'offset_y', 0)
+        xs = [q.x() - ox for q in pts]
+        ys = [q.y() - oy for q in pts]
+        redrawn = self._segment_dirty(
+            QPoint(math.floor(min(xs)), math.floor(min(ys))),
+            QPoint(math.ceil(max(xs)), math.ceil(max(ys))))
+        if redrawn is None:
+            self._mark_stroke_dirty(layer, None)
+            return
+        self._mark_stroke_dirty(layer, redrawn)
+        sp["dirty"] = sp["dirty"].united(sp.get("all", QRect()))
 
     # ── 不透明度つきペン・透明色 ─────────────────────────────────────────────
 
@@ -3920,6 +4070,7 @@ class Canvas(QWidget):
         """ペン・消しゴムで描いた後の仕上げ（線を重ねる → 選択範囲・ロックで戻す）。"""
         self._compose_pen_buffer(layer, dirty)
         self._apply_clip_to_selection(dirty)
+        self._mark_stroke_dirty(layer, dirty)
 
     # ── Shift+クリックで直線 ─────────────────────────────────────────────────
 
@@ -5032,6 +5183,8 @@ class Canvas(QWidget):
     def reset_state(self):
         """新規/開くなどでキャンバスを差し替える前に一切の作業状態を破棄する。"""
         self._end_stroke_cache()
+        self._preview_parts_cache = None
+        self._display_cache = None
         self._taper_stroke = None
         self._pen_buf = None
         self._last_stroke_end = None

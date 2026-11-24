@@ -1398,6 +1398,231 @@ class TestLongSessionSpeed:
         top.blend_mode = "multiply"
         assert ls.stroke_preview_parts(mid) is None
 
+    @staticmethod
+    def _parts_image(ls, layer):
+        parts = ls.stroke_preview_parts(layer)
+        if parts is None:
+            return None
+        below, above = parts
+        out = QImage(below)
+        p = QPainter(out)
+        p.setOpacity(layer.opacity / 255)
+        p.drawImage(layer.offset_x, layer.offset_y, layer.image)
+        p.setOpacity(1.0)
+        if above is not None:
+            p.drawImage(0, 0, above)
+        p.end()
+        return out.convertToFormat(QImage.Format.Format_ARGB32)
+
+    def _assert_same(self, a, b):
+        import numpy as np
+
+        def arr(img):
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
+            ptr = img.constBits()
+            ptr.setsize(img.sizeInBytes())
+            return np.frombuffer(ptr, np.uint8).reshape(
+                img.height(), img.bytesPerLine())[:, :img.width() * 4].astype(int)
+        assert np.abs(arr(a) - arr(b)).max() <= 2
+
+    def _nested(self, win, pass_through=False):
+        """外の下・グループ（中の下・描く・中の上＋クリッピング）・外の上 を作る。"""
+        ls = win.layer_stack
+        w, h = ls.width, ls.height
+
+        def lay(name, rect, color, opacity=255):
+            l = Layer(name, w, h)
+            fill(l.image, rect, color)
+            l.opacity = opacity
+            return l
+        outer_below = lay("外の下", QRect(0, 0, 70, 70), QColor(255, 0, 0, 200))
+        in_below = lay("中の下", QRect(30, 0, 60, 60), QColor(0, 0, 255, 150))
+        in_below.blend_mode = "multiply"
+        target = lay("描く", QRect(10, 20, 60, 50), QColor(0, 160, 0, 180), 200)
+        in_above = lay("中の上", QRect(50, 40, 40, 40), QColor(200, 200, 0, 120))
+        in_clip = lay("中の上クリップ", QRect(0, 0, 100, 100), QColor(0, 0, 0, 255))
+        in_clip.clipping = True
+        outer_above = lay("外の上", QRect(60, 60, 40, 40), QColor(0, 200, 200, 130))
+        g = GroupLayer("グループ", w, h)
+        g.pass_through = pass_through
+        g.children = [in_clip, in_above, target, in_below]
+        ls.layers = [outer_above, g, outer_below]
+        return ls, g, target
+
+    def test_preview_parts_inside_group_match_full_composite(self, win):
+        """フォルダの中のレイヤーでも、分けて重ねた絵が全体の合成と一致する。"""
+        for pt in (False, True):
+            ls, g, target = self._nested(win, pass_through=pt)
+            out = self._parts_image(ls, target)
+            assert out is not None, pt
+            self._assert_same(out, ls.composite())
+
+    def test_preview_parts_inside_group_falls_back_when_unsafe(self, win):
+        """分けると見た目が変わる場合は、従来どおり毎回全体を合成する。"""
+        ls, g, target = self._nested(win)
+        g.opacity = 128          # 不透明度 100% 未満のフォルダ
+        assert ls.stroke_preview_parts(target) is None
+        g.opacity = 255
+        target.blend_mode = "multiply"   # フォルダの中で合成モード付きのレイヤー
+        assert ls.stroke_preview_parts(target) is None
+        target.blend_mode = "normal"
+        in_clip, in_above, _, in_below = g.children
+        g.children = [in_above, in_clip, target, in_below]  # 描くレイヤーがクリッピングの下地
+        assert ls.stroke_preview_parts(target) is None
+        g.children = [in_clip, in_above, target, in_below]
+        g.clipping = True                # フォルダ自体がクリッピング
+        assert ls.stroke_preview_parts(target) is None
+        g.clipping = False
+        g.visible = False                # 見えないフォルダ
+        assert ls.stroke_preview_parts(target) is None
+
+    def test_stroke_inside_group_uses_fast_path(self, win):
+        """フォルダの中で描いても背景のキャッシュが使われ、表示は合成と一致する。"""
+        ls, g, target = self._nested(win)
+        win.canvas._stroke_layer = None
+        ls.active_path = [1, 2]
+        assert ls.active is target
+        c = self._pen(win)
+        c.pen_size = 20
+
+        def ev(typ, x, y, btns):
+            wp = c._c2w().map(QPointF(x, y))
+            return QMouseEvent(typ, wp, Qt.MouseButton.LeftButton, btns,
+                               Qt.KeyboardModifier.NoModifier)
+        c.mousePressEvent(ev(QEvent.Type.MouseButtonPress, 20, 80, Qt.MouseButton.LeftButton))
+        for i in range(6):
+            c.mouseMoveEvent(ev(QEvent.Type.MouseMove, 20 + i * 12, 80, Qt.MouseButton.LeftButton))
+        assert c._stroke_bg_cache is not None
+        shown = c._composite_with_floating()
+        self._assert_same(shown, ls.composite())
+        c.mouseReleaseEvent(ev(QEvent.Type.MouseButtonRelease, 90, 80, Qt.MouseButton.NoButton))
+        # 描き終えた直後の表示も、全体の合成と一致する
+        self._assert_same(c.display_composite(), ls.composite())
+
+    def _drag_line(self, c, y):
+        def ev(typ, x, btns):
+            wp = c._c2w().map(QPointF(x, y))
+            return QMouseEvent(typ, wp, Qt.MouseButton.LeftButton, btns,
+                               Qt.KeyboardModifier.NoModifier)
+        c.mousePressEvent(ev(QEvent.Type.MouseButtonPress, 10, Qt.MouseButton.LeftButton))
+        for i in range(5):
+            c.mouseMoveEvent(ev(QEvent.Type.MouseMove, 10 + i * 15, Qt.MouseButton.LeftButton))
+        bg = c._stroke_bg_cache
+        c.mouseReleaseEvent(ev(QEvent.Type.MouseButtonRelease, 80, Qt.MouseButton.NoButton))
+        return bg
+
+    def test_next_stroke_reuses_below_and_above(self, win):
+        """同じレイヤーに続けて描くと下と上を作り直さず、他が変われば作り直す。"""
+        ls, g, target = self._nested(win)
+        ls.active_path = [1, 2]
+        c = self._pen(win)
+        first = self._drag_line(c, 30)
+        assert self._drag_line(c, 50) is first
+        # 下のレイヤーが変わったら作り直して、表示も合う
+        outer_below = ls.layers[2]
+        fill(outer_below.image, QRect(0, 80, 100, 20), QColor(0, 0, 0, 255))
+        third = self._drag_line(c, 70)
+        assert third is not first
+        self._assert_same(c.display_composite(), ls.composite())
+        # 上のレイヤーを隠しても作り直す
+        ls.layers[0].visible = False
+        assert self._drag_line(c, 90) is not third
+        self._assert_same(c.display_composite(), ls.composite())
+
+    def test_display_cache_dropped_when_layers_change(self, win):
+        """描き終えた後にレイヤーが変われば、控えでなく合成し直した絵を出す。"""
+        ls, g, target = self._nested(win)
+        ls.active_path = [1, 2]
+        c = self._pen(win)
+        self._drag_line(c, 30)
+        assert c._display_cache is not None
+        target.opacity = 100
+        self._assert_same(c.display_composite(), ls.composite())
+        assert c._display_cache is None
+
+    def _stroke_on_clip(self, win, tool, setup=None):
+        """クリッピングレイヤー（中の上クリップ）に描き、途中と描き終えた後の表示を確かめる。"""
+        ls, g, target = self._nested(win)
+        clip = g.children[0]
+        ls.active_path = [1, 0]
+        assert ls.active is clip and clip.clipping
+        c = self._pen(win)
+        c.tool = tool
+        c.pen_size = c.eraser_size = 8
+        if setup:
+            setup(c, clip)
+
+        def ev(typ, x, y, btns):
+            wp = c._c2w().map(QPointF(x, y))
+            return QMouseEvent(typ, wp, Qt.MouseButton.LeftButton, btns,
+                               Qt.KeyboardModifier.NoModifier)
+        # 下地（中の上）は (50,40)-(90,80)。クリッピングはその中にだけ見える
+        c.mousePressEvent(ev(QEvent.Type.MouseButtonPress, 52, 50, Qt.MouseButton.LeftButton))
+        assert ls.stroke_preview_parts(clip) is None  # 下と上に分けられない場合
+        for i in range(8):
+            c.mouseMoveEvent(ev(QEvent.Type.MouseMove, 52 + i * 5, 50 + i * 3,
+                                Qt.MouseButton.LeftButton))
+            if i % 3 == 0:
+                self._assert_same(c._composite_with_floating(), ls.composite())
+        partial = c._stroke_partial
+        self._assert_same(c._composite_with_floating(), ls.composite())
+        c.mouseReleaseEvent(ev(QEvent.Type.MouseButtonRelease, 88, 72, Qt.MouseButton.NoButton))
+        assert c._stroke_partial is None
+        self._assert_same(c.display_composite(), ls.composite())
+        return partial
+
+    def test_stroke_on_clipping_layer_redraws_only_drawn_area(self, win):
+        """クリッピングレイヤーに描くと描いた所だけ合成し直し、表示は全体の合成と一致する。"""
+        assert self._stroke_on_clip(win, Tool.PEN) is not None
+        assert self._stroke_on_clip(win, Tool.ERASER) is not None
+
+    def test_partial_stroke_with_symmetry_taper_and_moved_layer(self, win):
+        """左右対称・入り抜き・ずらしたレイヤー（描くと広がる）でも表示が合う。"""
+        def sym(c, clip):
+            c.symmetry_enabled = True
+        def taper(c, clip):
+            c.set_taper("pen", "in", 30)
+            c.set_taper("pen", "out", 30)
+        def moved(c, clip):
+            # 描く所がレイヤー画像の内側に収まる（広がらない）ずらし方
+            clip.offset_x, clip.offset_y = -40, -30
+            assert clip.image.width() - 40 > 110 and clip.image.height() - 30 > 100
+        def reset():
+            win.canvas.symmetry_enabled = False
+            win.canvas.set_taper("pen", "in", 0)
+            win.canvas.set_taper("pen", "out", 0)
+        try:
+            for setup in (sym, taper, moved):
+                reset()  # 1つずつ確かめる（前の設定が残ると全体の合成になって確かめられない）
+                assert self._stroke_on_clip(win, Tool.PEN, setup) is not None
+        finally:
+            reset()
+
+    def test_tap_on_clipping_layer_shows_dot(self, win):
+        """動かさずに押して離しただけ（点を打つ・消す）でも表示が合う。"""
+        for tool in (Tool.PEN, Tool.ERASER):
+            ls, g, target = self._nested(win)
+            ls.active_path = [1, 0]
+            c = self._pen(win)
+            c.tool = tool
+            c.pen_size = c.eraser_size = 10
+            wp = c._c2w().map(QPointF(70, 60))
+            c.mousePressEvent(QMouseEvent(
+                QEvent.Type.MouseButtonPress, wp, Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+            assert c._stroke_partial is not None
+            self._assert_same(c._composite_with_floating(), ls.composite())
+            c.mouseReleaseEvent(QMouseEvent(
+                QEvent.Type.MouseButtonRelease, wp, Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+            self._assert_same(c.display_composite(), ls.composite())
+
+    def test_partial_stroke_not_used_with_spreading_effects(self, win):
+        """縁取りのように描いた所の外まで変わる効果があるときは、全体を合成し直す。"""
+        def border(c, clip):
+            clip.border_enabled = True
+        assert self._stroke_on_clip(win, Tool.PEN, border) is None
+
 
 def alphas(img):
     """画像に出てくるアルファ値の集合。"""
